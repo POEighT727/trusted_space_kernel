@@ -337,7 +337,7 @@ func handleInfo(connector *client.Connector, args []string) {
 	fmt.Printf("最后心跳:     %s\n", time.Unix(info.LastHeartbeat, 0).Format("2006-01-02 15:04:05"))
 	fmt.Printf("注册时间:     %s\n", time.Unix(info.RegisteredAt, 0).Format("2006-01-02 15:04:05"))
 	fmt.Println(strings.Repeat("-", 50))
-}
+	}
 
 // handleCreateChannel 处理创建频道命令
 func handleCreateChannel(connector *client.Connector, args []string) {
@@ -426,7 +426,7 @@ func handleCreateChannel(connector *client.Connector, args []string) {
 	}
 
 	channelID, proposalID, err := connector.ProposeChannel(senderIDs, receiverIDs, "", approverID, reason)
-	if err != nil {
+		if err != nil {
 		fmt.Printf("❌ 提议创建频道失败: %v\n", err)
 		return
 	}
@@ -434,7 +434,7 @@ func handleCreateChannel(connector *client.Connector, args []string) {
 	fmt.Printf("✓ 频道提议创建成功\n")
 	fmt.Printf("  频道ID: %s\n", channelID)
 	fmt.Printf("  提议ID: %s\n", proposalID)
-
+	
 	// 显示需要哪些参与方确认（创建者自动接受，不需要确认）
 	fmt.Println("  需要以下参与方确认:")
 	selfID := connector.GetID()

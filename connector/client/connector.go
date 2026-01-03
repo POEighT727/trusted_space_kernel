@@ -69,6 +69,11 @@ type Connector struct {
 	subscriptionsMu sync.RWMutex
 	subscriptions   map[string]bool // key: channelID, value: 是否正在订阅
 
+	// 通知去重，防止重复处理同一个频道的通知
+	processedNotificationsMu sync.RWMutex
+	processedNotifications   map[string]bool // key: channelID, value: 是否已处理过通知
+	skippedNotifications     map[string]int  // key: channelID, value: 跳过次数
+
 	// 存证存储配置
 	evidenceLocalStorage bool   // 是否启用本地存证存储
 	evidenceStoragePath  string // 本地存证存储路径
@@ -128,6 +133,8 @@ func NewConnector(config *Config) (*Connector, error) {
 		cancel:      cancel,
 		channels:     make(map[string]*LocalChannelInfo),
 		subscriptions: make(map[string]bool),
+		processedNotifications: make(map[string]bool),
+		skippedNotifications: make(map[string]int),
 		evidenceLocalStorage: config.EvidenceLocalStorage,
 		evidenceStoragePath:  config.EvidenceStoragePath,
 	}
@@ -445,13 +452,13 @@ func (c *Connector) ReceiveData(channelID string, handler func(*pb.DataPacket) e
 
 // ReceiveEvidenceData 接收存证频道数据并本地存储
 func (c *Connector) ReceiveEvidenceData(channelID string) error {
-	// 检查是否已经订阅了该频道
+	// 检查是否已经在本地标记为订阅状态（避免重复调用）
 	c.subscriptionsMu.Lock()
 	if c.subscriptions[channelID] {
 		c.subscriptionsMu.Unlock()
 		return fmt.Errorf("already subscribed to evidence channel: %s", channelID)
 	}
-	// 标记开始订阅
+	// 标记开始订阅（即使内核已经记录了订阅，也要防止客户端重复调用）
 	c.subscriptions[channelID] = true
 	c.subscriptionsMu.Unlock()
 
@@ -727,6 +734,12 @@ func (c *Connector) Close() error {
 	c.subscriptions = make(map[string]bool)
 	c.subscriptionsMu.Unlock()
 
+	// 清理通知处理缓存
+	c.processedNotificationsMu.Lock()
+	c.processedNotifications = make(map[string]bool)
+	c.skippedNotifications = make(map[string]int)
+	c.processedNotificationsMu.Unlock()
+
 	if c.conn != nil {
 		return c.conn.Close()
 	}
@@ -788,6 +801,20 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 
 			// 处理通知
 			for notification := range notifyChan {
+				// 去重检查：防止重复处理同一个频道的通知
+				c.processedNotificationsMu.Lock()
+				if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED {
+					if c.processedNotifications[notification.ChannelId] {
+						c.processedNotificationsMu.Unlock()
+						// 只在第一次跳过时显示消息，避免重复日志
+						c.skippedNotifications[notification.ChannelId]++
+						continue
+					}
+					// 标记为已处理
+					c.processedNotifications[notification.ChannelId] = true
+				}
+				c.processedNotificationsMu.Unlock()
+
 				// 记录本地频道信息
 				c.RecordChannelFromNotification(notification)
 
@@ -893,6 +920,7 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 						log.Printf("ℹ 所有参与方接受后，频道将被激活并自动开始接收数据")
 					}
 				} else if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED {
+
 					// 频道已正式创建，可以自动订阅
 					// 格式化参与者列表显示
 					senderInfo := fmt.Sprintf("%v", notification.SenderIds)

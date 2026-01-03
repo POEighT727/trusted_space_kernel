@@ -87,6 +87,9 @@ type Channel struct {
 	// 权限变更管理
 	permissionRequests []*PermissionChangeRequest // 权限变更请求列表
 	permissionMu       sync.RWMutex               // 权限变更锁
+
+	// 连接器状态管理（重启恢复）
+	manager *ChannelManager // 指向ChannelManager的引用，用于访问连接器状态
 }
 
 // DataPacket 数据包
@@ -117,17 +120,35 @@ type PermissionChangeRequest struct {
 	RejectReason    string            // 拒绝理由
 }
 
+// ConnectorStatus 连接器状态
+type ConnectorStatus int
+
+const (
+	ConnectorStatusUnknown ConnectorStatus = iota
+	ConnectorStatusOnline  // 在线
+	ConnectorStatusOffline // 离线
+)
+
 // ChannelManager 频道管理器
 type ChannelManager struct {
 	mu                   sync.RWMutex
 	channels             map[string]*Channel
 	notifyChannelCreated func(*Channel) // 频道创建通知回调
+
+	// 连接器状态跟踪（用于重启恢复）
+	connectorStatus  map[string]ConnectorStatus // 连接器状态
+	connectorBuffers map[string][]*DataPacket   // 离线连接器的个人缓冲区
+	lastActivity     map[string]time.Time       // 连接器最后活动时间
+	connectorMu      sync.RWMutex               // 连接器状态的锁
 }
 
 // NewChannelManager 创建新的频道管理器
 func NewChannelManager() *ChannelManager {
 	return &ChannelManager{
-		channels: make(map[string]*Channel),
+		channels:         make(map[string]*Channel),
+		connectorStatus:  make(map[string]ConnectorStatus),
+		connectorBuffers: make(map[string][]*DataPacket),
+		lastActivity:     make(map[string]time.Time),
 	}
 }
 
@@ -206,6 +227,7 @@ func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs
 		Status:            ChannelStatusProposed,
 		CreatedAt:         time.Now(),
 		LastActivity:      time.Now(),
+		manager:           cm, // 设置ChannelManager引用
 		ChannelProposal: &ChannelProposal{
 			ProposalID:        proposalID,
 			Status:            NegotiationStatusProposed,
@@ -502,6 +524,7 @@ func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, se
 		buffer:             make([]*DataPacket, 0),
 		maxBufferSize:      10000, // 最多暂存10000个数据包
 		permissionRequests: make([]*PermissionChangeRequest, 0),
+		manager:            cm, // 设置ChannelManager引用
 	}
 
 	cm.channels[channelID] = channel
@@ -723,25 +746,66 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		targetReceivers = validTargets
 	}
 	
-	// 决定是否需要缓冲：只有当指定了目标接收者且有目标未订阅时才缓冲
-	shouldBuffer := false
+	// 处理连接器重启恢复缓冲
+	offlineTargets := make([]string, 0)
+
+	// 检查是否有离线连接器需要缓冲
 	if len(packet.TargetIDs) > 0 {
-		// 检查指定的目标接收者是否都已订阅
+		// 指定了目标接收者
 		for _, targetID := range packet.TargetIDs {
 			if c.CanReceive(targetID) { // 只检查频道接收者
 				if _, subscribed := c.subscribers[targetID]; !subscribed {
-					shouldBuffer = true
-					break
+					// 检查是否离线
+					if c.manager != nil && !c.manager.IsConnectorOnline(targetID) {
+						offlineTargets = append(offlineTargets, targetID)
+					}
+				}
+			}
+		}
+	} else {
+		// 广播模式：检查所有接收者中是否有离线的
+		for _, receiverID := range c.ReceiverIDs {
+			if _, subscribed := c.subscribers[receiverID]; !subscribed {
+				if c.manager != nil && !c.manager.IsConnectorOnline(receiverID) {
+					offlineTargets = append(offlineTargets, receiverID)
 				}
 			}
 		}
 	}
-	// 注意：如果没有指定TargetIDs或TargetIDs为空，数据会广播给所有订阅者，不需要缓冲
+
+	// 为离线连接器缓冲数据
+	for _, offlineTarget := range offlineTargets {
+		if c.manager != nil {
+			c.manager.BufferDataForOfflineConnector(offlineTarget, packet)
+			log.Printf("📦 Buffered data for offline connector %s in channel %s", offlineTarget, c.ChannelID)
+		}
+	}
+
+	if len(offlineTargets) > 0 {
+		log.Printf("🔍 Found %d offline targets for packet in channel %s", len(offlineTargets), c.ChannelID)
+	}
+
+	// 决定是否需要频道级别的缓冲
+	shouldBuffer := false
+	if len(packet.TargetIDs) > 0 {
+		// 检查指定的目标接收者是否有未订阅但在线的
+		for _, targetID := range packet.TargetIDs {
+			if c.CanReceive(targetID) {
+				if _, subscribed := c.subscribers[targetID]; !subscribed {
+					// 只有在线但未订阅的才需要频道级别缓冲
+					if c.manager == nil || c.manager.IsConnectorOnline(targetID) {
+						shouldBuffer = true
+						break
+					}
+				}
+			}
+		}
+	}
 
 	c.mu.RUnlock()
 
 	if shouldBuffer {
-		// 有指定的目标接收者未订阅，暂存数据等待他们订阅
+		// 有指定的目标接收者未订阅（但在线），暂存数据等待他们订阅
 		c.bufferMu.Lock()
 		if len(c.buffer) >= c.maxBufferSize {
 			c.bufferMu.Unlock()
@@ -801,16 +865,33 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 	subChan := make(chan *DataPacket, 100)
 	c.subscribers[subscriberID] = subChan
 
-	// 先发送暂存的数据
+	// 先发送暂存的数据（频道级别缓冲）
 	c.bufferMu.Lock()
 	bufferedPackets := make([]*DataPacket, len(c.buffer))
 	copy(bufferedPackets, c.buffer)
 	c.buffer = c.buffer[:0] // 清空缓冲区
 	c.bufferMu.Unlock()
 
-	// 在goroutine中发送暂存的数据，避免阻塞
+	// 获取连接器级别的离线缓冲数据
+	connectorBufferedPackets := []*DataPacket{}
+	if c.manager != nil {
+		connectorBufferedPackets = c.manager.GetBufferedDataForConnector(subscriberID)
+		log.Printf("🔍 Connector %s has %d buffered packets", subscriberID, len(connectorBufferedPackets))
+	}
+
+	// 合并所有缓冲数据
+	allBufferedPackets := append(bufferedPackets, connectorBufferedPackets...)
+
+	log.Printf("📊 Total buffered packets for %s: %d (channel: %d, connector: %d)",
+		subscriberID, len(allBufferedPackets), len(bufferedPackets), len(connectorBufferedPackets))
+
+	// 在goroutine中发送所有暂存的数据，避免阻塞
 	go func() {
-		for _, packet := range bufferedPackets {
+		if len(allBufferedPackets) > 0 {
+			log.Printf("📤 Sending %d buffered packets to recovered connector %s", len(allBufferedPackets), subscriberID)
+		}
+
+		for _, packet := range allBufferedPackets {
 			// 检查是否应该发送给此订阅者
 			if shouldSendToSubscriber(packet, subscriberID) {
 				select {
@@ -818,6 +899,7 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 					// 成功发送暂存数据
 				case <-time.After(1 * time.Second):
 					// 超时，跳过
+					log.Printf("⚠️ Timeout sending buffered packet to %s", subscriberID)
 				}
 			}
 		}
@@ -884,6 +966,76 @@ func (c *Channel) GetSubscriberCount() int {
 	return len(c.subscribers)
 }
 
+// IsSubscribed 检查连接器是否已订阅频道
+func (c *Channel) IsSubscribed(subscriberID string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, exists := c.subscribers[subscriberID]
+	return exists
+}
+
+// Resubscribe 重新订阅（用于重启恢复场景）
+func (c *Channel) Resubscribe(subscriberID string) (chan *DataPacket, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.Status != ChannelStatusActive {
+		return nil, fmt.Errorf("channel is not active")
+	}
+
+	// 验证订阅者是否是接收方
+	if !c.CanReceive(subscriberID) {
+		return nil, fmt.Errorf("subscriber %s is not authorized to receive data from this channel", subscriberID)
+	}
+
+	// 如果已经订阅，先清理旧的订阅
+	if oldChan, exists := c.subscribers[subscriberID]; exists {
+		close(oldChan)
+		delete(c.subscribers, subscriberID)
+	}
+
+	// 创建新的订阅通道
+	subChan := make(chan *DataPacket, 100)
+	c.subscribers[subscriberID] = subChan
+
+	// 先发送暂存的数据（频道级别缓冲）
+	c.bufferMu.Lock()
+	bufferedPackets := make([]*DataPacket, len(c.buffer))
+	copy(bufferedPackets, c.buffer)
+	c.buffer = c.buffer[:0] // 清空缓冲区
+	c.bufferMu.Unlock()
+
+	// 获取连接器级别的离线缓冲数据
+	connectorBufferedPackets := []*DataPacket{}
+	if c.manager != nil {
+		connectorBufferedPackets = c.manager.GetBufferedDataForConnector(subscriberID)
+		log.Printf("🔍 Connector %s has %d buffered packets", subscriberID, len(connectorBufferedPackets))
+	}
+
+	// 合并所有缓冲数据
+	allBufferedPackets := append(bufferedPackets, connectorBufferedPackets...)
+
+	log.Printf("📊 Total buffered packets for %s: %d (channel: %d, connector: %d)",
+		subscriberID, len(allBufferedPackets), len(bufferedPackets), len(connectorBufferedPackets))
+
+	// 在goroutine中发送所有暂存的数据，避免阻塞
+	go func() {
+		if len(allBufferedPackets) > 0 {
+			log.Printf("📤 Sending %d buffered packets to recovered connector %s", len(allBufferedPackets), subscriberID)
+		}
+		for _, packet := range allBufferedPackets {
+			select {
+			case subChan <- packet:
+			case <-time.After(5 * time.Second):
+				log.Printf("⚠️ Timeout sending buffered packet to %s", subscriberID)
+				return
+			}
+		}
+	}()
+
+	return subChan, nil
+}
+
 // CleanupInactiveChannels 清理不活跃的频道（超过1小时没有活动）
 func (cm *ChannelManager) CleanupInactiveChannels(inactiveThreshold time.Duration) int {
 	cm.mu.Lock()
@@ -900,6 +1052,130 @@ func (cm *ChannelManager) CleanupInactiveChannels(inactiveThreshold time.Duratio
 	}
 
 	return cleaned
+}
+
+// ------------------------------------------------------------
+// 连接器状态管理（重启恢复）
+// ------------------------------------------------------------
+
+// MarkConnectorOnline 标记连接器在线
+func (cm *ChannelManager) MarkConnectorOnline(connectorID string) {
+	cm.connectorMu.Lock()
+	defer cm.connectorMu.Unlock()
+
+	oldStatus := cm.connectorStatus[connectorID]
+	cm.connectorStatus[connectorID] = ConnectorStatusOnline
+	cm.lastActivity[connectorID] = time.Now()
+
+	// 如果是从离线状态恢复，记录恢复事件
+	if oldStatus == ConnectorStatusOffline {
+		log.Printf("🔄 Connector %s recovered from offline state", connectorID)
+	}
+}
+
+// MarkConnectorOffline 标记连接器离线
+func (cm *ChannelManager) MarkConnectorOffline(connectorID string) {
+	cm.connectorMu.Lock()
+	defer cm.connectorMu.Unlock()
+
+	cm.connectorStatus[connectorID] = ConnectorStatusOffline
+	log.Printf("📴 Connector %s marked as offline", connectorID)
+}
+
+// IsConnectorOnline 检查连接器是否在线
+func (cm *ChannelManager) IsConnectorOnline(connectorID string) bool {
+	cm.connectorMu.RLock()
+	defer cm.connectorMu.RUnlock()
+	return cm.connectorStatus[connectorID] == ConnectorStatusOnline
+}
+
+// BufferDataForOfflineConnector 为离线连接器缓冲数据
+func (cm *ChannelManager) BufferDataForOfflineConnector(connectorID string, packet *DataPacket) {
+	cm.connectorMu.Lock()
+	defer cm.connectorMu.Unlock()
+
+	// 检查缓冲区大小限制（每个连接器最多缓冲1000个数据包）
+	if len(cm.connectorBuffers[connectorID]) >= 1000 {
+		// 如果缓冲区满了，移除最旧的数据包
+		cm.connectorBuffers[connectorID] = cm.connectorBuffers[connectorID][1:]
+	}
+
+	// 复制数据包
+	bufferedPacket := &DataPacket{
+		ChannelID:      packet.ChannelID,
+		SequenceNumber: packet.SequenceNumber,
+		Payload:        make([]byte, len(packet.Payload)),
+		Signature:      packet.Signature,
+		Timestamp:      packet.Timestamp,
+		SenderID:       packet.SenderID,
+		TargetIDs:      make([]string, len(packet.TargetIDs)),
+	}
+	copy(bufferedPacket.Payload, packet.Payload)
+	copy(bufferedPacket.TargetIDs, packet.TargetIDs)
+
+	// 添加到缓冲区
+	cm.connectorBuffers[connectorID] = append(cm.connectorBuffers[connectorID], bufferedPacket)
+}
+
+// GetBufferedDataForConnector 获取连接器的缓冲数据
+func (cm *ChannelManager) GetBufferedDataForConnector(connectorID string) []*DataPacket {
+	cm.connectorMu.Lock()
+	defer cm.connectorMu.Unlock()
+
+	bufferedPackets := make([]*DataPacket, len(cm.connectorBuffers[connectorID]))
+	copy(bufferedPackets, cm.connectorBuffers[connectorID])
+
+	// 清空缓冲区
+	cm.connectorBuffers[connectorID] = nil
+
+	return bufferedPackets
+}
+
+// CleanupExpiredConnectorBuffers 清理过期的连接器缓冲数据
+func (cm *ChannelManager) CleanupExpiredConnectorBuffers(maxAge time.Duration) int {
+	cm.connectorMu.Lock()
+	defer cm.connectorMu.Unlock()
+
+	cleanupCount := 0
+	cutoffTime := time.Now().Add(-maxAge)
+
+	for connectorID, buffers := range cm.connectorBuffers {
+		if len(buffers) == 0 {
+			continue
+		}
+
+		// 检查连接器是否长时间未活动
+		lastActivity, exists := cm.lastActivity[connectorID]
+		if exists && lastActivity.Before(cutoffTime) {
+			// 清理过期缓冲区
+			delete(cm.connectorBuffers, connectorID)
+			delete(cm.lastActivity, connectorID)
+			delete(cm.connectorStatus, connectorID)
+			cleanupCount++
+			log.Printf("🧹 Cleaned up expired buffers for offline connector %s", connectorID)
+		}
+	}
+
+	return cleanupCount
+}
+
+// StartBufferCleanupRoutine 启动缓冲区清理协程
+func (cm *ChannelManager) StartBufferCleanupRoutine() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute) // 每10分钟清理一次
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				cleanupCount := cm.CleanupExpiredConnectorBuffers(1 * time.Hour) // 清理1小时前离线的连接器缓冲
+				if cleanupCount > 0 {
+					log.Printf("🧹 Cleaned up buffers for %d offline connectors", cleanupCount)
+				}
+			}
+		}
+	}()
+	log.Println("✓ Started connector buffer cleanup routine")
 }
 
 // ------------------------------------------------------------

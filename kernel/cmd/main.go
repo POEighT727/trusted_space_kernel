@@ -82,6 +82,7 @@ func main() {
 	// 3. 频道管理器
 	channelManager := circulation.NewChannelManager()
 	channelManager.StartCleanupRoutine()
+	channelManager.StartBufferCleanupRoutine() // 启动连接器缓冲清理协程
 	log.Println("✓ Channel manager initialized")
 
 	// 4. 数据库管理器（如果启用）

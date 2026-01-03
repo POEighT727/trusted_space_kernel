@@ -263,16 +263,16 @@ func (al *AuditLog) SubmitEvidence(connectorID string, eventType EventType, chan
 
 	// 更新内存缓存（如果启用）
 	if al.records != nil {
-		al.records = append(al.records, record)
-		al.indexByID[txID] = record
+	al.records = append(al.records, record)
+	al.indexByID[txID] = record
 
-		if channelID != "" {
-			al.indexByCh[channelID] = append(al.indexByCh[channelID], record)
-		}
+	if channelID != "" {
+		al.indexByCh[channelID] = append(al.indexByCh[channelID], record)
+	}
 
-		if connectorID != "" {
-			al.indexByConn[connectorID] = append(al.indexByConn[connectorID], record)
-		}
+	if connectorID != "" {
+		al.indexByConn[connectorID] = append(al.indexByConn[connectorID], record)
+	}
 	}
 
 	// 通过频道传输存证数据（分布式存储）
@@ -436,10 +436,10 @@ func (al *AuditLog) GetRecordCount() int {
 
 // VerifyRecord 验证单个记录的完整性
 func (al *AuditLog) VerifyRecord(record *EvidenceRecord) error {
-	calculatedHash := al.calculateRecordHash(record)
+		calculatedHash := al.calculateRecordHash(record)
 	if calculatedHash != record.Hash {
 		return fmt.Errorf("hash mismatch: expected=%s, got=%s", record.Hash, calculatedHash)
-	}
+		}
 	return nil
 }
 

@@ -771,6 +771,15 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 		return fmt.Errorf("subscriber verification failed: %v", err)
 	}
 
+	// 标记连接器为在线状态（用于重启恢复）
+	wasOffline := !s.channelManager.IsConnectorOnline(req.ConnectorId)
+	s.channelManager.MarkConnectorOnline(req.ConnectorId)
+
+	// 在连接断开时标记为离线
+	defer func() {
+		s.channelManager.MarkConnectorOffline(req.ConnectorId)
+	}()
+
 	// 获取频道
 	channel, err := s.channelManager.GetChannel(req.ChannelId)
 	if err != nil {
@@ -783,12 +792,52 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 		channel.AddParticipant(req.ConnectorId)
 	}
 
-	// 订阅频道
-	dataChan, err := channel.Subscribe(req.ConnectorId)
+	// 检查是否已经订阅（针对重启恢复场景）
+	var dataChan chan *circulation.DataPacket
+	if channel.IsSubscribed(req.ConnectorId) {
+		// 如果已经订阅，说明是从离线状态恢复，直接重新订阅
+		log.Printf("🔄 Connector %s re-subscribing to channel %s (recovery)", req.ConnectorId, req.ChannelId)
+		dataChan, err = channel.Resubscribe(req.ConnectorId)
+	} else {
+		// 正常订阅
+		dataChan, err = channel.Subscribe(req.ConnectorId)
+	}
 	if err != nil {
 		return fmt.Errorf("subscription failed: %v", err)
 	}
 	defer channel.Unsubscribe(req.ConnectorId)
+
+	// 如果是从离线状态恢复，发送频道激活通知
+	if wasOffline {
+		log.Printf("🔄 Connector %s recovered from offline state, sending channel notification", req.ConnectorId)
+		go func() {
+			// 构造频道通知
+			channelType := pb.ChannelType_CHANNEL_TYPE_DATA
+			if channel.ChannelType == circulation.ChannelTypeLog {
+				channelType = pb.ChannelType_CHANNEL_TYPE_LOG
+			}
+
+			negotiationStatus := pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED
+
+			notification := &pb.ChannelNotification{
+				ChannelId:         channel.ChannelID,
+				CreatorId:         channel.CreatorID,
+				SenderIds:         channel.SenderIDs,
+				ReceiverIds:       channel.ReceiverIDs,
+				ChannelType:       channelType,
+				Encrypted:         channel.Encrypted,
+				RelatedChannelIds: channel.RelatedChannelIDs,
+				DataTopic:         channel.DataTopic,
+				CreatedAt:         channel.CreatedAt.Unix(),
+				NegotiationStatus: negotiationStatus,
+			}
+
+			// 发送通知给重新连接的连接器
+			if err := s.notificationManager.Notify(req.ConnectorId, notification); err != nil {
+				log.Printf("⚠️ Failed to send recovery notification to %s: %v", req.ConnectorId, err)
+			}
+		}()
+	}
 
 	// 持续发送数据
 	for {
