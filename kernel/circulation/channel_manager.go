@@ -324,6 +324,24 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 					return
 				}
 
+				// 检查是否已经存在存证频道
+				hasEvidenceChannel := false
+				for _, relatedID := range dataChannel.RelatedChannelIDs {
+					if relatedChannel, exists := cm.channels[relatedID]; exists {
+						if relatedChannel.ChannelType == ChannelTypeLog &&
+						   relatedChannel.DataTopic == dataChannel.DataTopic+"-evidence" {
+							hasEvidenceChannel = true
+							log.Printf("✓ Evidence channel already exists for data channel %s", channelID)
+							break
+						}
+					}
+				}
+
+				if hasEvidenceChannel {
+					log.Printf("⏭ Skipping evidence channel creation for %s (already exists)", channelID)
+					return
+				}
+
 				log.Printf("🔄 Creating evidence channel for data channel %s (type: %v)", channelID, dataChannel.ChannelType)
 				evidenceChannel, err := cm.createEvidenceChannel(dataChannel)
 				if err != nil {
@@ -421,21 +439,8 @@ func (cm *ChannelManager) CreateChannel(creatorID, approverID string, senderIDs,
 		return nil, err
 	}
 
-	// 如果是数据频道，自动创建配套的存证频道
-	if channelType == ChannelTypeData {
-		evidenceChannel, err := cm.createEvidenceChannel(channel)
-		if err != nil {
-			// 如果存证频道创建失败，关闭主频道
-			cm.CloseChannel(channel.ChannelID)
-			return nil, fmt.Errorf("failed to create evidence channel: %w", err)
-		}
-
-		// 更新关联频道ID
-		cm.mu.Lock()
-		channel.RelatedChannelIDs = append(channel.RelatedChannelIDs, evidenceChannel.ChannelID)
-		evidenceChannel.RelatedChannelIDs = []string{channel.ChannelID}
-		cm.mu.Unlock()
-	}
+	// 注意：存证频道不在创建时同步创建，而是在频道激活时异步创建
+	// 这样可以避免协商模式下的重复创建问题
 
 	return channel, nil
 }
@@ -718,23 +723,25 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		targetReceivers = validTargets
 	}
 	
-	// 检查所有目标接收者是否都已订阅
-	allTargetsSubscribed := true
-	if len(targetReceivers) > 0 {
-		for _, targetID := range targetReceivers {
-			if _, subscribed := c.subscribers[targetID]; !subscribed {
-				allTargetsSubscribed = false
-				break
+	// 决定是否需要缓冲：只有当指定了目标接收者且有目标未订阅时才缓冲
+	shouldBuffer := false
+	if len(packet.TargetIDs) > 0 {
+		// 检查指定的目标接收者是否都已订阅
+		for _, targetID := range packet.TargetIDs {
+			if c.CanReceive(targetID) { // 只检查频道接收者
+				if _, subscribed := c.subscribers[targetID]; !subscribed {
+					shouldBuffer = true
+					break
+				}
 			}
 		}
-	} else {
-		// 没有目标接收者（只有发送者自己），不需要缓冲
-		allTargetsSubscribed = true
 	}
+	// 注意：如果没有指定TargetIDs或TargetIDs为空，数据会广播给所有订阅者，不需要缓冲
+
 	c.mu.RUnlock()
 
-	if !allTargetsSubscribed {
-		// 有目标接收者未订阅，暂存数据
+	if shouldBuffer {
+		// 有指定的目标接收者未订阅，暂存数据等待他们订阅
 		c.bufferMu.Lock()
 		if len(c.buffer) >= c.maxBufferSize {
 			c.bufferMu.Unlock()
