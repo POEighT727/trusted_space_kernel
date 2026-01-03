@@ -1,0 +1,1208 @@
+package main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/trusted-space/kernel/connector/client"
+	pb "github.com/trusted-space/kernel/proto/kernel/v1"
+)
+
+// Config 连接器配置
+type Config struct {
+	Connector struct {
+		ID         string `yaml:"id"`
+		EntityType string `yaml:"entity_type"`
+		PublicKey  string `yaml:"public_key"`
+	} `yaml:"connector"`
+
+	Kernel struct {
+		Address string `yaml:"address"`
+		Port    int    `yaml:"port"`
+	} `yaml:"kernel"`
+
+	Security struct {
+		CACertPath     string `yaml:"ca_cert_path"`
+		ClientCertPath string `yaml:"client_cert_path"`
+		ClientKeyPath  string `yaml:"client_key_path"`
+		ServerName     string `yaml:"server_name"`
+	} `yaml:"security"`
+
+	Evidence struct {
+		LocalStorage bool   `yaml:"local_storage"` // 是否启用本地存证存储
+		StoragePath  string `yaml:"storage_path"`  // 本地存证存储路径
+	} `yaml:"evidence"`
+}
+
+func main() {
+	// 解析命令行参数
+	configPath := flag.String("config", "config/connector.yaml", "path to config file")
+	flag.Parse()
+
+	// 加载配置
+	config, err := loadConfig(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// 检查证书是否存在，如果不存在则进行首次注册
+	if _, err := os.Stat(config.Security.ClientCertPath); os.IsNotExist(err) {
+		fmt.Println("未找到证书文件，开始首次注册...")
+		
+		// 读取配置模板（如果存在）
+		configYAML := ""
+		if configData, err := os.ReadFile(*configPath); err == nil {
+			configYAML = string(configData)
+		}
+		
+		// 连接到引导端点（主端口+1）
+		bootstrapPort := config.Kernel.Port + 1
+		bootstrapAddr := fmt.Sprintf("%s:%d", config.Kernel.Address, bootstrapPort)
+		
+		fmt.Printf("正在连接到引导服务器 %s...\n", bootstrapAddr)
+		
+		// 注册并获取证书
+		certPEM, keyPEM, caCertPEM, err := client.RegisterConnector(
+			bootstrapAddr,
+			config.Connector.ID,
+			config.Connector.EntityType,
+			config.Connector.PublicKey,
+			configYAML,
+		)
+		if err != nil {
+			log.Fatalf("注册失败: %v", err)
+		}
+		
+		// 保存证书文件
+		if err := os.WriteFile(config.Security.ClientCertPath, certPEM, 0600); err != nil {
+			log.Fatalf("保存证书失败: %v", err)
+		}
+		if err := os.WriteFile(config.Security.ClientKeyPath, keyPEM, 0600); err != nil {
+			log.Fatalf("保存私钥失败: %v", err)
+		}
+		if err := os.WriteFile(config.Security.CACertPath, caCertPEM, 0644); err != nil {
+			log.Fatalf("保存CA证书失败: %v", err)
+		}
+		
+		fmt.Println("✓ 证书已保存")
+	}
+
+	// 创建连接器
+	serverAddr := fmt.Sprintf("%s:%d", config.Kernel.Address, config.Kernel.Port)
+
+	connector, err := client.NewConnector(&client.Config{
+		ConnectorID:    config.Connector.ID,
+		EntityType:     config.Connector.EntityType,
+		PublicKey:      config.Connector.PublicKey,
+		ServerAddr:     serverAddr,
+		CACertPath:     config.Security.CACertPath,
+		ClientCertPath: config.Security.ClientCertPath,
+		ClientKeyPath:  config.Security.ClientKeyPath,
+		ServerName:     config.Security.ServerName,
+		EvidenceLocalStorage: config.Evidence.LocalStorage,
+		EvidenceStoragePath:  config.Evidence.StoragePath,
+	})
+	if err != nil {
+		log.Fatalf("Failed to create connector: %v", err)
+	}
+	defer connector.Close()
+
+	// 连接到内核
+	fmt.Printf("正在连接到内核 %s...\n", serverAddr)
+	if err := connector.Connect(); err != nil {
+		log.Fatalf("连接失败: %v", err)
+	}
+
+	fmt.Printf("✓ 连接成功！连接器ID: %s\n", config.Connector.ID)
+	
+	// 启动自动通知监听（所有连接器都会自动等待频道创建通知）
+	fmt.Println("正在启动自动通知监听...")
+	if err := connector.StartAutoNotificationListener(func(notification *pb.ChannelNotification) {
+		// 通知回调：根据协商状态显示不同消息
+		switch notification.NegotiationStatus {
+		case pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_PROPOSED:
+			fmt.Printf("\n📋 收到频道提议通知:\n")
+		case pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED:
+			fmt.Printf("\n📢 频道已正式创建并激活:\n")
+		case pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_REJECTED:
+			fmt.Printf("\n❌ 频道提议已被拒绝:\n")
+		default:
+			fmt.Printf("\n📢 收到频道通知:\n")
+		}
+
+		fmt.Printf("   频道ID: %s\n", notification.ChannelId)
+		fmt.Printf("   创建者: %s\n", notification.CreatorId)
+		fmt.Printf("   发送方: %v\n", notification.SenderIds)
+		fmt.Printf("   接收方: %v\n", notification.ReceiverIds)
+		fmt.Printf("   频道类型: %s\n", notification.ChannelType.String())
+		fmt.Printf("   加密: %v\n", notification.Encrypted)
+		if len(notification.RelatedChannelIds) > 0 {
+			fmt.Printf("   关联频道: %v\n", notification.RelatedChannelIds)
+		}
+		fmt.Printf("   数据主题: %s\n", notification.DataTopic)
+		fmt.Printf("   创建时间: %s\n", time.Unix(notification.CreatedAt, 0).Format("2006-01-02 15:04:05"))
+	}); err != nil {
+		log.Printf("⚠ 启动自动通知监听失败: %v", err)
+	} else {
+		fmt.Println("✓ 自动通知监听已启动（连接器状态: active，将自动订阅频道）")
+	}
+	
+	fmt.Println("✓ 已进入交互模式，输入 'help' 查看可用命令")
+	fmt.Println()
+
+	// 优雅关闭
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// 启动交互式命令行
+	go runInteractiveShell(connector, config.Connector.ID)
+
+	// 等待信号
+	<-sigChan
+	fmt.Println("\n正在关闭连接器...")
+}
+
+// runInteractiveShell 运行交互式命令行
+func runInteractiveShell(connector *client.Connector, connectorID string) {
+	scanner := bufio.NewScanner(os.Stdin)
+	
+	for {
+		fmt.Print(fmt.Sprintf("[%s] > ", connectorID))
+		
+		if !scanner.Scan() {
+			break
+		}
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+
+		command := parts[0]
+		args := parts[1:]
+
+		switch command {
+		case "help", "h":
+			printHelp()
+		case "list", "ls":
+			handleList(connector)
+		case "info":
+			handleInfo(connector, args)
+		case "create":
+			handleCreateChannel(connector, args)
+		case "accept":
+			handleAcceptProposal(connector, args)
+		case "reject":
+			handleRejectProposal(connector, args)
+		case "propose":
+			fmt.Println("❌ 'propose' command is deprecated - use 'create' command instead")
+		case "sendto":
+			handleSendTo(connector, args)
+		case "subscribe", "sub":
+			handleSubscribe(connector, args)
+		case "receive", "recv":
+			fmt.Println("❌ 'receive' command is deprecated - use 'subscribe' command instead")
+		case "channels", "ch":
+			handleChannels(connector)
+		case "request-permission":
+			handleRequestPermission(connector, args)
+		case "approve-permission":
+			handleApprovePermission(connector, args)
+		case "reject-permission":
+			handleRejectPermission(connector, args)
+		case "list-permissions":
+			handleListPermissions(connector, args)
+		case "status":
+			handleStatus(connector, args)
+		case "exit", "quit", "q":
+			fmt.Println("退出连接器...")
+			os.Exit(0)
+	default:
+			fmt.Printf("未知命令: %s。输入 'help' 查看可用命令\n", command)
+		}
+	}
+}
+
+// printHelp 打印帮助信息
+func printHelp() {
+	fmt.Println("可用命令:")
+	fmt.Println("  list, ls              - 列出空间中的所有连接器")
+	fmt.Println("  info <connector_id>   - 查看指定连接器的详细信息")
+	fmt.Println("  create --sender <sender_ids> --receiver <receiver_ids> [--approver <approver_id>] [--reason <reason>] - 创建频道")
+    fmt.Println("    发起频道创建提议，支持多个发送方和接收方，需要所有参与方确认后才能使用")
+    fmt.Println("    示例: create --sender connector-A --receiver connector-B --reason \"data exchange\"")
+    fmt.Println("    示例: create --sender connector-A,connector-B --receiver connector-C,connector-D --reason \"group chat\"")
+	fmt.Println("  accept <channel_id> <proposal_id> - 接受频道提议")
+	fmt.Println("    示例: accept channel-123 proposal-456")
+	fmt.Println("  reject <channel_id> <proposal_id> [--reason <reason>] - 拒绝频道提议")
+	fmt.Println("    示例: reject channel-123 proposal-456 --reason \"not authorized\"")
+	fmt.Println("  sendto <channel_id> [file_path] - 向频道发送数据或文件")
+    fmt.Println("    如果提供file_path且文件存在，则发送文件；否则进入文本发送模式")
+    fmt.Println("    注意: 单对单模式下，数据会自动发送给频道的接收方")
+    fmt.Println("    示例: sendto channel-123                    (文本模式)")
+    fmt.Println("    示例: sendto channel-123 /path/to/file.txt  (发送文件)")
+	fmt.Println("  subscribe <channel_id> [--role <sender|receiver>] [--reason <reason>] [output_dir] - 订阅频道")
+    fmt.Println("    频道外连接器：申请加入频道指定角色（需要审批通过后才能订阅）")
+    fmt.Println("    频道内连接器：直接订阅频道开始接收数据")
+    fmt.Println("    自动识别文件传输数据包和普通文本数据包，文件保存到output_dir（默认: ./received）")
+	fmt.Println("  channels, ch          - 查看当前连接器参与的频道信息")
+	fmt.Println("  request-permission <channel_id> <change_type> <target_id> <reason> - 申请权限变更")
+	fmt.Println("    change_type: add_sender, remove_sender, add_receiver, remove_receiver")
+	fmt.Println("    示例: request-permission channel-123 add_sender connector-X \"需要发送数据\"")
+	fmt.Println("  approve-permission <channel_id> <request_id> - 批准权限变更或订阅申请（仅频道参与者可用）")
+	fmt.Println("    示例: approve-permission channel-123 req-456")
+	fmt.Println("  reject-permission <channel_id> <request_id> <reason> - 拒绝权限变更或订阅申请（仅频道参与者可用）")
+	fmt.Println("    示例: reject-permission channel-123 req-456 \"权限不足\"")
+	fmt.Println("  list-permissions <channel_id> - 查看频道的权限变更请求")
+	fmt.Println("  status [active|inactive|closed] - 查看或设置连接器状态")
+	fmt.Println("  help, h               - 显示此帮助信息")
+	fmt.Println("  exit, quit, q         - 退出连接器")
+	fmt.Println("")
+	fmt.Println("频道协商流程:")
+	fmt.Println("  1. 创建者发起频道提议: create --sender A,B --receiver C,D --reason \"...\"")
+	fmt.Println("  2. 所有发送方和接收方都需要确认:")
+	fmt.Println("     - 每个参与方确认: accept <channel_id> <proposal_id>")
+	fmt.Println("     - 任意方拒绝: reject <channel_id> <proposal_id> --reason \"...\"")
+	fmt.Println("  3. 所有参与方确认后频道激活，可使用: sendto <channel_id>")
+}
+
+// handleList 处理列出连接器命令
+func handleList(connector *client.Connector) {
+	fmt.Println("正在查询空间中的连接器...")
+	
+	connectors, err := connector.DiscoverConnectors("")
+	if err != nil {
+		fmt.Printf("❌ 查询失败: %v\n", err)
+		return
+	}
+
+	if len(connectors) == 0 {
+		fmt.Println("空间中没有其他连接器")
+		return
+	}
+
+	fmt.Printf("\n找到 %d 个连接器:\n", len(connectors))
+	fmt.Println(strings.Repeat("-", 80))
+	fmt.Printf("%-20s %-15s %-10s %-20s\n", "连接器ID", "实体类型", "状态", "最后心跳")
+	fmt.Println(strings.Repeat("-", 80))
+
+	for _, c := range connectors {
+		lastHeartbeat := time.Unix(c.LastHeartbeat, 0)
+		timeStr := time.Since(lastHeartbeat).Round(time.Second).String()
+		fmt.Printf("%-20s %-15s %-10s %-20s\n", 
+			c.ConnectorId, 
+			c.EntityType, 
+			c.Status,
+			timeStr+"前")
+	}
+	fmt.Println(strings.Repeat("-", 80))
+}
+
+// handleInfo 处理查看连接器信息命令
+func handleInfo(connector *client.Connector, args []string) {
+	if len(args) == 0 {
+		fmt.Println("用法: info <connector_id>")
+		return
+	}
+
+	connectorID := args[0]
+	fmt.Printf("正在查询连接器 %s 的信息...\n", connectorID)
+
+	info, err := connector.GetConnectorInfo(connectorID)
+	if err != nil {
+		fmt.Printf("❌ 查询失败: %v\n", err)
+		return
+	}
+
+	fmt.Println("\n连接器信息:")
+	fmt.Println(strings.Repeat("-", 50))
+	fmt.Printf("连接器ID:     %s\n", info.ConnectorId)
+	fmt.Printf("实体类型:     %s\n", info.EntityType)
+	fmt.Printf("状态:         %s\n", info.Status)
+	fmt.Printf("公钥:         %s\n", truncateString(info.PublicKey, 50))
+	fmt.Printf("最后心跳:     %s\n", time.Unix(info.LastHeartbeat, 0).Format("2006-01-02 15:04:05"))
+	fmt.Printf("注册时间:     %s\n", time.Unix(info.RegisteredAt, 0).Format("2006-01-02 15:04:05"))
+	fmt.Println(strings.Repeat("-", 50))
+}
+
+// handleCreateChannel 处理创建频道命令
+func handleCreateChannel(connector *client.Connector, args []string) {
+	if len(args) < 2 {
+		fmt.Println("❌ 参数错误: create --sender <sender_ids> --receiver <receiver_ids> [--approver <approver_id>] [--reason <reason>]")
+		fmt.Println("   支持多个发送方和接收方，使用逗号分隔多个ID")
+		fmt.Println("   示例: create --sender connector-A,connector-B --receiver connector-C --reason \"data exchange\"")
+		return
+	}
+
+	var senderIDs []string
+	var receiverIDs []string
+	approverID := "" // 默认为空，表示使用创建者作为批准者
+	reason := "channel proposal"
+
+	// 解析参数
+	i := 0
+	for i < len(args) {
+		switch args[i] {
+		case "--sender":
+			if i+1 < len(args) {
+				// 支持逗号分隔的多个发送方ID
+				senderList := strings.Split(args[i+1], ",")
+				for _, sender := range senderList {
+					sender = strings.TrimSpace(sender)
+					if sender != "" {
+						senderIDs = append(senderIDs, sender)
+					}
+				}
+				i += 2
+			} else {
+				fmt.Println("❌ --sender 参数需要提供发送方ID")
+				return
+			}
+		case "--receiver":
+			if i+1 < len(args) {
+				// 支持逗号分隔的多个接收方ID
+				receiverList := strings.Split(args[i+1], ",")
+				for _, receiver := range receiverList {
+					receiver = strings.TrimSpace(receiver)
+					if receiver != "" {
+						receiverIDs = append(receiverIDs, receiver)
+					}
+				}
+				i += 2
+			} else {
+				fmt.Println("❌ --receiver 参数需要提供接收方ID")
+				return
+			}
+		case "--approver":
+			if i+1 < len(args) {
+				approverID = args[i+1]
+				i += 2
+			} else {
+				fmt.Println("❌ --approver 参数需要提供批准者ID")
+				return
+			}
+		case "--reason":
+			if i+1 < len(args) {
+				reason = strings.Join(args[i+1:], " ")
+				i = len(args) // 结束解析
+			} else {
+				fmt.Println("❌ --reason 参数需要提供理由")
+				return
+			}
+		default:
+			fmt.Printf("❌ 未知参数: %s\n", args[i])
+			return
+		}
+	}
+
+	if len(senderIDs) == 0 || len(receiverIDs) == 0 {
+		fmt.Println("❌ 必须至少指定一个 --sender 和一个 --receiver 参数")
+		return
+	}
+
+	// 去重
+	senderIDs = removeDuplicates(senderIDs)
+	receiverIDs = removeDuplicates(receiverIDs)
+
+	fmt.Printf("正在提议创建频道，发送方: %v, 接收方: %v...\n", senderIDs, receiverIDs)
+	if approverID != "" {
+		fmt.Printf("权限批准者: %s\n", approverID)
+	} else {
+		fmt.Println("权限批准者: 默认(创建者)")
+	}
+
+	channelID, proposalID, err := connector.ProposeChannel(senderIDs, receiverIDs, "", approverID, reason)
+	if err != nil {
+		fmt.Printf("❌ 提议创建频道失败: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✓ 频道提议创建成功\n")
+	fmt.Printf("  频道ID: %s\n", channelID)
+	fmt.Printf("  提议ID: %s\n", proposalID)
+
+	// 显示需要哪些参与方确认（创建者自动接受，不需要确认）
+	fmt.Println("  需要以下参与方确认:")
+	selfID := connector.GetID()
+	hasOthers := false
+	for _, senderID := range senderIDs {
+		if senderID != selfID { // 创建者自己不需要确认
+			fmt.Printf("    - 发送方 %s 需要确认\n", senderID)
+			hasOthers = true
+		}
+	}
+	for _, receiverID := range receiverIDs {
+		fmt.Printf("    - 接收方 %s 需要确认\n", receiverID)
+		hasOthers = true
+	}
+	if !hasOthers {
+		fmt.Println("    - 无（所有参与方都是创建者自己）")
+	}
+	fmt.Println("  创建者已自动接受，等待其他参与方确认后频道将自动激活...")
+}
+
+// handleAcceptProposal 处理接受提议命令
+func handleAcceptProposal(connector *client.Connector, args []string) {
+	if len(args) != 2 {
+		fmt.Println("❌ 参数错误: accept <channel_id> <proposal_id>")
+		return
+	}
+
+	channelID := args[0]
+	proposalID := args[1]
+
+	fmt.Printf("正在接受频道提议: %s...\n", channelID)
+
+	err := connector.AcceptChannelProposal(channelID, proposalID)
+	if err != nil {
+		fmt.Printf("❌ 接受频道提议失败: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✓ 已确认频道提议 %s\n", proposalID)
+	fmt.Println("  等待其他参与方确认，频道将自动激活...")
+}
+
+// handleRejectProposal 处理拒绝提议命令
+func handleRejectProposal(connector *client.Connector, args []string) {
+	if len(args) < 2 {
+		fmt.Println("❌ 参数错误: reject <channel_id> <proposal_id> [--reason <reason>]")
+		return
+	}
+
+	channelID := args[0]
+	proposalID := args[1]
+	reason := "no reason provided"
+
+	// 解析可选的 --reason 参数
+	if len(args) >= 4 && args[2] == "--reason" {
+		reason = strings.Join(args[3:], " ")
+	}
+
+	fmt.Printf("正在拒绝频道提议: %s...\n", channelID)
+
+	err := connector.RejectChannelProposal(channelID, proposalID, reason)
+	if err != nil {
+		fmt.Printf("❌ 拒绝频道提议失败: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✓ 频道提议已拒绝，频道将被关闭: %s\n", reason)
+}
+
+// handleCreateChannel removed - direct channel creation is not allowed
+
+// handleSendTo 处理向已存在频道发送数据命令（频道内所有参与者可互相发送）
+// 用法: sendto <channel_id> [file_path] [@receiver_id]
+// 如果提供file_path且文件存在，则发送文件；否则进入文本发送模式
+func handleSendTo(connector *client.Connector, args []string) {
+	if len(args) == 0 {
+		fmt.Println("用法: sendto <channel_id> [file_path] [@receiver_id]")
+		fmt.Println("说明: 向已存在的频道发送数据或文件")
+		fmt.Println("  - 如果提供file_path且文件存在，则发送文件")
+		fmt.Println("  - 否则进入文本发送模式")
+		fmt.Println("示例: sendto channel-123                    (文本模式)")
+		fmt.Println("示例: sendto channel-123 /path/to/file.txt  (发送文件)")
+		fmt.Println("示例: sendto channel-123 /path/to/file.txt @connector-B  (发送文件到指定接收者)")
+		return
+	}
+
+	channelID := args[0]
+
+	// 获取频道信息并验证提议状态
+	fmt.Printf("正在验证频道 %s 的状态...\n", channelID)
+	channelInfo, err := connector.GetChannelInfo(channelID)
+	if err != nil {
+		fmt.Printf("❌ 获取频道信息失败: %v\n", err)
+		return
+	}
+
+	if !channelInfo.Found {
+		fmt.Printf("❌ 频道 %s 不存在\n", channelID)
+		return
+	}
+
+	// 检查协商状态
+	if channelInfo.NegotiationStatus != pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED {
+		fmt.Printf("❌ 无法发送数据到频道 %s\n", channelID)
+		fmt.Printf("   频道协商状态: %s\n", channelInfo.NegotiationStatus.String())
+		switch channelInfo.NegotiationStatus {
+		case pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_PROPOSED:
+			fmt.Println("   原因: 频道提议尚未被所有参与方接受")
+			if channelInfo.ProposalId != "" {
+				fmt.Printf("   提议ID: %s\n", channelInfo.ProposalId)
+			}
+			fmt.Println("   解决方法: 请等待所有参与方使用 'accept <channel_id> <proposal_id>' 接受提议")
+		case pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_REJECTED:
+			fmt.Println("   原因: 频道提议已被拒绝")
+		case pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_UNKNOWN:
+			fmt.Println("   原因: 频道状态未知")
+		}
+		return
+	}
+
+	// 检查频道状态
+	if channelInfo.Status != "active" {
+		fmt.Printf("❌ 频道 %s 当前状态为 %s，无法发送数据\n", channelID, channelInfo.Status)
+		return
+	}
+
+	// 检查发送方权限（当前连接器必须是频道的发送方）
+	connectorID := connector.GetID()
+	isSender := false
+	for _, senderID := range channelInfo.SenderIds {
+		if senderID == connectorID {
+			isSender = true
+			break
+		}
+	}
+
+	if !isSender {
+		fmt.Printf("❌ 权限不足: 连接器 %s 不是频道 %s 的发送方\n", connectorID, channelID)
+		fmt.Printf("   频道发送方: %v\n", channelInfo.SenderIds)
+		fmt.Printf("   频道接收方: %v\n", channelInfo.ReceiverIds)
+		fmt.Println("   解决方法: 只有发送方可以向频道发送数据")
+		return
+	}
+
+	fmt.Printf("✓ 频道状态验证通过，可以发送数据\n")
+
+	// 检查第二个参数是否是文件路径
+	if len(args) >= 2 {
+		filePath := args[1]
+		
+		// 检查是否是文件路径（不以@开头，且文件存在）
+		if !strings.HasPrefix(filePath, "@") {
+			if fileInfo, err := os.Stat(filePath); err == nil && !fileInfo.IsDir() {
+				// 是文件，发送文件
+				var targetIDs []string
+				// 解析目标接收者（从第三个参数开始）
+				for i := 2; i < len(args); i++ {
+					if strings.HasPrefix(args[i], "@") {
+						targetID := strings.TrimPrefix(args[i], "@")
+						targetIDs = append(targetIDs, targetID)
+					}
+				}
+
+				fmt.Printf("正在发送文件: %s 到频道 %s...\n", filePath, channelID)
+				if len(targetIDs) > 0 {
+					fmt.Printf("目标接收者: %v\n", targetIDs)
+				} else {
+					fmt.Println("目标接收者: 所有订阅者（广播）")
+				}
+
+				if err := connector.SendFile(channelID, filePath, targetIDs); err != nil {
+					fmt.Printf("❌ 发送文件失败: %v\n", err)
+					return
+				}
+
+				fmt.Printf("✓ 文件发送成功: %s\n", filePath)
+				return
+			}
+		}
+	}
+
+	// 文本发送模式
+	fmt.Printf("正在连接到频道 %s...\n", channelID)
+
+	// 启动实时发送器
+	sender, err := connector.StartRealtimeSend(channelID)
+	if err != nil {
+		fmt.Printf("❌ 连接频道失败: %v\n", err)
+		return
+	}
+	defer sender.Close()
+
+	fmt.Println("实时发送模式：输入数据后按回车立即发送")
+	fmt.Println("发送格式: <数据> (广播给所有订阅者) 或 @<接收者ID> <数据> (指定接收者)")
+	fmt.Println("输入 'END' 结束发送")
+
+	fmt.Println("✓ 实时发送已就绪，开始输入数据...")
+
+	// 读取并实时发送数据
+	scanner := bufio.NewScanner(os.Stdin)
+	packetCount := 0
+	
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "END" {
+			break
+		}
+		if line == "" {
+			continue // 跳过空行
+		}
+
+		// 检查是否指定了目标接收者（格式: @receiver_id data）
+		var targetIDs []string
+		var data string
+		
+		if strings.HasPrefix(line, "@") {
+			// 解析目标接收者
+			parts := strings.Fields(line)
+			if len(parts) < 2 {
+				fmt.Println("❌ 格式错误，正确格式: @<接收者ID> <数据>")
+				continue
+			}
+			
+			// 提取所有以@开头的接收者ID
+			for i, part := range parts {
+				if strings.HasPrefix(part, "@") {
+					targetID := strings.TrimPrefix(part, "@")
+					targetIDs = append(targetIDs, targetID)
+				} else {
+					// 剩余部分作为数据
+					data = strings.Join(parts[i:], " ")
+					break
+				}
+			}
+			
+			if len(data) == 0 {
+				fmt.Println("❌ 格式错误，需要提供数据内容")
+				continue
+			}
+		} else {
+			// 没有指定接收者，广播给所有订阅者
+			data = line
+			targetIDs = []string{} // 空列表表示广播
+		}
+
+		// 立即发送这一行
+		if err := sender.SendLineTo([]byte(data), targetIDs); err != nil {
+			fmt.Printf("❌ 发送失败: %v\n", err)
+			continue
+		}
+
+		packetCount++
+		if len(targetIDs) > 0 {
+			fmt.Printf("✓ [%d] 已发送到 %v: %s\n", packetCount, targetIDs, data)
+		} else {
+			fmt.Printf("✓ [%d] 已广播: %s\n", packetCount, data)
+		}
+	}
+
+	if packetCount == 0 {
+		fmt.Println("没有发送任何数据")
+		return
+	}
+
+	fmt.Printf("✓ 共发送 %d 条数据\n", packetCount)
+}
+
+// handleSubscribe 处理订阅频道命令
+// 支持频道外连接器申请加入和频道内连接器直接订阅
+func handleSubscribe(connector *client.Connector, args []string) {
+	if len(args) == 0 {
+		// 如果没有指定channel_id，则等待通知
+		fmt.Println("等待频道创建通知...")
+		fmt.Println("（当有发送方创建频道时，会自动收到通知）")
+		
+		notifyChan, err := connector.WaitForChannelNotification()
+		if err != nil {
+			fmt.Printf("❌ 等待通知失败: %v\n", err)
+			return
+		}
+
+		// 创建文件接收器（用于接收文件）
+		outputDir := "./received"
+		if err := os.MkdirAll(outputDir, 0755); err != nil {
+			log.Printf("⚠ 创建接收目录失败: %v", err)
+		}
+		fileReceiver := client.NewFileReceiver(outputDir, func(filePath, fileHash string) {
+			fmt.Printf("\n✓ 文件接收并保存成功:\n")
+			fmt.Printf("  文件路径: %s\n", filePath)
+			fmt.Printf("  文件哈希: %s\n", fileHash)
+		})
+
+		// 在goroutine中等待通知
+		go func() {
+			for notification := range notifyChan {
+				fmt.Printf("\n📢 收到频道创建通知:\n")
+				fmt.Printf("   频道ID: %s\n", notification.ChannelId)
+				fmt.Printf("   创建者: %s\n", notification.CreatorId)
+				fmt.Printf("   发送方: %v\n", notification.SenderIds)
+				fmt.Printf("   接收方: %v\n", notification.ReceiverIds)
+				fmt.Printf("   频道类型: %s\n", notification.ChannelType.String())
+				fmt.Printf("   加密: %v\n", notification.Encrypted)
+				if len(notification.RelatedChannelIds) > 0 {
+					fmt.Printf("   关联频道: %v\n", notification.RelatedChannelIds)
+				}
+				fmt.Printf("   数据主题: %s\n", notification.DataTopic)
+				fmt.Printf("   创建时间: %s\n", time.Unix(notification.CreatedAt, 0).Format("2006-01-02 15:04:05"))
+				fmt.Println("正在自动订阅频道...")
+
+				// 自动订阅并接收数据
+				go func(chID string) {
+					err := connector.ReceiveData(chID, func(packet *pb.DataPacket) error {
+						// 检查是否是文件传输数据包
+						if client.IsFileTransferPacket(packet.Payload) {
+							// 处理文件传输数据包
+							if err := fileReceiver.HandleFilePacket(packet); err != nil {
+								log.Printf("⚠ 处理文件数据包失败: %v", err)
+							}
+						} else {
+							// 普通数据包，显示文本
+						senderInfo := ""
+						if packet.SenderId != "" {
+							senderInfo = fmt.Sprintf("来自 %s, ", packet.SenderId)
+						}
+						fmt.Printf("📦 [序列号: %d] %s数据: %s\n", packet.SequenceNumber, senderInfo, string(packet.Payload))
+						}
+						return nil
+					})
+					if err != nil {
+						fmt.Printf("❌ 接收失败: %v\n", err)
+					} else {
+						fmt.Printf("✓ 频道 %s 已关闭\n", chID)
+					}
+				}(notification.ChannelId)
+			}
+		}()
+
+		fmt.Println("✓ 已开始等待通知... (输入任意命令继续)")
+		return
+	}
+
+	// 如果指定了channel_id，检查是否需要申请加入或直接订阅
+	channelID := args[0]
+
+	// 解析命令行参数
+	var role string
+	var reason string = "request to join channel"
+	outputDir := "./received"
+
+	i := 1
+	for i < len(args) {
+		switch args[i] {
+		case "--role":
+			if i+1 < len(args) {
+				role = args[i+1]
+				if role != "sender" && role != "receiver" {
+					fmt.Printf("❌ 无效的角色: %s (必须是 'sender' 或 'receiver')\n", role)
+					return
+				}
+				i += 2
+			} else {
+				fmt.Println("❌ --role 参数需要提供角色值")
+				return
+			}
+		case "--reason":
+			if i+1 < len(args) {
+				reason = strings.Join(args[i+1:], " ")
+				i = len(args) // 结束解析
+			} else {
+				fmt.Println("❌ --reason 参数需要提供理由")
+				return
+			}
+		default:
+			// 如果不是以--开头，当作output_dir
+			if !strings.HasPrefix(args[i], "--") {
+				outputDir = args[i]
+				i++
+			} else {
+				fmt.Printf("❌ 未知参数: %s\n", args[i])
+				return
+			}
+		}
+	}
+
+	// 创建输出目录
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		fmt.Printf("⚠ 创建接收目录失败: %v\n", err)
+	}
+
+	// 检查是否已经是频道参与者
+	isParticipant, err := connector.IsChannelParticipant(channelID)
+	if err != nil {
+		fmt.Printf("❌ 检查频道参与状态失败: %v\n", err)
+		return
+	}
+
+	if isParticipant {
+		// 已经是频道参与者，直接订阅
+		fmt.Printf("✓ 您已经是频道 %s 的参与者，正在订阅...\n", channelID)
+	} else {
+		// 不是频道参与者，需要申请加入
+		if role == "" {
+			fmt.Printf("❌ 您不是频道 %s 的参与者，请指定要申请的角色\n", channelID)
+			fmt.Println("   使用: subscribe <channel_id> --role <sender|receiver> [--reason <reason>]")
+			return
+		}
+
+		fmt.Printf("📝 申请加入频道 %s 作为 %s...\n", channelID, role)
+		fmt.Printf("   理由: %s\n", reason)
+
+		// 发送加入申请
+		err := connector.RequestChannelAccess(channelID, role, reason)
+		if err != nil {
+			fmt.Printf("❌ 申请加入频道失败: %v\n", err)
+			return
+		}
+
+		fmt.Println("✓ 加入申请已发送，等待审批...")
+		fmt.Println("   审批通过后您将自动获得订阅权限")
+		return
+	}
+
+	// 创建文件接收器
+	fileReceiver := client.NewFileReceiver(outputDir, func(filePath, fileHash string) {
+		fmt.Printf("\n✓ 文件接收并保存成功:\n")
+		fmt.Printf("  文件路径: %s\n", filePath)
+		fmt.Printf("  文件哈希: %s\n", fileHash)
+	})
+
+	fmt.Printf("正在订阅频道 %s...\n", channelID)
+	fmt.Printf("文件将保存到: %s\n", outputDir)
+
+		// 获取频道信息并记录到本地
+		go func() {
+			channelInfo, err := connector.GetChannelInfo(channelID)
+			if err == nil && channelInfo != nil && channelInfo.Found {
+				// 记录频道信息到本地
+				connector.RecordChannelFromNotification(&pb.ChannelNotification{
+					ChannelId:         channelInfo.ChannelId,
+					CreatorId:         channelInfo.CreatorId,
+					SenderIds:         channelInfo.SenderIds,
+					ReceiverIds:       channelInfo.ReceiverIds,
+					ChannelType:       channelInfo.ChannelType,
+					Encrypted:         channelInfo.Encrypted,
+					RelatedChannelIds: channelInfo.RelatedChannelIds,
+					DataTopic:         channelInfo.DataTopic,
+					CreatedAt:         channelInfo.CreatedAt,
+				})
+			}
+		}()
+
+	// 在goroutine中接收数据
+	go func() {
+		err := connector.ReceiveData(channelID, func(packet *pb.DataPacket) error {
+			// 检查是否是文件传输数据包
+			if client.IsFileTransferPacket(packet.Payload) {
+				// 处理文件传输数据包
+				if err := fileReceiver.HandleFilePacket(packet); err != nil {
+					log.Printf("⚠ 处理文件数据包失败: %v", err)
+				}
+			} else {
+				// 普通数据包，显示文本
+			senderInfo := ""
+			if packet.SenderId != "" {
+				senderInfo = fmt.Sprintf("来自 %s, ", packet.SenderId)
+			}
+			fmt.Printf("📦 [序列号: %d] %s数据: %s\n", packet.SequenceNumber, senderInfo, string(packet.Payload))
+			}
+			return nil
+		})
+		if err != nil {
+			fmt.Printf("❌ 接收失败: %v\n", err)
+		} else {
+			fmt.Printf("✓ 频道 %s 已关闭\n", channelID)
+		}
+	}()
+
+	fmt.Println("✓ 已订阅，等待数据... (输入任意命令继续)")
+}
+
+// handleStatus 处理状态命令
+func handleStatus(connector *client.Connector, args []string) {
+	if len(args) == 0 {
+		// 查看当前状态
+		status := connector.GetStatus()
+		fmt.Printf("当前连接器状态: %s\n", status)
+		fmt.Println("说明:")
+		fmt.Println("  - active: 连接器处于活跃状态，收到频道创建通知时会自动订阅")
+		fmt.Println("  - inactive: 连接器处于非活跃状态，收到通知但不会自动订阅，需要手动订阅")
+		fmt.Println("  - closed: 连接器已关闭")
+		return
+	}
+
+	// 设置状态
+	newStatus := args[0]
+	if err := connector.SetStatus(client.ConnectorStatus(newStatus)); err != nil {
+		fmt.Printf("❌ 设置状态失败: %v\n", err)
+		fmt.Println("可用状态: active, inactive, closed")
+		return
+	}
+
+	fmt.Printf("✓ 连接器状态已设置为: %s\n", newStatus)
+	if newStatus == "active" {
+		fmt.Println("  → 连接器将自动订阅新创建的频道")
+	} else {
+		fmt.Println("  → 连接器不会自动订阅，需要手动使用 'subscribe <channel_id>' 订阅")
+	}
+}
+
+// truncateString 截断字符串
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// handleRequestPermission 处理申请权限变更命令
+func handleRequestPermission(connector *client.Connector, args []string) {
+	if len(args) != 4 {
+		fmt.Println("❌ 参数错误: request-permission <channel_id> <change_type> <target_id> <reason>")
+		fmt.Println("   change_type: add_sender, remove_sender, add_receiver, remove_receiver")
+		return
+	}
+
+	channelID := args[0]
+	changeType := args[1]
+	targetID := args[2]
+	reason := args[3]
+
+	// 验证change_type
+	validTypes := map[string]bool{
+		"add_sender":      true,
+		"remove_sender":   true,
+		"add_receiver":    true,
+		"remove_receiver": true,
+	}
+	if !validTypes[changeType] {
+		fmt.Printf("❌ 无效的变更类型: %s\n", changeType)
+		fmt.Println("   支持的类型: add_sender, remove_sender, add_receiver, remove_receiver")
+		return
+	}
+
+	fmt.Printf("正在申请权限变更: 频道 %s, 类型 %s, 目标 %s...\n", channelID, changeType, targetID)
+
+	resp, err := connector.RequestPermissionChange(channelID, changeType, targetID, reason)
+	if err != nil {
+		fmt.Printf("❌ 申请失败: %v\n", err)
+		return
+	}
+
+	if !resp.Success {
+		fmt.Printf("❌ 申请失败: %s\n", resp.Message)
+		return
+	}
+
+	fmt.Printf("✓ 权限变更申请已提交\n")
+	fmt.Printf("  请求ID: %s\n", resp.RequestId)
+	fmt.Println("  等待批准者审批...")
+}
+
+// handleApprovePermission 处理批准权限变更/订阅申请命令
+func handleApprovePermission(connector *client.Connector, args []string) {
+	if len(args) != 2 {
+		fmt.Println("❌ 参数错误: approve-permission <channel_id> <request_id>")
+		return
+	}
+
+	channelID := args[0]
+	requestID := args[1]
+
+	fmt.Printf("正在批准请求: %s...\n", requestID)
+
+	// 首先尝试批准订阅申请（如果适用）
+	resp, err := connector.ApproveChannelSubscription(channelID, requestID)
+	if err == nil && resp.Success {
+		fmt.Printf("✓ 订阅申请已批准: %s\n", requestID)
+		fmt.Println("  申请者现在可以订阅该频道")
+		return
+	}
+
+	// 如果订阅申请批准失败，尝试批准权限变更
+	resp2, err2 := connector.ApprovePermissionChange(channelID, requestID)
+	if err2 != nil {
+		fmt.Printf("❌ 批准失败: %v\n", err2)
+		return
+	}
+
+	if !resp2.Success {
+		fmt.Printf("❌ 批准失败: %s\n", resp2.Message)
+		return
+	}
+
+	fmt.Printf("✓ 权限变更已批准: %s\n", requestID)
+}
+
+// handleRejectPermission 处理拒绝权限变更/订阅申请命令
+func handleRejectPermission(connector *client.Connector, args []string) {
+	if len(args) < 3 {
+		fmt.Println("❌ 参数错误: reject-permission <channel_id> <request_id> <reason>")
+		return
+	}
+
+	channelID := args[0]
+	requestID := args[1]
+	reason := strings.Join(args[2:], " ")
+
+	fmt.Printf("正在拒绝请求: %s...\n", requestID)
+
+	// 首先尝试拒绝订阅申请（如果适用）
+	resp, err := connector.RejectChannelSubscription(channelID, requestID, reason)
+	if err == nil && resp.Success {
+		fmt.Printf("✓ 订阅申请已拒绝: %s\n", requestID)
+		fmt.Printf("  拒绝理由: %s\n", reason)
+		return
+	}
+
+	// 如果订阅申请拒绝失败，尝试拒绝权限变更
+	resp2, err2 := connector.RejectPermissionChange(channelID, requestID, reason)
+	if err2 != nil {
+		fmt.Printf("❌ 拒绝失败: %v\n", err2)
+		return
+	}
+
+	if !resp2.Success {
+		fmt.Printf("❌ 拒绝失败: %s\n", resp2.Message)
+		return
+	}
+
+	fmt.Printf("✓ 权限变更已拒绝: %s\n", requestID)
+	fmt.Printf("  拒绝理由: %s\n", reason)
+}
+
+// handleListPermissions 处理查看权限变更请求命令
+func handleListPermissions(connector *client.Connector, args []string) {
+	if len(args) != 1 {
+		fmt.Println("❌ 参数错误: list-permissions <channel_id>")
+		return
+	}
+
+	channelID := args[0]
+
+	fmt.Printf("正在获取频道 %s 的权限变更请求...\n", channelID)
+
+	resp, err := connector.GetPermissionRequests(channelID)
+	if err != nil {
+		fmt.Printf("❌ 获取失败: %v\n", err)
+		return
+	}
+
+	if !resp.Success {
+		fmt.Printf("❌ 获取失败: %s\n", resp.Message)
+		return
+	}
+
+	if len(resp.Requests) == 0 {
+		fmt.Println("当前频道没有权限变更请求")
+		return
+	}
+
+	fmt.Println("\n权限变更请求列表:")
+	fmt.Println(strings.Repeat("-", 100))
+	fmt.Printf("%-36s %-15s %-15s %-12s %-10s\n", "请求ID", "请求者", "变更类型", "目标ID", "状态")
+	fmt.Println(strings.Repeat("-", 100))
+
+	for _, req := range resp.Requests {
+		fmt.Printf("%-36s %-15s %-15s %-12s %-10s\n",
+			req.RequestId, req.RequesterId, req.ChangeType, req.TargetId, req.Status)
+
+		if req.Reason != "" {
+			fmt.Printf("  理由: %s\n", req.Reason)
+		}
+		if req.ApprovedBy != "" {
+			fmt.Printf("  批准者: %s\n", req.ApprovedBy)
+		}
+		if req.RejectReason != "" {
+			fmt.Printf("  拒绝理由: %s\n", req.RejectReason)
+		}
+		fmt.Printf("  创建时间: %s\n", time.Unix(req.CreatedAt, 0).Format("2006-01-02 15:04:05"))
+		if req.ApprovedAt > 0 {
+			fmt.Printf("  批准时间: %s\n", time.Unix(req.ApprovedAt, 0).Format("2006-01-02 15:04:05"))
+		}
+		fmt.Println(strings.Repeat("-", 100))
+	}
+}
+
+// handleChannels 查看当前连接器参与的频道信息
+func handleChannels(connector *client.Connector) {
+	localChannels := connector.ListLocalChannels()
+	if len(localChannels) == 0 {
+		fmt.Println("当前没有记录到任何频道（可能尚未创建或收到频道通知）。")
+		return
+	}
+
+	fmt.Println("当前参与的频道列表：")
+	fmt.Println(strings.Repeat("-", 80))
+	fmt.Printf("%-40s %-20s %-10s\n", "频道ID", "数据主题", "创建者")
+	fmt.Println(strings.Repeat("-", 80))
+	
+	for _, localCh := range localChannels {
+		// 实时从内核获取最新的频道信息
+		channelInfo, err := connector.GetChannelInfo(localCh.ChannelID)
+		if err != nil || channelInfo == nil || !channelInfo.Found {
+			// 如果获取失败，使用本地缓存的信息
+			fmt.Printf("%-40s %-20s %-10s\n", localCh.ChannelID, localCh.DataTopic, localCh.CreatorID)
+			fmt.Printf("  参与者: %v (本地缓存，可能已过时)\n", localCh.Participants)
+			if localCh.CreatedAt > 0 {
+				fmt.Printf("  创建时间: %s\n", time.Unix(localCh.CreatedAt, 0).Format("2006-01-02 15:04:05"))
+			}
+		} else {
+			// 使用最新的频道信息
+			fmt.Printf("%-40s %-20s %-10s\n", channelInfo.ChannelId, channelInfo.DataTopic, channelInfo.CreatorId)
+			fmt.Printf("  发送方: %v\n", channelInfo.SenderIds)
+			fmt.Printf("  接收方: %v\n", channelInfo.ReceiverIds)
+			fmt.Printf("  频道类型: %s\n", channelInfo.ChannelType.String())
+			fmt.Printf("  加密: %v\n", channelInfo.Encrypted)
+			if len(channelInfo.RelatedChannelIds) > 0 {
+				fmt.Printf("  关联频道: %v\n", channelInfo.RelatedChannelIds)
+			}
+			fmt.Printf("  状态: %s\n", channelInfo.Status)
+			if channelInfo.CreatedAt > 0 {
+				fmt.Printf("  创建时间: %s\n", time.Unix(channelInfo.CreatedAt, 0).Format("2006-01-02 15:04:05"))
+			}
+			if channelInfo.LastActivity > 0 {
+				fmt.Printf("  最后活动: %s\n", time.Unix(channelInfo.LastActivity, 0).Format("2006-01-02 15:04:05"))
+			}
+			
+			// 更新本地缓存
+			connector.RecordChannelFromNotification(&pb.ChannelNotification{
+				ChannelId:         channelInfo.ChannelId,
+				CreatorId:         channelInfo.CreatorId,
+				SenderIds:         channelInfo.SenderIds,
+				ReceiverIds:       channelInfo.ReceiverIds,
+				ChannelType:       channelInfo.ChannelType,
+				Encrypted:        channelInfo.Encrypted,
+				RelatedChannelIds: channelInfo.RelatedChannelIds,
+				DataTopic:        channelInfo.DataTopic,
+				CreatedAt:        channelInfo.CreatedAt,
+			})
+		}
+		fmt.Println(strings.Repeat("-", 80))
+	}
+}
+
+func loadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var config Config
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	return &config, nil
+}
+
+// removeDuplicates 移除字符串切片中的重复元素，保持原有顺序
+func removeDuplicates(slice []string) []string {
+	keys := make(map[string]bool)
+	var result []string
+	for _, item := range slice {
+		if !keys[item] {
+			keys[item] = true
+			result = append(result, item)
+		}
+	}
+	return result
+}
+

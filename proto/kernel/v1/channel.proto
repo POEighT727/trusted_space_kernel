@@ -1,0 +1,327 @@
+syntax = "proto3";
+
+package trusted_space.kernel.v1;
+
+option go_package = "github.com/trusted-space/kernel/api/v1;kernelv1";
+
+// 频道类型
+enum ChannelType {
+  CHANNEL_TYPE_UNKNOWN = 0;
+  CHANNEL_TYPE_DATA = 1;      // 真实数据频道（加密传输）
+  CHANNEL_TYPE_CONTROL = 2;   // 控制数据频道（明文传输）
+  CHANNEL_TYPE_LOG = 3;       // 日志数据频道（明文传输，用于分布式存证）
+}
+
+// ------------------------------------------------------------
+// 流通与频道服务 (Channel Service)
+// ------------------------------------------------------------
+// 对应文档中的"频道(Channel)"概念
+service ChannelService {
+  // 请求创建一个数据传输频道
+  // 如果指定create_related_channels=true，会自动创建关联的控制和日志频道
+  rpc CreateChannel (CreateChannelRequest) returns (CreateChannelResponse);
+
+  // 在频道内推送数据 (连接器 -> 内核)
+  // 内核作为中转服务，接收流数据
+  rpc StreamData (stream DataPacket) returns (stream TransferStatus);
+  
+  // 接收数据 (内核 -> 连接器)
+  rpc SubscribeData (SubscribeRequest) returns (stream DataPacket);
+  
+  // 关闭频道
+  rpc CloseChannel (CloseChannelRequest) returns (CloseChannelResponse);
+  
+  // 通知服务：接收频道创建通知
+  rpc NotifyChannelCreated (NotifyChannelRequest) returns (NotifyChannelResponse);
+  
+  // 等待频道通知（接收方使用，等待被通知有新的频道）
+  rpc WaitForChannelNotification (WaitNotificationRequest) returns (stream ChannelNotification);
+  
+  // 获取频道信息
+  rpc GetChannelInfo (GetChannelInfoRequest) returns (GetChannelInfoResponse);
+
+  // 频道协商相关服务（两阶段频道创建）
+  rpc ProposeChannel (ProposeChannelRequest) returns (ProposeChannelResponse);         // 提议创建频道
+  rpc AcceptChannelProposal (AcceptChannelProposalRequest) returns (AcceptChannelProposalResponse); // 接受频道提议
+  rpc RejectChannelProposal (RejectChannelProposalRequest) returns (RejectChannelProposalResponse); // 拒绝频道提议
+
+  // 频道订阅申请相关服务（频道外连接器使用）
+  rpc RequestChannelSubscription (RequestChannelSubscriptionRequest) returns (RequestChannelSubscriptionResponse); // 申请订阅频道
+  rpc ApproveChannelSubscription (ApproveChannelSubscriptionRequest) returns (ApproveChannelSubscriptionResponse); // 批准订阅申请
+  rpc RejectChannelSubscription (RejectChannelSubscriptionRequest) returns (RejectChannelSubscriptionResponse);   // 拒绝订阅申请
+
+  // 权限变更相关服务（频道内连接器使用）
+  rpc RequestPermissionChange (RequestPermissionChangeRequest) returns (RequestPermissionChangeResponse); // 申请权限变更
+  rpc ApprovePermissionChange (ApprovePermissionChangeRequest) returns (ApprovePermissionChangeResponse); // 批准权限变更
+  rpc RejectPermissionChange (RejectPermissionChangeRequest) returns (RejectPermissionChangeResponse);   // 拒绝权限变更
+  rpc GetPermissionRequests (GetPermissionRequestsRequest) returns (GetPermissionRequestsResponse);     // 获取权限变更请求列表
+}
+
+message CreateChannelRequest {
+  string creator_id = 1;        // 创建者ID（不一定是发送方）
+  repeated string sender_ids = 2;     // 发送方ID列表（至少一个，必须指定）
+  repeated string receiver_ids = 3;   // 接收方ID列表（至少一个，必须指定）
+  string data_topic = 4;        // 数据主题/业务标识
+  ChannelType channel_type = 5; // 频道类型（默认为数据频道）
+  bool encrypted = 6;           // 是否加密传输（数据频道默认true，控制/日志频道默认false）
+  bool create_related_channels = 7; // 是否创建关联频道（数据频道会自动创建控制频道和存证日志频道）
+  string access_token = 8;      // 访问凭证（可选，用于额外鉴权）
+}
+
+message CreateChannelResponse {
+  string channel_id = 1;        // 全局唯一的频道ID（主频道）
+  repeated string related_channel_ids = 2; // 关联频道ID列表（控制频道、日志频道等）
+  bool authorized = 3;          // 权限检查结果
+  string message = 4;
+}
+
+message DataPacket {
+  string channel_id = 1;
+  int64 sequence_number = 2;
+  bytes payload = 3;            // 加密的数据载荷
+  string signature = 4;         // 发送方对payload的数字签名
+  int64 timestamp = 5;
+  string sender_id = 6;         // 发送方ID
+  repeated string target_ids = 7; // 目标接收者ID列表（为空则广播给所有订阅者）
+}
+
+message TransferStatus {
+  string channel_id = 1;
+  int64 last_sequence_received = 2;
+  bool success = 3;
+  string message = 4;
+}
+
+message SubscribeRequest {
+  string connector_id = 1;
+  string channel_id = 2;
+}
+
+message CloseChannelRequest {
+  string channel_id = 1;
+  string requester_id = 2;
+}
+
+message CloseChannelResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// 通知服务消息定义
+message NotifyChannelRequest {
+  string receiver_id = 1;  // 接收方ID
+  string channel_id = 2;   // 频道ID
+  string sender_id = 3;    // 发送方ID
+  string data_topic = 4;   // 数据主题
+}
+
+message NotifyChannelResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message WaitNotificationRequest {
+  string receiver_id = 1;  // 接收方ID
+}
+
+message ChannelNotification {
+  string channel_id = 1;   // 频道ID
+  string creator_id = 2;   // 创建者ID
+  repeated string sender_ids = 3;    // 发送方ID列表
+  repeated string receiver_ids = 4;   // 接收方ID列表
+  ChannelType channel_type = 5; // 频道类型
+  bool encrypted = 6;      // 是否加密
+  repeated string related_channel_ids = 7; // 关联频道ID列表
+  string data_topic = 8;    // 数据主题
+  int64 created_at = 9;     // 创建时间
+  ChannelNegotiationStatus negotiation_status = 10; // 协商状态
+  string proposal_id = 11;  // 提议ID（协商中时）
+}
+
+// 获取频道信息请求
+message GetChannelInfoRequest {
+  string requester_id = 1;  // 请求者ID
+  string channel_id = 2;     // 频道ID
+}
+
+// 获取频道信息响应
+message GetChannelInfoResponse {
+  bool found = 1;                    // 是否找到频道
+  string channel_id = 2;             // 频道ID
+  string creator_id = 3;            // 创建者ID
+  string approver_id = 16;           // 权限变更批准者ID
+  repeated string sender_ids = 4;          // 发送方ID列表
+  repeated string receiver_ids = 5;        // 接收方ID列表
+  ChannelType channel_type = 6;     // 频道类型
+  bool encrypted = 7;               // 是否加密传输
+  repeated string related_channel_ids = 8; // 关联频道ID列表
+  string data_topic = 9;             // 数据主题
+  string status = 10;                 // 频道状态 (active, closed)
+  int64 created_at = 11;              // 创建时间
+  int64 last_activity = 12;           // 最后活动时间
+  ChannelNegotiationStatus negotiation_status = 14; // 协商状态
+  string proposal_id = 15;            // 提议ID（如果处于协商中）
+  string message = 13;                // 消息
+}
+
+// ------------------------------------------------------------
+// 频道协商相关消息定义
+// ------------------------------------------------------------
+
+enum ChannelNegotiationStatus {
+  NEGOTIATION_STATUS_UNKNOWN = 0;   // 未知状态
+  NEGOTIATION_STATUS_PROPOSED = 1;  // 已提议，等待确认
+  NEGOTIATION_STATUS_ACCEPTED = 2;  // 已接受，可使用
+  NEGOTIATION_STATUS_REJECTED = 3;  // 已拒绝
+}
+
+message ProposeChannelRequest {
+  string creator_id = 1;        // 提议创建者ID（不一定是发送方）
+  repeated string sender_ids = 2;     // 发送方ID列表（至少一个，必须指定）
+  repeated string receiver_ids = 3;   // 接收方ID列表（至少一个，必须指定）
+  string data_topic = 4;        // 数据主题/业务标识
+  ChannelType channel_type = 5; // 频道类型（默认为数据频道）
+  bool encrypted = 6;           // 是否加密传输
+  string approver_id = 9;       // 权限变更批准者ID（默认是创建者，可选）
+  string reason = 7;            // 创建理由说明
+  int32 timeout_seconds = 8;    // 提议超时时间（秒，默认300秒）
+}
+
+message ProposeChannelResponse {
+  bool success = 1;
+  string channel_id = 2;        // 频道ID
+  string proposal_id = 3;       // 提议ID
+  string message = 4;
+}
+
+message AcceptChannelProposalRequest {
+  string accepter_id = 1;  // 接受者ID
+  string channel_id = 2;   // 频道ID
+  string proposal_id = 3;  // 提议ID
+}
+
+message AcceptChannelProposalResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RejectChannelProposalRequest {
+  string rejecter_id = 1;  // 拒绝者ID
+  string channel_id = 2;   // 频道ID
+  string proposal_id = 3;  // 提议ID
+  string reason = 4;       // 拒绝理由
+}
+
+message RejectChannelProposalResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ------------------------------------------------------------
+// 频道订阅申请相关消息定义
+// ------------------------------------------------------------
+
+message RequestChannelSubscriptionRequest {
+  string subscriber_id = 1;  // 订阅者ID（申请者）
+  string channel_id = 2;     // 频道ID
+  string role = 3;           // 申请角色: "sender" 或 "receiver"
+  string reason = 4;         // 申请理由
+}
+
+message RequestChannelSubscriptionResponse {
+  bool success = 1;
+  string request_id = 2;    // 请求ID
+  string message = 3;
+}
+
+message ApproveChannelSubscriptionRequest {
+  string approver_id = 1;   // 批准者ID
+  string channel_id = 2;    // 频道ID
+  string request_id = 3;    // 订阅请求ID
+}
+
+message ApproveChannelSubscriptionResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RejectChannelSubscriptionRequest {
+  string approver_id = 1;   // 批准者ID
+  string channel_id = 2;    // 频道ID
+  string request_id = 3;    // 订阅请求ID
+  string reason = 4;        // 拒绝理由
+}
+
+message RejectChannelSubscriptionResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ------------------------------------------------------------
+// 权限变更相关消息定义
+// ------------------------------------------------------------
+
+message RequestPermissionChangeRequest {
+  string requester_id = 1;  // 请求者ID
+  string channel_id = 2;    // 频道ID
+  string change_type = 3;   // 变更类型: "add_sender", "remove_sender", "add_receiver", "remove_receiver"
+  string target_id = 4;     // 目标连接器ID
+  string reason = 5;        // 变更理由
+}
+
+message RequestPermissionChangeResponse {
+  bool success = 1;
+  string request_id = 2;    // 请求ID
+  string message = 3;
+}
+
+message ApprovePermissionChangeRequest {
+  string approver_id = 1;   // 批准者ID
+  string channel_id = 2;    // 频道ID
+  string request_id = 3;    // 请求ID
+}
+
+message ApprovePermissionChangeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RejectPermissionChangeRequest {
+  string approver_id = 1;   // 批准者ID
+  string channel_id = 2;    // 频道ID
+  string request_id = 3;    // 请求ID
+  string reason = 4;        // 拒绝理由
+}
+
+message RejectPermissionChangeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetPermissionRequestsRequest {
+  string requester_id = 1;  // 请求者ID
+  string channel_id = 2;    // 频道ID
+}
+
+message GetPermissionRequestsResponse {
+  bool success = 1;
+  repeated PermissionChangeRequest requests = 2;  // 权限变更请求列表
+  string message = 3;
+}
+
+message PermissionChangeRequest {
+  string request_id = 1;     // 请求ID
+  string requester_id = 2;   // 请求者ID
+  string channel_id = 3;     // 频道ID
+  string change_type = 4;    // 变更类型
+  string target_id = 5;      // 目标连接器ID
+  string reason = 6;         // 变更理由
+  string status = 7;         // 请求状态: "pending", "approved", "rejected"
+  int64 created_at = 8;      // 创建时间
+  int64 approved_at = 9;     // 批准时间（可选）
+  string approved_by = 10;   // 批准者ID（可选）
+  int64 rejected_at = 11;    // 拒绝时间（可选）
+  string rejected_by = 12;   // 拒绝者ID（可选）
+  string reject_reason = 13; // 拒绝理由（可选）
+}
+

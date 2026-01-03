@@ -1,0 +1,32 @@
+# 可信数据空间内核配置
+
+server:
+  # 监听地址
+  # "0.0.0.0" - 监听所有网络接口，允许跨主机连接（推荐用于跨主机部署）
+  # "127.0.0.1" 或 "localhost" - 仅监听本地回环接口，仅允许本地连接
+  address: "0.0.0.0"
+  port: 50051
+
+security:
+  ca_cert_path: "certs/ca.crt"
+  ca_key_path: "certs/ca.key"
+  server_cert_path: "certs/kernel.crt"
+  server_key_path: "certs/kernel.key"
+
+evidence:
+  persistent: true
+  log_file_path: "logs/audit.log"
+  use_database: true  # 是否启用数据库存储
+
+database:
+  enabled: true       # 是否启用数据库
+  host: "localhost"
+  port: 3306
+  user: "root"
+  password: "123456"
+  database: "trusted_space"
+
+policy:
+  # 默认策略：true=允许所有连接，false=需要显式授权
+  default_allow: true
+

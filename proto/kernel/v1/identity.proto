@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+package trusted_space.kernel.v1;
+
+option go_package = "github.com/trusted-space/kernel/api/v1;kernelv1";
+
+// ------------------------------------------------------------
+// 身份与准入服务 (Identity Service)
+// ------------------------------------------------------------
+service IdentityService {
+  // 连接器上线握手，注册自身能力，交换元信息
+  rpc Handshake (HandshakeRequest) returns (HandshakeResponse);
+  
+  // 心跳保活，维持在线状态
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+  
+  // 目录服务：发现空间中的其他连接器
+  rpc DiscoverConnectors (DiscoverRequest) returns (DiscoverResponse);
+  
+  // 获取连接器详细信息
+  rpc GetConnectorInfo (GetConnectorInfoRequest) returns (GetConnectorInfoResponse);
+  
+  // 设置连接器状态（active, inactive, closed等）
+  rpc SetConnectorStatus (SetConnectorStatusRequest) returns (SetConnectorStatusResponse);
+  
+  // 证书注册服务：首次连接时动态申请证书
+  rpc RegisterConnector (RegisterConnectorRequest) returns (RegisterConnectorResponse);
+}
+
+message HandshakeRequest {
+  string connector_id = 1;      // 连接器ID（需与证书CN匹配）
+  string entity_type = 2;       // 实体类型 (例如: 数据源, 算法节点)
+  string public_key = 3;        // 用于应用层加密的公钥
+  int64 timestamp = 4;
+}
+
+message HandshakeResponse {
+  bool success = 1;
+  string session_token = 2;     // 临时会话令牌
+  string kernel_version = 3;
+  string message = 4;
+}
+
+message HeartbeatRequest {
+  string connector_id = 1;
+  int64 timestamp = 2;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  int64 server_timestamp = 2;
+}
+
+// ------------------------------------------------------------
+// 目录服务消息定义
+// ------------------------------------------------------------
+message DiscoverRequest {
+  string requester_id = 1;  // 请求者ID
+  string filter_type = 2;   // 可选的实体类型过滤（为空则返回所有）
+}
+
+message DiscoverResponse {
+  repeated ConnectorInfo connectors = 1;
+  int32 total_count = 2;
+}
+
+message ConnectorInfo {
+  string connector_id = 1;
+  string entity_type = 2;
+  string public_key = 3;
+  string status = 4;        // active, inactive, offline, closed
+  int64 last_heartbeat = 5; // Unix时间戳
+  int64 registered_at = 6;  // Unix时间戳
+}
+
+message GetConnectorInfoRequest {
+  string requester_id = 1;
+  string connector_id = 2;  // 要查询的连接器ID
+}
+
+message GetConnectorInfoResponse {
+  bool found = 1;
+  ConnectorInfo connector = 2;
+  string message = 3;
+}
+
+// ------------------------------------------------------------
+// 连接器状态管理消息定义
+// ------------------------------------------------------------
+message SetConnectorStatusRequest {
+  string requester_id = 1;  // 请求者ID（必须是连接器自己或管理员）
+  string connector_id = 2;  // 要设置状态的连接器ID
+  string status = 3;        // 目标状态：active, inactive, closed
+}
+
+message SetConnectorStatusResponse {
+  bool success = 1;
+  string message = 2;
+  string previous_status = 3; // 之前的状态
+  string current_status = 4;  // 当前状态
+}
+
+// ------------------------------------------------------------
+// 证书注册服务消息定义
+// ------------------------------------------------------------
+message RegisterConnectorRequest {
+  string connector_id = 1;      // 连接器ID
+  string entity_type = 2;       // 实体类型
+  string public_key = 3;        // 用于应用层加密的公钥
+  string config_yaml = 4;       // 连接器配置（YAML格式）
+  int64 timestamp = 5;
+}
+
+message RegisterConnectorResponse {
+  bool success = 1;
+  string message = 2;
+  bytes certificate = 3;        // PEM格式的证书
+  bytes private_key = 4;        // PEM格式的私钥
+  bytes ca_certificate = 5;      // PEM格式的CA证书
+  string connector_id = 6;      // 确认的连接器ID
+}
+

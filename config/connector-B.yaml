@@ -1,0 +1,27 @@
+# 连接器 B 配置
+
+connector:
+  id: "connector-B"
+  entity_type: "algorithm_node"
+  public_key: "mock_public_key_xyz789"
+
+kernel:
+  # 内核服务器地址
+  # 本地部署: "localhost" 或 "127.0.0.1"
+  # 跨主机部署: 使用远程主机的IP地址或域名，例如: "192.168.1.100" 或 "kernel.example.com"
+  address: "localhost"
+  port: 50051
+
+security:
+  ca_cert_path: "certs/ca.crt"
+  client_cert_path: "certs/connector-B.crt"
+  client_key_path: "certs/connector-B.key"
+  # 服务器名称，用于TLS证书验证，必须与服务器证书的CN或SAN匹配
+  # 跨主机部署时，通常使用服务器的域名或IP地址
+  server_name: "trusted-data-space-kernel"
+
+evidence:
+  # 本地存证存储配置
+  local_storage: true      # 是否启用本地存证存储（接收到的分布式存证数据）
+  storage_path: "./evidence" # 本地存证存储路径
+

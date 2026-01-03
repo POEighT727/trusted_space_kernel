@@ -1,0 +1,50 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Certificates (DO NOT commit private keys!)
+certs/
+*.key
+*.crt
+*.csr
+*.pem
+*.srl
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Protobuf generated files
+api/
+proto/**/*.pb.go
+
+# Config overrides (optional)
+config/local.yaml
+

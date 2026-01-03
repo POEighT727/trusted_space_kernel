@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package trusted_space.kernel.v1;
+
+option go_package = "github.com/trusted-space/kernel/api/v1;kernelv1";
+
+// ------------------------------------------------------------
+// 存证溯源服务 (Evidence Service)
+// ------------------------------------------------------------
+// 实现全生命周期的数据安全管理与溯源
+service EvidenceService {
+  // 提交关键行为存证 (如：数据已发送、数据已接收、协议签署)
+  rpc SubmitEvidence (EvidenceRequest) returns (EvidenceResponse);
+
+  // 查询存证记录 (用于审计)
+  rpc QueryEvidence (QueryRequest) returns (QueryResponse);
+
+  // 验证存证记录的数字签名 (用于验证真实性)
+  rpc VerifyEvidenceSignature (VerifySignatureRequest) returns (VerifySignatureResponse);
+}
+
+message EvidenceRequest {
+  string connector_id = 1;
+  string event_type = 2;        // 类型: TRANSFER_START, TRANSFER_END, AUTH_FAIL
+  string channel_id = 3;
+  string data_hash = 4;         // 数据指纹，而非原始数据
+  string timestamp = 5;
+  string signature = 6;         // 行为不可抵赖签名
+  map<string, string> metadata = 7; // 额外元数据
+}
+
+message EvidenceResponse {
+  string evidence_tx_id = 1;    // 存证交易号
+  bool committed = 2;
+  string message = 3;
+  int64 timestamp = 4;
+}
+
+message QueryRequest {
+  string channel_id = 1;
+  string connector_id = 2;
+  int64 start_timestamp = 3;
+  int64 end_timestamp = 4;
+  int32 limit = 5;
+}
+
+message QueryResponse {
+  repeated EvidenceRecord logs = 1;
+  int32 total_count = 2;
+}
+
+message EvidenceRecord {
+  string evidence_tx_id = 1;
+  EvidenceRequest evidence = 2;
+  int64 stored_timestamp = 3;
+}
+
+message VerifySignatureRequest {
+  string requester_id = 1;    // 请求验证的连接器ID
+  string connector_id = 2;    // 被验证的存证记录的连接器ID
+  string event_type = 3;      // 事件类型
+  string channel_id = 4;      // 频道ID
+  string data_hash = 5;       // 数据哈希
+  string signature = 6;       // 要验证的签名
+  int64 timestamp = 7;        // 时间戳
+}
+
+message VerifySignatureResponse {
+  bool valid = 1;             // 签名是否有效
+  string message = 2;         // 验证结果消息
+  int64 verified_at = 3;      // 验证时间
+}
+
