@@ -153,11 +153,11 @@ func main() {
 	)
 
 	// 注册服务
-	identityService := server.NewIdentityServiceServer(registry, auditLog, ca)
-	pb.RegisterIdentityServiceServer(grpcServer, identityService)
-
 	channelService := server.NewChannelServiceServer(channelManager, policyEngine, registry, auditLog)
 	pb.RegisterChannelServiceServer(grpcServer, channelService)
+
+	identityService := server.NewIdentityServiceServer(registry, auditLog, ca, channelManager, channelService.NotificationManager)
+	pb.RegisterIdentityServiceServer(grpcServer, identityService)
 
 	evidenceService := server.NewEvidenceServiceServer(auditLog)
 	pb.RegisterEvidenceServiceServer(grpcServer, evidenceService)

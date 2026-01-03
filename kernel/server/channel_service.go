@@ -123,7 +123,7 @@ type ChannelServiceServer struct {
 	policyEngine        *control.PolicyEngine
 	registry            *control.Registry
 	auditLog            *evidence.AuditLog
-	notificationManager *NotificationManager
+	NotificationManager *NotificationManager
 }
 
 // NewChannelServiceServer 创建频道服务
@@ -138,7 +138,7 @@ func NewChannelServiceServer(
 		policyEngine:        policyEngine,
 		registry:            registry,
 		auditLog:            auditLog,
-		notificationManager: NewNotificationManager(channelManager, registry),
+		NotificationManager: NewNotificationManager(channelManager, registry),
 }
 
 	// 设置evidence频道创建通知回调
@@ -177,14 +177,14 @@ func (s *ChannelServiceServer) notifyChannelCreated(channel *circulation.Channel
 	go func() {
 		// 通知所有发送方
 		for _, senderID := range channel.SenderIDs {
-			if err := s.notificationManager.Notify(senderID, notification); err != nil {
+			if err := s.NotificationManager.Notify(senderID, notification); err != nil {
 				log.Printf("⚠ Failed to notify sender %s: %v", senderID, err)
 			}
 		}
 
 		// 通知所有接收方
 		for _, receiverID := range channel.ReceiverIDs {
-			if err := s.notificationManager.Notify(receiverID, notification); err != nil {
+			if err := s.NotificationManager.Notify(receiverID, notification); err != nil {
 				log.Printf("⚠ Failed to notify receiver %s: %v", receiverID, err)
 			}
 		}
@@ -206,7 +206,7 @@ func (s *ChannelServiceServer) notifyChannelCreated(channel *circulation.Channel
 			}
 		}
 		if !isCreatorParticipant {
-			if err := s.notificationManager.Notify(channel.CreatorID, notification); err != nil {
+			if err := s.NotificationManager.Notify(channel.CreatorID, notification); err != nil {
 				log.Printf("⚠ Failed to notify creator %s: %v", channel.CreatorID, err)
 			}
 		}
@@ -412,7 +412,7 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 		// 通知所有接收方需要接受提议（创建者除外，因为已自动接受）
 		for _, receiverID := range req.ReceiverIds {
 			if receiverID != creatorID { // 创建者不需要收到通知，因为已经自动接受
-				if err := s.notificationManager.Notify(receiverID, notification); err != nil {
+				if err := s.NotificationManager.Notify(receiverID, notification); err != nil {
 					log.Printf("⚠ Failed to notify receiver %s: %v", receiverID, err)
 				}
 			}
@@ -421,7 +421,7 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 		// 通知所有发送方需要接受提议（创建者已自动接受，不需要通知）
 		for _, senderID := range req.SenderIds {
 			if senderID != creatorID { // 创建者不需要收到通知，因为已经自动接受
-				if err := s.notificationManager.Notify(senderID, notification); err != nil {
+				if err := s.NotificationManager.Notify(senderID, notification); err != nil {
 					log.Printf("⚠ Failed to notify sender %s: %v", senderID, err)
 				}
 			}
@@ -524,14 +524,14 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 
 			// 通知所有发送方
 			for _, senderID := range channel.SenderIDs {
-				if err := s.notificationManager.Notify(senderID, notification); err != nil {
+				if err := s.NotificationManager.Notify(senderID, notification); err != nil {
 					log.Printf("⚠ Failed to notify sender %s: %v", senderID, err)
 				}
 			}
 
 			// 通知所有接收方
 			for _, receiverID := range channel.ReceiverIDs {
-				if err := s.notificationManager.Notify(receiverID, notification); err != nil {
+				if err := s.NotificationManager.Notify(receiverID, notification); err != nil {
 					log.Printf("⚠ Failed to notify receiver %s: %v", receiverID, err)
 				}
 			}
@@ -553,7 +553,7 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 				}
 			}
 			if !isParticipant {
-				if err := s.notificationManager.Notify(channel.CreatorID, notification); err != nil {
+				if err := s.NotificationManager.Notify(channel.CreatorID, notification); err != nil {
 					log.Printf("⚠ Failed to notify creator %s: %v", channel.CreatorID, err)
 				}
 			}
@@ -623,13 +623,13 @@ func (s *ChannelServiceServer) RejectChannelProposal(ctx context.Context, req *p
 		}
 
 		// 通知创建者
-		if err := s.notificationManager.Notify(channel.CreatorID, notification); err != nil {
+		if err := s.NotificationManager.Notify(channel.CreatorID, notification); err != nil {
 			log.Printf("⚠ Failed to notify creator %s: %v", channel.CreatorID, err)
 		}
 
 		// 通知所有发送方
 		for _, senderID := range channel.SenderIDs {
-			if err := s.notificationManager.Notify(senderID, notification); err != nil {
+			if err := s.NotificationManager.Notify(senderID, notification); err != nil {
 				log.Printf("⚠ Failed to notify sender %s: %v", senderID, err)
 			}
 		}
@@ -771,8 +771,8 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 		return fmt.Errorf("subscriber verification failed: %v", err)
 	}
 
-	// 标记连接器为在线状态（用于重启恢复）
-	wasOffline := !s.channelManager.IsConnectorOnline(req.ConnectorId)
+	// 检测是否是重启恢复
+	isRecovery := s.channelManager.IsConnectorRestarting(req.ConnectorId)
 	s.channelManager.MarkConnectorOnline(req.ConnectorId)
 
 	// 在连接断开时标记为离线
@@ -792,23 +792,15 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 		channel.AddParticipant(req.ConnectorId)
 	}
 
-	// 检查是否已经订阅（针对重启恢复场景）
-	var dataChan chan *circulation.DataPacket
-	if channel.IsSubscribed(req.ConnectorId) {
-		// 如果已经订阅，说明是从离线状态恢复，直接重新订阅
-		log.Printf("🔄 Connector %s re-subscribing to channel %s (recovery)", req.ConnectorId, req.ChannelId)
-		dataChan, err = channel.Resubscribe(req.ConnectorId)
-	} else {
-		// 正常订阅
-		dataChan, err = channel.Subscribe(req.ConnectorId)
-	}
+	// 订阅频道
+	dataChan, err := channel.SubscribeWithRecovery(req.ConnectorId, isRecovery)
 	if err != nil {
 		return fmt.Errorf("subscription failed: %v", err)
 	}
 	defer channel.Unsubscribe(req.ConnectorId)
 
 	// 如果是从离线状态恢复，发送频道激活通知
-	if wasOffline {
+	if isRecovery {
 		log.Printf("🔄 Connector %s recovered from offline state, sending channel notification", req.ConnectorId)
 		go func() {
 			// 构造频道通知
@@ -833,7 +825,7 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 			}
 
 			// 发送通知给重新连接的连接器
-			if err := s.notificationManager.Notify(req.ConnectorId, notification); err != nil {
+			if err := s.NotificationManager.Notify(req.ConnectorId, notification); err != nil {
 				log.Printf("⚠️ Failed to send recovery notification to %s: %v", req.ConnectorId, err)
 			}
 		}()
@@ -929,8 +921,8 @@ func (s *ChannelServiceServer) WaitForChannelNotification(req *pb.WaitNotificati
 	}
 
 	// 注册通知通道
-	notifyChan := s.notificationManager.Register(req.ReceiverId)
-	defer s.notificationManager.Unregister(req.ReceiverId)
+	notifyChan := s.NotificationManager.Register(req.ReceiverId)
+	defer s.NotificationManager.Unregister(req.ReceiverId)
 
 	// 持续监听通知
 	for {
@@ -986,7 +978,7 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 		CreatedAt:         channel.CreatedAt.Unix(),
 	}
 
-	if err := s.notificationManager.Notify(req.ReceiverId, notification); err != nil {
+	if err := s.NotificationManager.Notify(req.ReceiverId, notification); err != nil {
 		return &pb.NotifyChannelResponse{
 			Success: false,
 			Message: fmt.Sprintf("failed to notify: %v", err),
@@ -1356,7 +1348,7 @@ func (s *ChannelServiceServer) sendChannelUpdateNotification(channel *circulatio
 	}
 
 	// 发送通知给指定的订阅者
-	return s.notificationManager.Notify(subscriberID, notification)
+	return s.NotificationManager.Notify(subscriberID, notification)
 }
 
 // ------------------------------------------------------------

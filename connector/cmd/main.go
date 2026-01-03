@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -759,7 +760,31 @@ func handleSubscribe(connector *client.Connector, args []string) {
 						if packet.SenderId != "" {
 							senderInfo = fmt.Sprintf("来自 %s, ", packet.SenderId)
 						}
-						fmt.Printf("📦 [序列号: %d] %s数据: %s\n", packet.SequenceNumber, senderInfo, string(packet.Payload))
+
+						// 检查是否是存证数据（JSON格式且包含特定字段）
+						payloadStr := string(packet.Payload)
+						isEvidenceData := strings.Contains(payloadStr, `"event_type"`) &&
+							strings.Contains(payloadStr, `"tx_id"`) &&
+							strings.Contains(payloadStr, `"signature"`)
+
+						if isEvidenceData {
+							// 存证数据，简化显示
+							var evidenceBrief struct {
+								EventType   string `json:"event_type"`
+								ConnectorID string `json:"connector_id"`
+								TxID        string `json:"tx_id"`
+							}
+							if err := json.Unmarshal(packet.Payload, &evidenceBrief); err == nil {
+								fmt.Printf("📋 [序列号: %d] 存证记录: %s (%s) - TxID: %s\n",
+									packet.SequenceNumber, evidenceBrief.EventType,
+									evidenceBrief.ConnectorID, evidenceBrief.TxID[:8]+"...")
+							} else {
+								fmt.Printf("📋 [序列号: %d] 存证数据 (%d bytes)\n", packet.SequenceNumber, len(packet.Payload))
+							}
+						} else {
+							// 普通数据，显示完整内容
+							fmt.Printf("📦 [序列号: %d] %s数据: %s\n", packet.SequenceNumber, senderInfo, payloadStr)
+						}
 						}
 						return nil
 					})

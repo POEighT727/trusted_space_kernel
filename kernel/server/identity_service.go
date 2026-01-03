@@ -3,12 +3,14 @@ package server
 import (
 	"context"
 	"fmt"
+	"log"
 	"gopkg.in/yaml.v3"
 	"os"
 	"time"
 
 	"github.com/google/uuid"
 	pb "github.com/trusted-space/kernel/proto/kernel/v1"
+	"github.com/trusted-space/kernel/kernel/circulation"
 	"github.com/trusted-space/kernel/kernel/control"
 	"github.com/trusted-space/kernel/kernel/evidence"
 	"github.com/trusted-space/kernel/kernel/security"
@@ -19,17 +21,21 @@ const KernelVersion = "v1.0.0"
 // IdentityServiceServer 实现身份与准入服务
 type IdentityServiceServer struct {
 	pb.UnimplementedIdentityServiceServer
-	registry  *control.Registry
-	auditLog  *evidence.AuditLog
-	ca        *security.CA
+	registry           *control.Registry
+	auditLog           *evidence.AuditLog
+	ca                 *security.CA
+	channelManager     *circulation.ChannelManager
+	notificationManager *NotificationManager
 }
 
 // NewIdentityServiceServer 创建身份服务
-func NewIdentityServiceServer(registry *control.Registry, auditLog *evidence.AuditLog, ca *security.CA) *IdentityServiceServer {
+func NewIdentityServiceServer(registry *control.Registry, auditLog *evidence.AuditLog, ca *security.CA, channelManager *circulation.ChannelManager, notificationManager *NotificationManager) *IdentityServiceServer {
 	return &IdentityServiceServer{
-		registry: registry,
-		auditLog: auditLog,
-		ca:       ca,
+		registry:           registry,
+		auditLog:           auditLog,
+		ca:                 ca,
+		channelManager:     channelManager,
+		notificationManager: notificationManager,
 	}
 }
 
@@ -92,12 +98,81 @@ func (s *IdentityServiceServer) Handshake(ctx context.Context, req *pb.Handshake
 		},
 	)
 
+	// 检查是否是重启恢复，如果是则发送频道恢复通知
+	if s.channelManager.IsConnectorRestarting(req.ConnectorId) {
+		log.Printf("🔄 Connector %s detected as restarting, sending channel recovery notifications", req.ConnectorId)
+		s.sendChannelRecoveryNotifications(req.ConnectorId)
+	}
+
 	return &pb.HandshakeResponse{
 		Success:       true,
 		SessionToken:  sessionToken,
 		KernelVersion: KernelVersion,
 		Message:       "handshake successful",
 	}, nil
+}
+
+// sendChannelRecoveryNotifications 发送频道恢复通知给重启的连接器
+func (s *IdentityServiceServer) sendChannelRecoveryNotifications(connectorID string) {
+	// 获取所有活跃频道
+	channels := s.channelManager.GetAllChannels()
+
+	// 异步发送恢复通知，允许连接器有时间启动通知监听器
+	go func() {
+		// 等待连接器启动通知监听器（最多等待10秒）
+		maxRetries := 20
+		for i := 0; i < maxRetries; i++ {
+			time.Sleep(500 * time.Millisecond) // 每500ms检查一次
+
+			successCount := 0
+			totalCount := 0
+
+			for _, channel := range channels {
+				// 只发送连接器参与的频道通知
+				if channel.Status == circulation.ChannelStatusActive && channel.IsParticipant(connectorID) {
+					totalCount++
+
+					// 构造频道通知
+					channelType := pb.ChannelType_CHANNEL_TYPE_DATA
+					if channel.ChannelType == circulation.ChannelTypeLog {
+						channelType = pb.ChannelType_CHANNEL_TYPE_LOG
+					}
+
+					negotiationStatus := pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED
+
+					notification := &pb.ChannelNotification{
+						ChannelId:         channel.ChannelID,
+						CreatorId:         channel.CreatorID,
+						SenderIds:         channel.SenderIDs,
+						ReceiverIds:       channel.ReceiverIDs,
+						ChannelType:       channelType,
+						Encrypted:         channel.Encrypted,
+						RelatedChannelIds: channel.RelatedChannelIDs,
+						DataTopic:         channel.DataTopic,
+						CreatedAt:         channel.CreatedAt.Unix(),
+						NegotiationStatus: negotiationStatus,
+					}
+
+					// 发送通知
+					if err := s.notificationManager.Notify(connectorID, notification); err != nil {
+						log.Printf("⚠️ Recovery notification attempt %d for channel %s to %s failed: %v",
+							i+1, channel.ChannelID, connectorID, err)
+					} else {
+						log.Printf("✓ Recovery notification sent for channel %s to %s", channel.ChannelID, connectorID)
+						successCount++
+					}
+				}
+			}
+
+			// 如果所有通知都发送成功，退出重试循环
+			if successCount == totalCount && totalCount > 0 {
+				log.Printf("✅ All recovery notifications sent successfully to %s", connectorID)
+				return
+			}
+		}
+
+		log.Printf("⚠️ Failed to send recovery notifications to %s after %d attempts", connectorID, maxRetries)
+	}()
 }
 
 // Heartbeat 处理心跳请求

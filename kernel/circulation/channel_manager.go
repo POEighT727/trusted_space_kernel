@@ -974,8 +974,8 @@ func (c *Channel) IsSubscribed(subscriberID string) bool {
 	return exists
 }
 
-// Resubscribe 重新订阅（用于重启恢复场景）
-func (c *Channel) Resubscribe(subscriberID string) (chan *DataPacket, error) {
+// SubscribeWithRecovery 订阅频道，支持重启恢复
+func (c *Channel) SubscribeWithRecovery(subscriberID string, isRestartRecovery bool) (chan *DataPacket, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -988,13 +988,12 @@ func (c *Channel) Resubscribe(subscriberID string) (chan *DataPacket, error) {
 		return nil, fmt.Errorf("subscriber %s is not authorized to receive data from this channel", subscriberID)
 	}
 
-	// 如果已经订阅，先清理旧的订阅
-	if oldChan, exists := c.subscribers[subscriberID]; exists {
-		close(oldChan)
-		delete(c.subscribers, subscriberID)
+	// 检查是否已订阅
+	if _, exists := c.subscribers[subscriberID]; exists {
+		return nil, fmt.Errorf("already subscribed")
 	}
 
-	// 创建新的订阅通道
+	// 创建订阅通道
 	subChan := make(chan *DataPacket, 100)
 	c.subscribers[subscriberID] = subChan
 
@@ -1005,11 +1004,11 @@ func (c *Channel) Resubscribe(subscriberID string) (chan *DataPacket, error) {
 	c.buffer = c.buffer[:0] // 清空缓冲区
 	c.bufferMu.Unlock()
 
-	// 获取连接器级别的离线缓冲数据
+	// 如果是重启恢复，获取连接器级别的离线缓冲数据
 	connectorBufferedPackets := []*DataPacket{}
-	if c.manager != nil {
+	if isRestartRecovery && c.manager != nil {
 		connectorBufferedPackets = c.manager.GetBufferedDataForConnector(subscriberID)
-		log.Printf("🔍 Connector %s has %d buffered packets", subscriberID, len(connectorBufferedPackets))
+		log.Printf("🔍 Connector %s has %d buffered packets (restart recovery)", subscriberID, len(connectorBufferedPackets))
 	}
 
 	// 合并所有缓冲数据
@@ -1021,7 +1020,7 @@ func (c *Channel) Resubscribe(subscriberID string) (chan *DataPacket, error) {
 	// 在goroutine中发送所有暂存的数据，避免阻塞
 	go func() {
 		if len(allBufferedPackets) > 0 {
-			log.Printf("📤 Sending %d buffered packets to recovered connector %s", len(allBufferedPackets), subscriberID)
+			log.Printf("📤 Sending %d buffered packets to connector %s", len(allBufferedPackets), subscriberID)
 		}
 		for _, packet := range allBufferedPackets {
 			select {
@@ -1035,6 +1034,7 @@ func (c *Channel) Resubscribe(subscriberID string) (chan *DataPacket, error) {
 
 	return subChan, nil
 }
+
 
 // CleanupInactiveChannels 清理不活跃的频道（超过1小时没有活动）
 func (cm *ChannelManager) CleanupInactiveChannels(inactiveThreshold time.Duration) int {
@@ -1087,6 +1087,22 @@ func (cm *ChannelManager) IsConnectorOnline(connectorID string) bool {
 	cm.connectorMu.RLock()
 	defer cm.connectorMu.RUnlock()
 	return cm.connectorStatus[connectorID] == ConnectorStatusOnline
+}
+
+// IsConnectorRestarting 检查连接器是否正在重启恢复
+// 如果连接器最近（5秒内）没有活动，则认为是重启恢复
+func (cm *ChannelManager) IsConnectorRestarting(connectorID string) bool {
+	cm.connectorMu.RLock()
+	defer cm.connectorMu.RUnlock()
+
+	lastActivity, exists := cm.lastActivity[connectorID]
+	if !exists {
+		// 从来没有连接过，认为是新连接
+		return false
+	}
+
+	// 如果最后活动时间超过5秒，认为是重启恢复
+	return time.Since(lastActivity) > 5*time.Second
 }
 
 // BufferDataForOfflineConnector 为离线连接器缓冲数据
@@ -1566,5 +1582,15 @@ func (cm *ChannelManager) createEvidenceChannel(dataChannel *Channel) (*Channel,
 	return evidenceChannel, nil
 }
 
+// GetAllChannels 获取所有频道
+func (cm *ChannelManager) GetAllChannels() []*Channel {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
 
+	channels := make([]*Channel, 0, len(cm.channels))
+	for _, channel := range cm.channels {
+		channels = append(channels, channel)
+	}
+	return channels
+}
 

@@ -972,8 +972,35 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 										}
 									} else {
 										// 普通数据包，显示文本
-										log.Printf("📦 [频道: %s, 序列号: %d] 数据: %s", chID, packet.SequenceNumber, string(packet.Payload))
-										fmt.Printf("📦 [序列号: %d] 数据: %s\n", packet.SequenceNumber, string(packet.Payload))
+										payloadStr := string(packet.Payload)
+
+										// 检查是否是存证数据（JSON格式且包含特定字段）
+										isEvidenceData := strings.Contains(payloadStr, `"event_type"`) &&
+											strings.Contains(payloadStr, `"tx_id"`) &&
+											strings.Contains(payloadStr, `"signature"`)
+
+										if isEvidenceData {
+											// 存证数据，简化显示
+											var evidenceBrief struct {
+												EventType   string `json:"event_type"`
+												ConnectorID string `json:"connector_id"`
+												TxID        string `json:"tx_id"`
+											}
+											if err := json.Unmarshal(packet.Payload, &evidenceBrief); err == nil {
+												log.Printf("📋 [频道: %s, 序列号: %d] 存证记录: %s (%s) - TxID: %s",
+													chID, packet.SequenceNumber, evidenceBrief.EventType,
+													evidenceBrief.ConnectorID, evidenceBrief.TxID[:8]+"...")
+												fmt.Printf("📋 [序列号: %d] 存证记录: %s (%s)\n",
+													packet.SequenceNumber, evidenceBrief.EventType, evidenceBrief.ConnectorID)
+											} else {
+												log.Printf("📋 [频道: %s, 序列号: %d] 存证数据 (%d bytes)", chID, packet.SequenceNumber, len(packet.Payload))
+												fmt.Printf("📋 [序列号: %d] 存证数据 (%d bytes)\n", packet.SequenceNumber, len(packet.Payload))
+											}
+										} else {
+											// 普通数据，显示完整内容
+											log.Printf("📦 [频道: %s, 序列号: %d] 数据: %s", chID, packet.SequenceNumber, payloadStr)
+											fmt.Printf("📦 [序列号: %d] 数据: %s\n", packet.SequenceNumber, payloadStr)
+										}
 									}
 									return nil
 								})
