@@ -576,6 +576,7 @@ func (c *Connector) processEvidencePacket(packet *pb.DataPacket) error {
 		Timestamp   string            `json:"timestamp"`
 		Metadata    map[string]string `json:"metadata"`
 		Hash        string            `json:"hash"`
+		EventID     string            `json:"event_id"`
 	}
 
 	if err := json.Unmarshal(packet.Payload, &record); err != nil {
@@ -609,17 +610,31 @@ func (c *Connector) verifyEvidenceRecord(record *struct {
 	Timestamp   string            `json:"timestamp"`
 	Metadata    map[string]string `json:"metadata"`
 	Hash        string            `json:"hash"`
+	EventID     string            `json:"event_id"`
 }) error {
-	// 重新计算哈希值
-	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s",
+	// 解析时间戳
+	timestamp, err := time.Parse(time.RFC3339Nano, record.Timestamp)
+	if err != nil {
+		return fmt.Errorf("failed to parse timestamp: %w", err)
+	}
+
+	// 重新计算哈希值（与kernel端保持一致）
+	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%d|%s",
 		record.TxID,
 		record.ConnectorID,
 		record.EventType,
 		record.ChannelID,
 		record.DataHash,
-		record.Timestamp,
 		record.Signature,
+		timestamp.Unix(),
+		record.EventID,
 	)
+
+	// 如果有metadata，包含在哈希中
+	if len(record.Metadata) > 0 {
+		metadataJSON, _ := json.Marshal(record.Metadata)
+		data += "|" + string(metadataJSON)
+	}
 
 	hash := sha256.Sum256([]byte(data))
 	calculatedHash := hex.EncodeToString(hash[:])
@@ -674,6 +689,7 @@ func (c *Connector) storeEvidenceRecord(record *struct {
 	Timestamp   string            `json:"timestamp"`
 	Metadata    map[string]string `json:"metadata"`
 	Hash        string            `json:"hash"`
+	EventID     string            `json:"event_id"`
 }) error {
 	// 检查是否启用本地存证存储
 	if !c.evidenceLocalStorage {
@@ -782,6 +798,21 @@ func (c *Connector) QueryEvidence(channelID string, connectorID string, limit in
 		req.ConnectorId = connectorID
 	}
 
+	return c.queryEvidenceWithRequest(req)
+}
+
+// QueryEvidenceByFlowID 通过业务流程ID查询完整的业务流程
+func (c *Connector) QueryEvidenceByFlowID(flowID string) ([]*pb.EvidenceRecord, error) {
+	req := &pb.QueryRequest{
+		FlowId: flowID,
+		Limit:  1000, // 默认获取较多记录以包含完整流程
+	}
+
+	return c.queryEvidenceWithRequest(req)
+}
+
+// queryEvidenceWithRequest 通用查询方法
+func (c *Connector) queryEvidenceWithRequest(req *pb.QueryRequest) ([]*pb.EvidenceRecord, error) {
 	resp, err := c.evidenceSvc.QueryEvidence(c.ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query evidence: %w", err)

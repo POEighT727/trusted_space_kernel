@@ -1,7 +1,9 @@
 package database
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -45,8 +47,8 @@ func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 
 	query := `
 		INSERT INTO evidence_records
-		(tx_id, connector_id, event_type, channel_id, data_hash, signature, timestamp, metadata, record_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		(tx_id, connector_id, event_type, channel_id, data_hash, signature, timestamp, metadata, record_hash, event_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err = s.db.Exec(query,
 		record.TxID,
@@ -58,6 +60,7 @@ func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 		record.Timestamp,
 		string(metadataJSON),
 		record.Hash,
+		record.EventID,
 	)
 
 	if err != nil {
@@ -70,7 +73,7 @@ func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 // GetByID 根据ID获取证据记录
 func (s *MySQLEvidenceStore) GetByID(id int64) (*evidence.EvidenceRecord, error) {
 	query := `
-		SELECT id, tx_id, connector_id, event_type, channel_id, data_hash, signature, timestamp, metadata, record_hash
+		SELECT id, tx_id, connector_id, event_type, channel_id, data_hash, signature, timestamp, metadata, record_hash, event_id
 		FROM evidence_records WHERE id = ?`
 
 	row := s.db.QueryRow(query, id)
@@ -81,7 +84,7 @@ func (s *MySQLEvidenceStore) GetByID(id int64) (*evidence.EvidenceRecord, error)
 
 	err := row.Scan(&dbID, &record.TxID, &record.ConnectorID, &record.EventType,
 		&record.ChannelID, &record.DataHash, &record.Signature, &record.Timestamp,
-		&metadataStr, &record.Hash)
+		&metadataStr, &record.Hash, &record.EventID)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan evidence record: %w", err)
@@ -143,7 +146,7 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 	}
 
 	query := fmt.Sprintf(`
-		SELECT tx_id, connector_id, event_type, channel_id, data_hash, signature, timestamp, metadata, record_hash
+		SELECT tx_id, connector_id, event_type, channel_id, data_hash, signature, timestamp, metadata, record_hash, event_id
 		FROM evidence_records %s ORDER BY timestamp DESC %s`,
 		whereClause, limitClause)
 
@@ -160,7 +163,7 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 
 		err := rows.Scan(&record.TxID, &record.ConnectorID, &record.EventType,
 			&record.ChannelID, &record.DataHash, &record.Signature, &record.Timestamp,
-			&metadataStr, &record.Hash)
+			&metadataStr, &record.Hash, &record.EventID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan evidence record: %w", err)
 		}
@@ -186,7 +189,7 @@ func (s *MySQLEvidenceStore) Update(record *evidence.EvidenceRecord) error {
 	query := `
 		UPDATE evidence_records
 		SET connector_id = ?, event_type = ?, channel_id = ?, data_hash = ?,
-		    signature = ?, timestamp = ?, metadata = ?, record_hash = ?
+		    signature = ?, timestamp = ?, metadata = ?, record_hash = ?, event_id = ?
 		WHERE tx_id = ? AND event_type = ?`
 
 	_, err = s.db.Exec(query,
@@ -198,6 +201,7 @@ func (s *MySQLEvidenceStore) Update(record *evidence.EvidenceRecord) error {
 		record.Timestamp,
 		string(metadataJSON),
 		record.Hash,
+		record.EventID,
 		record.TxID,
 		string(record.EventType),
 	)
@@ -315,8 +319,8 @@ func (s *MySQLEvidenceStore) VerifyRecord(record *evidence.EvidenceRecord) error
 
 // calculateRecordHash 计算记录哈希
 func (s *MySQLEvidenceStore) calculateRecordHash(record *evidence.EvidenceRecord) string {
-	// 实现哈希计算逻辑
-	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%d",
+	// 实现哈希计算逻辑，包含event_id
+	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%d|%s",
 		record.TxID,
 		record.ConnectorID,
 		record.EventType,
@@ -324,6 +328,7 @@ func (s *MySQLEvidenceStore) calculateRecordHash(record *evidence.EvidenceRecord
 		record.DataHash,
 		record.Signature,
 		record.Timestamp.Unix(),
+		record.EventID,
 	)
 
 	// 如果有metadata，包含在哈希中
@@ -332,7 +337,9 @@ func (s *MySQLEvidenceStore) calculateRecordHash(record *evidence.EvidenceRecord
 		data += "|" + string(metadataJSON)
 	}
 
-	return fmt.Sprintf("%x", record.Hash) // 简化实现，实际应该使用SHA256
+	// 使用SHA256计算哈希
+	hash := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(hash[:])
 }
 
 // Close 关闭存储

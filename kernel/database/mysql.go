@@ -66,7 +66,7 @@ func (m *DBManager) initTables() error {
 	evidenceTableSQL := `
 	CREATE TABLE IF NOT EXISTS evidence_records (
 		id BIGINT AUTO_INCREMENT PRIMARY KEY,
-		tx_id VARCHAR(36) NOT NULL COMMENT '事务ID',
+		tx_id VARCHAR(36) NOT NULL COMMENT '业务流程ID',
 		connector_id VARCHAR(100) NOT NULL COMMENT '连接器ID',
 		event_type VARCHAR(50) NOT NULL COMMENT '事件类型',
 		channel_id VARCHAR(36) NOT NULL COMMENT '频道ID',
@@ -75,17 +75,31 @@ func (m *DBManager) initTables() error {
 		timestamp TIMESTAMP(6) NOT NULL COMMENT '时间戳',
 		metadata JSON COMMENT '元数据',
 		record_hash VARCHAR(128) NOT NULL COMMENT '记录哈希',
+		event_id VARCHAR(36) NOT NULL COMMENT '事件实例ID',
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
 		INDEX idx_tx_id (tx_id),
 		INDEX idx_connector_id (connector_id),
 		INDEX idx_event_type (event_type),
 		INDEX idx_channel_id (channel_id),
 		INDEX idx_timestamp (timestamp),
-		UNIQUE KEY uk_tx_event (tx_id, event_type)
+		INDEX idx_event_id (event_id),
+		UNIQUE KEY uk_flow_event (tx_id, event_type)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='证据记录表';`
 
 	if _, err := m.db.Exec(evidenceTableSQL); err != nil {
 		return fmt.Errorf("failed to create evidence_records table: %w", err)
+	}
+
+	// 检查并添加缺失的字段（数据库迁移）
+	migrationSQL := `
+		ALTER TABLE evidence_records
+		ADD COLUMN IF NOT EXISTS event_id VARCHAR(36) NOT NULL DEFAULT '' COMMENT '事件实例ID' AFTER record_hash,
+		ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间' AFTER event_id,
+		ADD INDEX IF NOT EXISTS idx_event_id (event_id);
+	`
+	if _, err := m.db.Exec(migrationSQL); err != nil {
+		log.Printf("Warning: failed to migrate evidence_records table: %v", err)
+		// 不返回错误，因为表可能已经是最新的
 	}
 
 	// 创建证据分发表

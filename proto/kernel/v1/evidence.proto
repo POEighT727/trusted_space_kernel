@@ -39,6 +39,7 @@ message EvidenceResponse {
 message QueryRequest {
   string channel_id = 1;
   string connector_id = 2;
+  string flow_id = 6;        // 业务流程ID，用于查询完整的数据流转过程
   int64 start_timestamp = 3;
   int64 end_timestamp = 4;
   int32 limit = 5;

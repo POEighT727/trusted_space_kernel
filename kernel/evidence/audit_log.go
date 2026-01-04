@@ -83,7 +83,7 @@ const (
 
 // EvidenceRecord 存证记录
 type EvidenceRecord struct {
-	TxID        string            `json:"tx_id"`
+	TxID        string            `json:"tx_id"`        // 业务流程ID (flow_id)
 	ConnectorID string            `json:"connector_id"`
 	EventType   EventType         `json:"event_type"`
 	ChannelID   string            `json:"channel_id"`
@@ -91,7 +91,8 @@ type EvidenceRecord struct {
 	Signature   string            `json:"signature"`
 	Timestamp   time.Time         `json:"timestamp"`
 	Metadata    map[string]string `json:"metadata"`
-	Hash        string            `json:"hash"` // 记录内容哈希，用于完整性验证
+	Hash        string            `json:"hash"`        // 记录内容哈希，用于完整性验证
+	EventID     string            `json:"event_id"`    // 事件实例ID (可选，用于区分同一流程中的不同事件)
 }
 
 // UnmarshalJSON 自定义JSON反序列化，支持向后兼容
@@ -222,12 +223,22 @@ func NewAuditLogWithConfig(config AuditLogConfig) (*AuditLog, error) {
 
 // SubmitEvidence 提交存证
 func (al *AuditLog) SubmitEvidence(connectorID string, eventType EventType, channelID, dataHash string, metadata map[string]string) (*EvidenceRecord, error) {
-	log.Printf("📝 EVIDENCE SUBMIT: %s, connector: %s, channel: %s, hash: %s", eventType, connectorID, channelID, dataHash)
+	return al.SubmitEvidenceWithFlowID("", connectorID, eventType, channelID, dataHash, metadata)
+}
+
+// SubmitEvidenceWithFlowID 提交带有业务流程ID的存证
+func (al *AuditLog) SubmitEvidenceWithFlowID(flowID, connectorID string, eventType EventType, channelID, dataHash string, metadata map[string]string) (*EvidenceRecord, error) {
+	log.Printf("📝 EVIDENCE SUBMIT: %s, connector: %s, channel: %s, hash: %s, flow: %s", eventType, connectorID, channelID, dataHash, flowID)
 	al.mu.Lock()
 	defer al.mu.Unlock()
 
-	// 生成唯一交易 ID
-	txID := uuid.New().String()
+	// 使用传入的flowID，如果为空则生成新的
+	if flowID == "" {
+		flowID = uuid.New().String()
+	}
+
+	// 生成事件实例ID（用于区分同一流程中的不同事件）
+	eventID := uuid.New().String()
 
 	// 创建临时记录用于签名（不包含TxID，因为TxID是动态生成的）
 	tempTimestamp := time.Now()
@@ -241,7 +252,7 @@ func (al *AuditLog) SubmitEvidence(connectorID string, eventType EventType, chan
 	}
 
 	record := &EvidenceRecord{
-		TxID:        txID,
+		TxID:        flowID,      // 使用业务流程ID作为TxID
 		ConnectorID: connectorID,
 		EventType:   eventType,
 		ChannelID:   channelID,
@@ -249,6 +260,7 @@ func (al *AuditLog) SubmitEvidence(connectorID string, eventType EventType, chan
 		Signature:   signature,
 		Timestamp:   tempTimestamp,
 		Metadata:    metadata,
+		EventID:     eventID,     // 事件实例ID
 	}
 
 	// 计算记录内容的哈希
@@ -257,15 +269,17 @@ func (al *AuditLog) SubmitEvidence(connectorID string, eventType EventType, chan
 	// 如果使用数据库存储
 	if al.store != nil {
 		if err := al.store.Store(record); err != nil {
-			return nil, fmt.Errorf("failed to store evidence in database: %w", err)
+			log.Printf("⚠️ Failed to store evidence in database: %v", err)
+			// 继续执行，不返回错误，确保其他存储方式仍然工作
+		} else {
+			log.Printf("✓ Evidence stored in database: %s", flowID)
 		}
-		log.Printf("✓ Evidence stored in database: %s", txID)
 	}
 
 	// 更新内存缓存（如果启用）
 	if al.records != nil {
 	al.records = append(al.records, record)
-	al.indexByID[txID] = record
+	al.indexByID[flowID] = record
 
 	if channelID != "" {
 		al.indexByCh[channelID] = append(al.indexByCh[channelID], record)
@@ -295,44 +309,62 @@ func (al *AuditLog) SubmitEvidence(connectorID string, eventType EventType, chan
 
 // calculateRecordHash 计算记录内容的哈希值
 func (al *AuditLog) calculateRecordHash(record *EvidenceRecord) string {
-	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s",
+	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%d|%s",
 		record.TxID,
 		record.ConnectorID,
 		record.EventType,
 		record.ChannelID,
 		record.DataHash,
-		record.Timestamp.Format(time.RFC3339Nano),
 		record.Signature,
+		record.Timestamp.Unix(),
+		record.EventID,
 	)
+
+	// 如果有metadata，包含在哈希中
+	if len(record.Metadata) > 0 {
+		metadataJSON, _ := json.Marshal(record.Metadata)
+		data += "|" + string(metadataJSON)
+	}
 
 	hash := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(hash[:])
 }
 
-// QueryByTxID 根据交易 ID 查询
-func (al *AuditLog) QueryByTxID(txID string) (*EvidenceRecord, error) {
+// QueryByTxID 根据业务流程ID查询所有相关事件
+func (al *AuditLog) QueryByTxID(flowID string) ([]*EvidenceRecord, error) {
 	// 如果使用数据库存储
 	if al.store != nil {
-		records, err := al.store.GetByTxID(txID)
+		records, err := al.store.GetByTxID(flowID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query evidence from database: %w", err)
 		}
-		if len(records) == 0 {
-			return nil, fmt.Errorf("evidence record not found for txID: %s", txID)
-		}
-		return records[0], nil
+		return records, nil
 	}
 
-	// 内存缓存查询
+	// 内存缓存查询 - 查找所有匹配的记录
 	al.mu.RLock()
 	defer al.mu.RUnlock()
 
-	record, exists := al.indexByID[txID]
-	if !exists {
-		return nil, fmt.Errorf("record not found: %s", txID)
+	var records []*EvidenceRecord
+	for _, record := range al.records {
+		if record.TxID == flowID {
+			records = append(records, record)
+		}
 	}
 
-	return record, nil
+	return records, nil
+}
+
+// QueryByTxIDSingle 根据交易ID查询单个事件（向后兼容）
+func (al *AuditLog) QueryByTxIDSingle(txID string) (*EvidenceRecord, error) {
+	records, err := al.QueryByTxID(txID)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("evidence record not found for txID: %s", txID)
+	}
+	return records[0], nil
 }
 
 // QueryByChannel 根据频道 ID 查询

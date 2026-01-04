@@ -272,10 +272,11 @@ func printHelp() {
 	fmt.Println("  reject-permission <channel_id> <request_id> <reason> - 拒绝权限变更或订阅申请（仅频道参与者可用）")
 	fmt.Println("    示例: reject-permission channel-123 req-456 \"权限不足\"")
 	fmt.Println("  list-permissions <channel_id> - 查看频道的权限变更请求")
-	fmt.Println("  query-evidence, query [--channel <channel_id>] [--connector <connector_id>] [--limit <num>] - 查询存证记录")
-    fmt.Println("    查询证据记录，支持按频道、连接器过滤")
+	fmt.Println("  query-evidence, query [--channel <channel_id>] [--connector <connector_id>] [--flow <flow_id>] [--limit <num>] - 查询存证记录")
+    fmt.Println("    查询证据记录，支持按频道、连接器、业务流程过滤")
     fmt.Println("    示例: query-evidence --channel channel-123 --limit 10")
     fmt.Println("    示例: query-evidence --connector connector-A")
+    fmt.Println("    示例: query-evidence --flow flow-uuid-123")
 	fmt.Println("  status [active|inactive|closed] - 查看或设置连接器状态")
 	fmt.Println("  help, h               - 显示此帮助信息")
 	fmt.Println("  exit, quit, q         - 退出连接器")
@@ -1161,7 +1162,7 @@ func handleListPermissions(connector *client.Connector, args []string) {
 // handleQueryEvidence 处理查询存证记录命令
 func handleQueryEvidence(connector *client.Connector, args []string) {
 	// 解析命令行参数
-	var channelID, connectorID string
+	var channelID, connectorID, flowID string
 	var limit int32 = 50 // 默认查询50条
 
 	i := 0
@@ -1183,6 +1184,14 @@ func handleQueryEvidence(connector *client.Connector, args []string) {
 				fmt.Println("❌ --connector 参数需要提供连接器ID")
 				return
 			}
+		case "--flow":
+			if i+1 < len(args) {
+				flowID = strings.TrimSpace(args[i+1])
+				i += 2
+			} else {
+				fmt.Println("❌ --flow 参数需要提供业务流程ID")
+				return
+			}
 		case "--limit":
 			if i+1 < len(args) {
 				limitStr := strings.TrimSpace(args[i+1])
@@ -1199,17 +1208,18 @@ func handleQueryEvidence(connector *client.Connector, args []string) {
 			}
 		default:
 			fmt.Printf("❌ 未知参数: %s\n", args[i])
-			fmt.Println("用法: query-evidence [--channel <channel_id>] [--connector <connector_id>] [--limit <num>]")
+			fmt.Println("用法: query-evidence [--channel <channel_id>] [--connector <connector_id>] [--flow <flow_id>] [--limit <num>]")
 			return
 		}
 	}
 
 	// 至少需要指定一个查询条件
-	if channelID == "" && connectorID == "" {
-		fmt.Println("❌ 至少需要指定--channel或--connector参数")
-		fmt.Println("用法: query-evidence [--channel <channel_id>] [--connector <connector_id>] [--limit <num>]")
+	if channelID == "" && connectorID == "" && flowID == "" {
+		fmt.Println("❌ 至少需要指定--channel、--connector或--flow参数")
+		fmt.Println("用法: query-evidence [--channel <channel_id>] [--connector <connector_id>] [--flow <flow_id>] [--limit <num>]")
 		fmt.Println("示例: query-evidence --channel channel-123 --limit 10")
 		fmt.Println("示例: query-evidence --connector connector-A")
+		fmt.Println("示例: query-evidence --flow flow-uuid-123")
 		return
 	}
 
@@ -1220,10 +1230,19 @@ func handleQueryEvidence(connector *client.Connector, args []string) {
 	if connectorID != "" {
 		fmt.Printf("  连接器ID: %s\n", connectorID)
 	}
+	if flowID != "" {
+		fmt.Printf("  业务流程ID: %s\n", flowID)
+	}
 	fmt.Printf("  限制数量: %d\n", limit)
 
-	// 调用查询API
-	records, err := connector.QueryEvidence(channelID, connectorID, limit)
+	// 根据查询类型调用不同的接口
+	var records []*pb.EvidenceRecord
+	var err error
+	if flowID != "" {
+		records, err = connector.QueryEvidenceByFlowID(flowID)
+	} else {
+		records, err = connector.QueryEvidence(channelID, connectorID, limit)
+	}
 	if err != nil {
 		fmt.Printf("❌ 查询失败: %v\n", err)
 		return

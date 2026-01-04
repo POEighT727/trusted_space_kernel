@@ -85,7 +85,14 @@ func (s *EvidenceServiceServer) QueryEvidence(ctx context.Context, req *pb.Query
 	var records []*evidence.EvidenceRecord
 
 	// 根据不同条件查询
-	if req.ChannelId != "" {
+	if req.FlowId != "" {
+		// 按业务流程ID查询 - 查询完整的业务流程
+		var err error
+		records, err = s.auditLog.QueryByTxID(req.FlowId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query by flow ID: %w", err)
+		}
+	} else if req.ChannelId != "" {
 		// 按频道查询 - 需要验证查询者是否是该频道的参与者
 		channel, err := s.channelManager.GetChannel(req.ChannelId)
 		if err != nil {
