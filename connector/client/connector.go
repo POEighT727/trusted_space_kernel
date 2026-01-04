@@ -505,6 +505,64 @@ func (c *Connector) ReceiveEvidenceData(channelID string) error {
 	}
 }
 
+// ReceiveControlData 接收控制频道数据并处理控制消息
+func (c *Connector) ReceiveControlData(channelID string) error {
+	// 检查是否已经在本地标记为订阅状态（避免重复调用）
+	c.subscriptionsMu.Lock()
+	if c.subscriptions[channelID] {
+		c.subscriptionsMu.Unlock()
+		return fmt.Errorf("already subscribed to control channel: %s", channelID)
+	}
+	// 标记开始订阅（即使内核已经记录了订阅，也要防止客户端重复调用）
+	c.subscriptions[channelID] = true
+	c.subscriptionsMu.Unlock()
+
+	// 确保在函数结束时清理订阅标记
+	defer func() {
+		c.subscriptionsMu.Lock()
+		delete(c.subscriptions, channelID)
+		c.subscriptionsMu.Unlock()
+	}()
+
+	stream, err := c.channelSvc.SubscribeData(c.ctx, &pb.SubscribeRequest{
+		ConnectorId: c.connectorID,
+		ChannelId:   channelID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to control channel: %w", err)
+	}
+
+	log.Printf("✓ Subscribed to control channel: %s", channelID)
+	log.Println("Waiting for control messages...")
+
+	for {
+		packet, err := stream.Recv()
+		if err == io.EOF {
+			log.Println("✓ Control channel closed")
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("control channel receive error: %w", err)
+		}
+
+		// 处理控制消息
+		if err := c.processControlPacket(packet); err != nil {
+			log.Printf("⚠ Failed to process control packet: %v", err)
+		}
+	}
+}
+
+// processControlPacket 处理接收到的控制消息数据包
+func (c *Connector) processControlPacket(packet *pb.DataPacket) error {
+	// 控制消息由connector/cmd/main.go中的handleControlMessage处理
+	// 这里只需要记录日志，不需要特殊处理
+	log.Printf("📢 [控制频道: %s, 序列号: %d] 收到控制消息 (%d bytes)",
+		packet.ChannelId, packet.SequenceNumber, len(packet.Payload))
+
+	// 控制消息的具体处理逻辑在UI层（main.go）实现
+	return nil
+}
+
 // processEvidencePacket 处理接收到的存证数据包
 func (c *Connector) processEvidencePacket(packet *pb.DataPacket) error {
 	// 反序列化存证记录
@@ -934,20 +992,25 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 					senderInfo := fmt.Sprintf("%v", notification.SenderIds)
 					receiverInfo := fmt.Sprintf("%v", notification.ReceiverIds)
 
-					// 检查是否为存证频道
+					// 检查频道类型
 					isEvidenceChannel := strings.HasSuffix(notification.DataTopic, "-evidence")
+					isControlChannel := strings.HasSuffix(notification.DataTopic, "-control")
 
 					if isEvidenceChannel {
 						log.Printf("📋 存证频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
 							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
 						log.Printf("✓ 自动订阅存证频道以接收分布式存证数据")
+					} else if isControlChannel {
+						log.Printf("🎛️ 控制频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
+							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
+						log.Printf("✓ 自动订阅控制频道以接收控制消息")
 					} else {
 						log.Printf("📢 数据频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
 							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
 					}
 
 						// 自动订阅逻辑
-						go func(chID string, isEvidence bool) {
+						go func(chID string, isEvidence bool, isControl bool) {
 							if isEvidence {
 								// 存证频道的特殊处理
 								err := c.ReceiveEvidenceData(chID)
@@ -955,6 +1018,14 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 									log.Printf("❌ 存证频道自动订阅失败: %v", err)
 								} else {
 									log.Printf("✓ 存证频道 %s 已关闭", chID)
+								}
+							} else if isControl {
+								// 控制频道的特殊处理
+								err := c.ReceiveControlData(chID)
+								if err != nil {
+									log.Printf("❌ 控制频道自动订阅失败: %v", err)
+								} else {
+									log.Printf("✓ 控制频道 %s 已关闭", chID)
 								}
 							} else {
 								// 普通数据频道的处理
@@ -1018,7 +1089,7 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 									log.Printf("✓ 频道 %s 已关闭", chID)
 								}
 							}
-						}(notification.ChannelId, isEvidenceChannel)
+						}(notification.ChannelId, isEvidenceChannel, isControlChannel)
 					} else if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_REJECTED {
 						// 频道提议已被拒绝
 						log.Printf("❌ 频道提议已被拒绝: %s (创建者: %s)",
@@ -1777,6 +1848,15 @@ func (fr *FileReceiver) assembleFile(transferID string) error {
 // IsFileTransferPacket 检查是否是文件传输数据包（导出函数）
 func IsFileTransferPacket(payload []byte) bool {
 	return len(payload) > len(FileTransferPrefix) && string(payload[:len(FileTransferPrefix)]) == FileTransferPrefix
+}
+
+// IsControlMessage 检查是否是控制消息
+func IsControlMessage(payload []byte) bool {
+	payloadStr := string(payload)
+
+	// 检查是否包含控制消息的特征字段
+	return strings.Contains(payloadStr, `"message_type":`) &&
+		strings.Contains(payloadStr, `"timestamp":`)
 }
 
 // verifyEvidenceSignature 验证存证记录的数字签名

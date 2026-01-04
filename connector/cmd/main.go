@@ -927,6 +927,11 @@ func handleSubscribe(connector *client.Connector, args []string) {
 				if err := fileReceiver.HandleFilePacket(packet); err != nil {
 					log.Printf("⚠ 处理文件数据包失败: %v", err)
 				}
+			} else if client.IsControlMessage(packet.Payload) {
+				// 处理控制消息
+				if err := handleControlMessage(packet); err != nil {
+					log.Printf("⚠ 处理控制消息失败: %v", err)
+				}
 			} else {
 				// 普通数据包，显示文本
 			senderInfo := ""
@@ -1358,5 +1363,104 @@ func removeDuplicates(slice []string) []string {
 		}
 	}
 	return result
+}
+
+// ControlMessage 控制消息结构（与kernel中的定义保持一致）
+type ControlMessage struct {
+	MessageType string    `json:"message_type"`
+	Timestamp   time.Time `json:"timestamp"`
+	SenderID    string    `json:"sender_id"`
+
+	// 权限变更相关字段
+	PermissionRequest *PermissionRequestMessage `json:"permission_request,omitempty"`
+	PermissionResult  *PermissionResultMessage  `json:"permission_result,omitempty"`
+
+	// 频道提议相关字段
+	ChannelProposal *ChannelProposalMessage `json:"channel_proposal,omitempty"`
+}
+
+// PermissionRequestMessage 权限变更请求消息
+type PermissionRequestMessage struct {
+	RequestID  string `json:"request_id"`
+	ChannelID  string `json:"channel_id"`
+	ChangeType string `json:"change_type"`
+	TargetID   string `json:"target_id"`
+	Reason     string `json:"reason"`
+}
+
+// PermissionResultMessage 权限变更结果消息
+type PermissionResultMessage struct {
+	RequestID    string `json:"request_id"`
+	ChannelID    string `json:"channel_id"`
+	Action       string `json:"action"`
+	ApproverID   string `json:"approver_id"`
+	RejectReason string `json:"reject_reason,omitempty"`
+}
+
+// ChannelProposalMessage 频道提议消息
+type ChannelProposalMessage struct {
+	ProposalID  string   `json:"proposal_id"`
+	ChannelID   string   `json:"channel_id"`
+	CreatorID   string   `json:"creator_id"`
+	SenderIDs   []string `json:"sender_ids"`
+	ReceiverIDs []string `json:"receiver_ids"`
+	DataTopic   string   `json:"data_topic"`
+	Reason      string   `json:"reason"`
+}
+
+// handleControlMessage 处理控制消息
+func handleControlMessage(packet *pb.DataPacket) error {
+	var message ControlMessage
+	if err := json.Unmarshal(packet.Payload, &message); err != nil {
+		return fmt.Errorf("failed to unmarshal control message: %w", err)
+	}
+
+	switch message.MessageType {
+	case "permission_request":
+		if message.PermissionRequest != nil {
+			fmt.Printf("🔐 [控制消息] 权限变更请求:\n")
+			fmt.Printf("   请求ID: %s\n", message.PermissionRequest.RequestID)
+			fmt.Printf("   频道ID: %s\n", message.PermissionRequest.ChannelID)
+			fmt.Printf("   变更类型: %s\n", message.PermissionRequest.ChangeType)
+			fmt.Printf("   目标ID: %s\n", message.PermissionRequest.TargetID)
+			fmt.Printf("   请求者: %s\n", message.SenderID)
+			if message.PermissionRequest.Reason != "" {
+				fmt.Printf("   理由: %s\n", message.PermissionRequest.Reason)
+			}
+		}
+
+	case "permission_result":
+		if message.PermissionResult != nil {
+			action := "批准"
+			if message.PermissionResult.Action == "rejected" {
+				action = "拒绝"
+			}
+			fmt.Printf("✅ [控制消息] 权限变更%s:\n", action)
+			fmt.Printf("   请求ID: %s\n", message.PermissionResult.RequestID)
+			fmt.Printf("   频道ID: %s\n", message.PermissionResult.ChannelID)
+			fmt.Printf("   批准者: %s\n", message.PermissionResult.ApproverID)
+			if message.PermissionResult.RejectReason != "" {
+				fmt.Printf("   拒绝理由: %s\n", message.PermissionResult.RejectReason)
+			}
+		}
+
+	case "channel_proposal":
+		if message.ChannelProposal != nil {
+			fmt.Printf("📋 [控制消息] 频道提议广播:\n")
+			fmt.Printf("   提议ID: %s\n", message.ChannelProposal.ProposalID)
+			fmt.Printf("   频道ID: %s\n", message.ChannelProposal.ChannelID)
+			fmt.Printf("   创建者: %s\n", message.ChannelProposal.CreatorID)
+			fmt.Printf("   发送方: %v\n", message.ChannelProposal.SenderIDs)
+			fmt.Printf("   接收方: %v\n", message.ChannelProposal.ReceiverIDs)
+			if message.ChannelProposal.Reason != "" {
+				fmt.Printf("   理由: %s\n", message.ChannelProposal.Reason)
+			}
+		}
+
+	default:
+		fmt.Printf("📢 [控制消息] 未知类型: %s\n", message.MessageType)
+	}
+
+	return nil
 }
 

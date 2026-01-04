@@ -205,51 +205,204 @@ Proposed → Closed (任意参与方拒绝)
 
 --------------------------------------------------------------------------
 
-## 四、存证模块
+## 四、存证溯源模块
 
 ### 4.1 核心构想
 
-存证模块采用**时间戳排序的哈希记录**方式记录所有关键操作，构建**可审计的存证日志**。核心理念是：**所有关键事件都必须记录，并通过哈希值确保记录完整性**。
+存证溯源模块采用**时间戳排序的哈希链记录**方式记录所有关键操作，构建**完全可审计的存证日志系统**。核心理念是：**所有关键事件都必须记录，通过数字签名确保不可抵赖性，通过哈希链确保不可篡改性**。
 
-### 4.2 记录结构
+### 4.2 事件类型体系
 
-每个存证记录包含：
-- **唯一标识**：交易ID（UUID）
-- **事件信息**：连接器ID、事件类型、频道ID等
-- **数据指纹**：数据哈希（而非原始数据）
-- **时间戳**：精确到纳秒的事件发生时间
-- **数字签名**：行为不可抵赖签名
-- **内容哈希**：记录内容的SHA256哈希，用于完整性验证
+模块定义了60多种事件类型，覆盖系统各个方面：
 
-### 4.3 分布式存储机制
+#### 数据传输事件
+- `TRANSFER_START` - 数据传输开始
+- `TRANSFER_END` - 数据传输结束
+- `DATA_RECEIVED` - 数据接收确认
+- `FILE_TRANSFER_START/END` - 文件传输事件
 
-**自动频道创建：**
+#### 频道管理事件
+- `CHANNEL_CREATED/CLOSED` - 频道生命周期
+- `CHANNEL_ACTIVATED/SUSPENDED/RESUMED` - 频道状态变化
+
+#### 权限管理事件
+- `PERMISSION_REQUEST/GRANTED/DENIED/REVOKED` - 权限控制
+- `ROLE_CHANGED` - 角色变更
+
+#### 安全事件
+- `POLICY_VIOLATION/SECURITY_VIOLATION` - 安全违规
+- `DATA_TAMPERING/INTEGRITY_CHECK_FAIL` - 数据安全
+- `ACCESS_DENIED/SUSPICIOUS_ACTIVITY` - 异常访问
+
+#### 身份认证事件
+- `AUTH_SUCCESS/FAIL/ATTEMPT/LOGOUT` - 认证过程
+- `TOKEN_GENERATED/VALIDATED/EXPIRED` - 令牌管理
+
+#### 连接器事件
+- `CONNECTOR_REGISTERED/UNREGISTERED` - 连接器生命周期
+- `CONNECTOR_HEARTBEAT/ONLINE/OFFLINE` - 连接器状态
+- `CONNECTOR_STATUS_CHANGED` - 状态变更
+
+#### 证据相关事件
+- `EVIDENCE_GENERATED/VERIFIED/STORED/DISTRIBUTED` - 证据处理
+- `EVIDENCE_INTEGRITY_FAIL` - 完整性验证失败
+
+#### 系统事件
+- `SYSTEM_STARTUP/SHUTDOWN` - 系统生命周期
+- `CONFIG_CHANGED/BACKUP_CREATED` - 配置管理
+- `MAINTENANCE_START/END` - 维护操作
+
+### 4.3 记录结构与完整性保证
+
+每个存证记录包含完整的审计信息：
+
+**核心字段：**
+- **交易ID (TxID)**：全局唯一UUID标识
+- **连接器ID**：操作发起者身份
+- **事件类型**：标准化的事件分类
+- **频道ID**：关联的数据传输频道
+- **数据哈希**：数据内容的SHA256指纹（不存储原始数据）
+- **数字签名**：RSA签名确保不可抵赖性
+- **时间戳**：纳秒级精确时间记录
+- **元数据**：扩展的上下文信息
+- **记录哈希**：整个记录的SHA256哈希，用于完整性验证
+
+**完整性保护机制：**
+- **数字签名**：使用RSA私钥对记录内容签名
+- **哈希链**：相邻记录通过哈希值链接，形成不可篡改链
+- **双重验证**：既验证签名真实性，又验证内容完整性
+
+### 4.4 多层存储架构
+
+#### 存储后端支持
+- **文件存储**：JSON格式本地持久化，支持向后兼容
+- **数据库存储**：MySQL高性能索引查询，支持复杂条件筛选
+- **分布式传输**：通过频道机制实现跨节点证据分发
+
+#### 数据库表结构
+```sql
+-- 证据记录表
+CREATE TABLE evidence_records (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    tx_id VARCHAR(36) NOT NULL COMMENT '交易ID',
+    connector_id VARCHAR(100) NOT NULL COMMENT '连接器ID',
+    event_type VARCHAR(50) NOT NULL COMMENT '事件类型',
+    channel_id VARCHAR(36) NOT NULL COMMENT '频道ID',
+    data_hash VARCHAR(128) DEFAULT '' COMMENT '数据哈希',
+    signature TEXT COMMENT '数字签名',
+    timestamp TIMESTAMP(6) NOT NULL COMMENT '时间戳',
+    metadata JSON COMMENT '元数据',
+    record_hash VARCHAR(128) NOT NULL COMMENT '记录哈希',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 索引优化
+INDEX idx_tx_id (tx_id),
+INDEX idx_connector_id (connector_id),
+INDEX idx_event_type (event_type),
+INDEX idx_channel_id (channel_id),
+INDEX idx_timestamp (timestamp),
+UNIQUE KEY uk_tx_event (tx_id, event_type)
+```
+
+### 4.5 分布式存证机制
+
+#### 自动频道关联
 - 创建数据传输频道时，系统自动创建配套的存证频道
-- 存证频道包含所有数据传输的参与者（发送方+接收方）
-- 频道主题格式：`{data_topic}-evidence`
+- 存证频道主题格式：`{data_topic}-evidence`
+- 包含所有数据传输的参与者，确保多方见证
 
-**分布式传输：**
-- 存证数据通过专用频道进行广播传输
-- 所有参与主机都能接收并存储存证数据
-- 实现真正的分布式存证，避免单点故障
+#### 分布式传输流程
+```
+数据传输发生 → 生成存证记录 → 数字签名 → 推送到存证频道
+                                      ↓
+接收方验证签名 → 本地存储 → 广播确认 → 多节点备份
+```
 
-**多层存储策略：**
-- **频道传输**：实时分布式广播（主要存储）
-- **本地持久化**：可选的本地文件备份
-- **内存索引**：快速查询支持
+#### 分发状态管理
+- **证据分发表**：跟踪分发状态（pending/delivered/failed）
+- **重试机制**：失败时自动重试，最多3次
+- **分发确认**：确保证据成功传递到所有相关节点
 
-### 4.4 完整性验证
+### 4.6 查询与分析接口
 
-通过计算记录内容的哈希值并与存储的哈希值对比，确保记录未被篡改。分布式存储确保即使部分节点故障，存证数据仍能从其他节点恢复。
+#### 多维度查询能力
+- **按交易ID查询**：追踪完整业务流程
+- **按频道查询**：分析特定频道的所有活动
+- **按连接器查询**：跟踪特定实体的操作历史
+- **时间范围查询**：支持精确时间段筛选
+- **复合条件查询**：支持多条件组合查询
 
-### 4.5 频道关联关系
+#### gRPC服务接口
+- **SubmitEvidence**：提交存证记录（带身份验证）
+- **QueryEvidence**：查询存证记录（带权限控制）
+- **VerifyEvidenceSignature**：验证数字签名真实性
+
+#### 权限控制
+- **身份验证**：基于mTLS证书的严格身份认证
+- **访问控制**：只能查询自己参与的频道记录
+- **审计追踪**：所有查询操作本身也会产生存证
+
+### 4.7 性能优化特性
+
+#### 高性能设计
+- **异步处理**：存证操作不阻塞业务流程
+- **批量写入**：累积多条记录后批量持久化
+- **内存索引**：快速查询支持（TxID、ChannelID、ConnectorID）
+- **连接池**：数据库连接池提高并发性能
+
+#### 存储策略
+- **文件存储**：简单可靠，适合小型部署
+- **数据库存储**：高性能查询，适合大规模部署
+- **混合存储**：文件+数据库双重保障
+
+### 4.8 安全特性
+
+#### 深度防御
+- **传输层安全**：基于mTLS的加密传输
+- **认证层安全**：RSA数字签名确保不可抵赖
+- **数据层安全**：哈希链确保不可篡改
+- **访问层安全**：细粒度权限控制
+
+#### 完整性验证
+```go
+// 记录完整性验证
+func (al *AuditLog) VerifyRecord(record *EvidenceRecord) error {
+    calculatedHash := al.calculateRecordHash(record)
+    if calculatedHash != record.Hash {
+        return fmt.Errorf("hash mismatch: expected=%s, got=%s",
+            record.Hash, calculatedHash)
+    }
+    return nil
+}
+```
+
+### 4.9 监控与运维
+
+#### 关键指标
+- 证据生成速率（EPS）
+- 查询响应时间
+- 存储成功率
+- 签名验证通过率
+- 分布式分发成功率
+
+#### 故障处理
+- **存储失败**：自动降级到文件存储
+- **网络分区**：本地缓存，网络恢复后同步
+- **数据损坏**：通过多副本恢复
+- **性能瓶颈**：自动扩容和索引优化
+
+### 4.10 频道关联关系
 
 ```
 数据频道 (ChannelTypeData)
 ├── 控制频道 (ChannelTypeControl) - 权限协商等控制信息
 ├── 存证频道 (ChannelTypeLog) - 分布式存证数据
+│   ├── 主题格式: {data_topic}-evidence
+│   ├── 参与者: 数据频道所有参与者
+│   └── 传输内容: 结构化存证记录
 └── 关联关系：数据频道知道存证频道ID，存证频道知道数据频道ID
 ```
 
-这种设计确保了存证数据的高可用性和容错性。
+这种设计确保了存证数据的**高可用性**、**容错性**和**不可抵赖性**，为整个可信数据空间提供了坚实的安全审计基础。
 
