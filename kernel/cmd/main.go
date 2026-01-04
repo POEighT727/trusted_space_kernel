@@ -159,7 +159,7 @@ func main() {
 	identityService := server.NewIdentityServiceServer(registry, auditLog, ca, channelManager, channelService.NotificationManager)
 	pb.RegisterIdentityServiceServer(grpcServer, identityService)
 
-	evidenceService := server.NewEvidenceServiceServer(auditLog)
+	evidenceService := server.NewEvidenceServiceServer(auditLog, channelManager)
 	pb.RegisterEvidenceServiceServer(grpcServer, evidenceService)
 
 	log.Println("✓ gRPC services registered")

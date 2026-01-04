@@ -21,6 +21,7 @@ type EvidenceStore interface {
 	GetByTxID(txID string) ([]*evidence.EvidenceRecord, error)
 	GetByChannel(channelID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error)
 	GetByConnector(connectorID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error)
+	GetByChannelAndConnector(channelID, connectorID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error)
 	VerifyRecord(record *evidence.EvidenceRecord) error
 	Close() error
 }
@@ -284,6 +285,17 @@ func (s *MySQLEvidenceStore) GetByChannel(channelID string, startTime, endTime *
 // GetByConnector 根据连接器获取证据记录
 func (s *MySQLEvidenceStore) GetByConnector(connectorID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error) {
 	filter := evidence.EvidenceFilter{
+		ConnectorID: connectorID,
+		StartTime:   startTime,
+		EndTime:     endTime,
+	}
+	return s.Query(filter)
+}
+
+// GetByChannelAndConnector 根据频道和连接器获取证据记录
+func (s *MySQLEvidenceStore) GetByChannelAndConnector(channelID, connectorID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error) {
+	filter := evidence.EvidenceFilter{
+		ChannelID:   channelID,
 		ConnectorID: connectorID,
 		StartTime:   startTime,
 		EndTime:     endTime,

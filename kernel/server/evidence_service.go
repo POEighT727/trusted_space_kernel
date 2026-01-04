@@ -6,6 +6,7 @@ import (
 	"time"
 
 	pb "github.com/trusted-space/kernel/proto/kernel/v1"
+	"github.com/trusted-space/kernel/kernel/circulation"
 	"github.com/trusted-space/kernel/kernel/evidence"
 	"github.com/trusted-space/kernel/kernel/security"
 )
@@ -13,13 +14,15 @@ import (
 // EvidenceServiceServer 实现存证服务
 type EvidenceServiceServer struct {
 	pb.UnimplementedEvidenceServiceServer
-	auditLog *evidence.AuditLog
+	auditLog      *evidence.AuditLog
+	channelManager *circulation.ChannelManager
 }
 
 // NewEvidenceServiceServer 创建存证服务
-func NewEvidenceServiceServer(auditLog *evidence.AuditLog) *EvidenceServiceServer {
+func NewEvidenceServiceServer(auditLog *evidence.AuditLog, channelManager *circulation.ChannelManager) *EvidenceServiceServer {
 	return &EvidenceServiceServer{
-		auditLog: auditLog,
+		auditLog:      auditLog,
+		channelManager: channelManager,
 	}
 }
 
@@ -83,22 +86,40 @@ func (s *EvidenceServiceServer) QueryEvidence(ctx context.Context, req *pb.Query
 
 	// 根据不同条件查询
 	if req.ChannelId != "" {
-		// 按频道查询
+		// 按频道查询 - 需要验证查询者是否是该频道的参与者
+		channel, err := s.channelManager.GetChannel(req.ChannelId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get channel info: %w", err)
+		}
+		if channel == nil {
+			return nil, fmt.Errorf("channel not found: %s", req.ChannelId)
+		}
+
+		// 检查查询者是否是该频道的参与者
+		if !channel.IsParticipant(querierID) {
+			return nil, fmt.Errorf("permission denied: not a participant of channel %s", req.ChannelId)
+		}
+
 		startTime := time.Unix(req.StartTimestamp, 0)
 		endTime := time.Unix(req.EndTimestamp, 0)
 		if req.EndTimestamp == 0 {
 			endTime = time.Time{} // 零值表示不限制
 		}
-		
+
 		limit := int(req.Limit)
 		if limit == 0 {
 			limit = 100 // 默认限制
 		}
 
-		records = s.auditLog.QueryByChannel(req.ChannelId, startTime, endTime, limit)
+		// 如果同时指定了connector_id，则查询指定连接器在该频道中的证据
+		if req.ConnectorId != "" {
+			records = s.auditLog.QueryByChannelAndConnector(req.ChannelId, req.ConnectorId, startTime, endTime, limit)
+		} else {
+			// 否则查询该频道中所有参与者的证据
+			records = s.auditLog.QueryByChannel(req.ChannelId, startTime, endTime, limit)
+		}
 	} else if req.ConnectorId != "" {
-		// 按连接器查询
-		// 只能查询自己的记录（权限控制）
+		// 按连接器查询 - 只能查询自己的记录（权限控制）
 		if req.ConnectorId != querierID {
 			return nil, fmt.Errorf("permission denied: can only query own records")
 		}
@@ -117,7 +138,7 @@ func (s *EvidenceServiceServer) QueryEvidence(ctx context.Context, req *pb.Query
 		records = s.auditLog.QueryByConnector(req.ConnectorId, startTime, endTime, limit)
 	} else {
 		// 无有效查询条件
-		return nil, fmt.Errorf("must specify either channel_id or connector_id")
+		return nil, fmt.Errorf("must specify channel_id, optionally with connector_id")
 	}
 
 	// 转换为 protobuf 格式

@@ -148,6 +148,7 @@ type EvidenceStore interface {
 	GetByTxID(txID string) ([]*EvidenceRecord, error)
 	GetByChannel(channelID string, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
 	GetByConnector(connectorID string, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
+	GetByChannelAndConnector(channelID, connectorID string, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
 	VerifyRecord(record *EvidenceRecord) error
 	Close() error
 }
@@ -338,7 +339,15 @@ func (al *AuditLog) QueryByTxID(txID string) (*EvidenceRecord, error) {
 func (al *AuditLog) QueryByChannel(channelID string, startTime, endTime time.Time, limit int) []*EvidenceRecord {
 	// 如果使用数据库存储
 	if al.store != nil {
-		records, err := al.store.GetByChannel(channelID, &startTime, &endTime)
+		var startTimePtr, endTimePtr *time.Time
+		if !startTime.IsZero() {
+			startTimePtr = &startTime
+		}
+		if !endTime.IsZero() {
+			endTimePtr = &endTime
+		}
+
+		records, err := al.store.GetByChannel(channelID, startTimePtr, endTimePtr)
 		if err != nil {
 			log.Printf("⚠️ Failed to query evidence from database: %v", err)
 			return []*EvidenceRecord{}
@@ -376,11 +385,70 @@ func (al *AuditLog) QueryByChannel(channelID string, startTime, endTime time.Tim
 	return filtered
 }
 
+// QueryByChannelAndConnector 根据频道和连接器ID查询证据记录
+func (al *AuditLog) QueryByChannelAndConnector(channelID, connectorID string, startTime, endTime time.Time, limit int) []*EvidenceRecord {
+	// 如果使用数据库存储
+	if al.store != nil {
+		var startTimePtr, endTimePtr *time.Time
+		if !startTime.IsZero() {
+			startTimePtr = &startTime
+		}
+		if !endTime.IsZero() {
+			endTimePtr = &endTime
+		}
+
+		records, err := al.store.GetByChannelAndConnector(channelID, connectorID, startTimePtr, endTimePtr)
+		if err != nil {
+			log.Printf("⚠️ Failed to query evidence from database: %v", err)
+			return []*EvidenceRecord{}
+		}
+
+		// 应用限制
+		if limit > 0 && len(records) > limit {
+			records = records[:limit]
+		}
+
+		return records
+	}
+
+	// 内存缓存查询
+	al.mu.RLock()
+	defer al.mu.RUnlock()
+
+	records, exists := al.indexByCh[channelID]
+	if !exists {
+		return []*EvidenceRecord{}
+	}
+
+	// 过滤连接器和时间范围
+	filtered := make([]*EvidenceRecord, 0)
+	for _, record := range records {
+		if record.ConnectorID == connectorID &&
+			(startTime.IsZero() || record.Timestamp.After(startTime)) &&
+			(endTime.IsZero() || record.Timestamp.Before(endTime)) {
+			filtered = append(filtered, record)
+			if limit > 0 && len(filtered) >= limit {
+				break
+			}
+		}
+	}
+
+	return filtered
+}
+
 // QueryByConnector 根据连接器 ID 查询
 func (al *AuditLog) QueryByConnector(connectorID string, startTime, endTime time.Time, limit int) []*EvidenceRecord {
 	// 如果使用数据库存储
 	if al.store != nil {
-		records, err := al.store.GetByConnector(connectorID, &startTime, &endTime)
+		var startTimePtr, endTimePtr *time.Time
+		if !startTime.IsZero() {
+			startTimePtr = &startTime
+		}
+		if !endTime.IsZero() {
+			endTimePtr = &endTime
+		}
+
+		records, err := al.store.GetByConnector(connectorID, startTimePtr, endTimePtr)
 		if err != nil {
 			log.Printf("⚠️ Failed to query evidence from database: %v", err)
 			return []*EvidenceRecord{}

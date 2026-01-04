@@ -322,7 +322,7 @@ pe.AddRule(&PolicyRule{
 使用连接器的 `QueryEvidence` 方法：
 
 ```go
-records, err := connector.QueryEvidence(channelID, 100)
+records, err := connector.QueryEvidence(channelID, "", 100)
 for _, record := range records {
     log.Printf("Event: %s, Hash: %s", 
         record.Evidence.EventType, 

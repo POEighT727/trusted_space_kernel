@@ -52,12 +52,12 @@ type Connector struct {
 	publicKey    string
 	serverAddr   string
 	status       ConnectorStatus // 连接器状态，默认为active
-
+	
 	conn         *grpc.ClientConn
 	identitySvc  pb.IdentityServiceClient
 	channelSvc   pb.ChannelServiceClient
 	evidenceSvc  pb.EvidenceServiceClient
-
+	
 	sessionToken string
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -241,7 +241,7 @@ func (c *Connector) removeLocalChannel(channelID string) {
 	c.channelsMu.Lock()
 	defer c.channelsMu.Unlock()
 	delete(c.channels, channelID)
-}
+	}
 
 // RecordChannelFromNotification 根据频道创建通知记录本地频道信息
 func (c *Connector) RecordChannelFromNotification(notification *pb.ChannelNotification) {
@@ -266,7 +266,7 @@ func (c *Connector) RecordChannelFromNotification(notification *pb.ChannelNotifi
 		CreatedAt:         notification.CreatedAt,
 		IsEvidenceChannel: isEvidenceChannel,
 	})
-}
+	}
 
 // ListLocalChannels 列出本地已知的频道信息
 func (c *Connector) ListLocalChannels() []*LocalChannelInfo {
@@ -712,11 +712,19 @@ func (c *Connector) SubmitEvidence(eventType, channelID, dataHash, signature str
 }
 
 // QueryEvidence 查询存证记录
-func (c *Connector) QueryEvidence(channelID string, limit int32) ([]*pb.EvidenceRecord, error) {
-	resp, err := c.evidenceSvc.QueryEvidence(c.ctx, &pb.QueryRequest{
-		ChannelId: channelID,
-		Limit:     limit,
-	})
+func (c *Connector) QueryEvidence(channelID string, connectorID string, limit int32) ([]*pb.EvidenceRecord, error) {
+	req := &pb.QueryRequest{
+		Limit: limit,
+	}
+
+	if channelID != "" {
+		req.ChannelId = channelID
+	}
+	if connectorID != "" {
+		req.ConnectorId = connectorID
+	}
+
+	resp, err := c.evidenceSvc.QueryEvidence(c.ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query evidence: %w", err)
 	}

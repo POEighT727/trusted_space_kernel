@@ -78,7 +78,7 @@ type Channel struct {
 	subscribers   map[string]chan *DataPacket // key: subscriber ID
 	mu            sync.RWMutex
 	participantsMu sync.RWMutex // 参与者集合的锁（保留用于兼容）
-
+	
 	// 数据暂存（在接收方订阅前暂存数据）
 	buffer        []*DataPacket  // 暂存的数据包
 	bufferMu      sync.RWMutex   // 暂存缓冲区的锁
@@ -772,7 +772,7 @@ func (c *Channel) PushData(packet *DataPacket) error {
 			}
 		}
 	}
-
+	
 	// 为离线连接器缓冲数据
 	for _, offlineTarget := range offlineTargets {
 		if c.manager != nil {
@@ -791,14 +791,14 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		// 检查指定的目标接收者是否有未订阅但在线的
 		for _, targetID := range packet.TargetIDs {
 			if c.CanReceive(targetID) {
-				if _, subscribed := c.subscribers[targetID]; !subscribed {
+			if _, subscribed := c.subscribers[targetID]; !subscribed {
 					// 只有在线但未订阅的才需要频道级别缓冲
 					if c.manager == nil || c.manager.IsConnectorOnline(targetID) {
 						shouldBuffer = true
-						break
-					}
-				}
+				break
 			}
+		}
+	}
 		}
 	}
 

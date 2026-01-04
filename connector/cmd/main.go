@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -227,6 +228,8 @@ func runInteractiveShell(connector *client.Connector, connectorID string) {
 			handleRejectPermission(connector, args)
 		case "list-permissions":
 			handleListPermissions(connector, args)
+		case "query-evidence", "query":
+			handleQueryEvidence(connector, args)
 		case "status":
 			handleStatus(connector, args)
 		case "exit", "quit", "q":
@@ -269,6 +272,10 @@ func printHelp() {
 	fmt.Println("  reject-permission <channel_id> <request_id> <reason> - 拒绝权限变更或订阅申请（仅频道参与者可用）")
 	fmt.Println("    示例: reject-permission channel-123 req-456 \"权限不足\"")
 	fmt.Println("  list-permissions <channel_id> - 查看频道的权限变更请求")
+	fmt.Println("  query-evidence, query [--channel <channel_id>] [--connector <connector_id>] [--limit <num>] - 查询存证记录")
+    fmt.Println("    查询证据记录，支持按频道、连接器过滤")
+    fmt.Println("    示例: query-evidence --channel channel-123 --limit 10")
+    fmt.Println("    示例: query-evidence --connector connector-A")
 	fmt.Println("  status [active|inactive|closed] - 查看或设置连接器状态")
 	fmt.Println("  help, h               - 显示此帮助信息")
 	fmt.Println("  exit, quit, q         - 退出连接器")
@@ -346,8 +353,8 @@ func handleCreateChannel(connector *client.Connector, args []string) {
 		fmt.Println("❌ 参数错误: create --sender <sender_ids> --receiver <receiver_ids> [--approver <approver_id>] [--reason <reason>]")
 		fmt.Println("   支持多个发送方和接收方，使用逗号分隔多个ID")
 		fmt.Println("   示例: create --sender connector-A,connector-B --receiver connector-C --reason \"data exchange\"")
-		return
-	}
+			return
+		}
 
 	var senderIDs []string
 	var receiverIDs []string
@@ -469,7 +476,7 @@ func handleAcceptProposal(connector *client.Connector, args []string) {
 	fmt.Printf("正在接受频道提议: %s...\n", channelID)
 
 	err := connector.AcceptChannelProposal(channelID, proposalID)
-	if err != nil {
+		if err != nil {
 		fmt.Printf("❌ 接受频道提议失败: %v\n", err)
 		return
 	}
@@ -1143,6 +1150,128 @@ func handleListPermissions(connector *client.Connector, args []string) {
 			fmt.Printf("  批准时间: %s\n", time.Unix(req.ApprovedAt, 0).Format("2006-01-02 15:04:05"))
 		}
 		fmt.Println(strings.Repeat("-", 100))
+	}
+}
+
+// handleQueryEvidence 处理查询存证记录命令
+func handleQueryEvidence(connector *client.Connector, args []string) {
+	// 解析命令行参数
+	var channelID, connectorID string
+	var limit int32 = 50 // 默认查询50条
+
+	i := 0
+	for i < len(args) {
+		switch args[i] {
+		case "--channel":
+			if i+1 < len(args) {
+				channelID = strings.TrimSpace(args[i+1])
+				i += 2
+			} else {
+				fmt.Println("❌ --channel 参数需要提供频道ID")
+				return
+			}
+		case "--connector":
+			if i+1 < len(args) {
+				connectorID = strings.TrimSpace(args[i+1])
+				i += 2
+			} else {
+				fmt.Println("❌ --connector 参数需要提供连接器ID")
+				return
+			}
+		case "--limit":
+			if i+1 < len(args) {
+				limitStr := strings.TrimSpace(args[i+1])
+				if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+					limit = int32(l)
+				} else {
+					fmt.Printf("❌ 无效的limit值: %s\n", limitStr)
+					return
+				}
+				i += 2
+			} else {
+				fmt.Println("❌ --limit 参数需要提供数字")
+				return
+			}
+		default:
+			fmt.Printf("❌ 未知参数: %s\n", args[i])
+			fmt.Println("用法: query-evidence [--channel <channel_id>] [--connector <connector_id>] [--limit <num>]")
+			return
+		}
+	}
+
+	// 至少需要指定一个查询条件
+	if channelID == "" && connectorID == "" {
+		fmt.Println("❌ 至少需要指定--channel或--connector参数")
+		fmt.Println("用法: query-evidence [--channel <channel_id>] [--connector <connector_id>] [--limit <num>]")
+		fmt.Println("示例: query-evidence --channel channel-123 --limit 10")
+		fmt.Println("示例: query-evidence --connector connector-A")
+		return
+	}
+
+	fmt.Printf("正在查询存证记录...\n")
+	if channelID != "" {
+		fmt.Printf("  频道ID: %s\n", channelID)
+	}
+	if connectorID != "" {
+		fmt.Printf("  连接器ID: %s\n", connectorID)
+	}
+	fmt.Printf("  限制数量: %d\n", limit)
+
+	// 调用查询API
+	records, err := connector.QueryEvidence(channelID, connectorID, limit)
+	if err != nil {
+		fmt.Printf("❌ 查询失败: %v\n", err)
+		return
+	}
+
+	if len(records) == 0 {
+		fmt.Println("没有找到匹配的存证记录")
+		return
+	}
+
+	fmt.Printf("\n找到 %d 条存证记录:\n", len(records))
+	fmt.Println(strings.Repeat("=", 120))
+	fmt.Printf("%-40s %-20s %-15s %-10s %-25s\n",
+		"存证交易ID", "事件类型", "连接器ID", "频道ID", "存储时间")
+	fmt.Println(strings.Repeat("=", 120))
+
+	for _, record := range records {
+		// 截断交易ID显示前16位
+		shortTxID := record.EvidenceTxId
+		if len(shortTxID) > 16 {
+			shortTxID = shortTxID[:16] + "..."
+		}
+
+		// 格式化存储时间
+		storedTime := time.Unix(record.StoredTimestamp, 0).Format("2006-01-02 15:04:05")
+
+		fmt.Printf("%-40s %-20s %-15s %-10s %-25s\n",
+			shortTxID,
+			record.Evidence.EventType,
+			record.Evidence.ConnectorId,
+			record.Evidence.ChannelId,
+			storedTime)
+
+		// 显示数据哈希（截断）
+		if record.Evidence.DataHash != "" {
+			dataHashShort := record.Evidence.DataHash
+			if len(dataHashShort) > 32 {
+				dataHashShort = dataHashShort[:32] + "..."
+			}
+			fmt.Printf("  数据哈希: %s\n", dataHashShort)
+		}
+
+		// 显示元数据
+		if len(record.Evidence.Metadata) > 0 {
+			fmt.Printf("  元数据: ")
+			var metadataStrings []string
+			for k, v := range record.Evidence.Metadata {
+				metadataStrings = append(metadataStrings, fmt.Sprintf("%s=%s", k, v))
+			}
+			fmt.Printf("%s\n", strings.Join(metadataStrings, ", "))
+		}
+
+		fmt.Println(strings.Repeat("-", 120))
 	}
 }
 
