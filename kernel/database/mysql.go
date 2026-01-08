@@ -91,15 +91,48 @@ func (m *DBManager) initTables() error {
 	}
 
 	// 检查并添加缺失的字段（数据库迁移）
-	migrationSQL := `
-		ALTER TABLE evidence_records
-		ADD COLUMN IF NOT EXISTS event_id VARCHAR(36) NOT NULL DEFAULT '' COMMENT '事件实例ID' AFTER record_hash,
-		ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间' AFTER event_id,
-		ADD INDEX IF NOT EXISTS idx_event_id (event_id);
-	`
-	if _, err := m.db.Exec(migrationSQL); err != nil {
-		log.Printf("Warning: failed to migrate evidence_records table: %v", err)
-		// 不返回错误，因为表可能已经是最新的
+	// 检查event_id列是否存在
+	var eventIdCount int
+	checkEventIdSQL := "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'evidence_records' AND COLUMN_NAME = 'event_id'"
+	if err := m.db.QueryRow(checkEventIdSQL).Scan(&eventIdCount); err != nil {
+		eventIdCount = 0
+	}
+
+	if eventIdCount == 0 {
+		// 添加event_id列
+		addEventIdSQL := "ALTER TABLE evidence_records ADD COLUMN event_id VARCHAR(36) NOT NULL DEFAULT '' COMMENT '事件实例ID' AFTER record_hash"
+		if _, err := m.db.Exec(addEventIdSQL); err != nil {
+			log.Printf("Warning: failed to add event_id column: %v", err)
+		}
+	}
+
+	// 检查created_at列是否存在
+	var createdAtCount int
+	checkCreatedAtSQL := "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'evidence_records' AND COLUMN_NAME = 'created_at'"
+	if err := m.db.QueryRow(checkCreatedAtSQL).Scan(&createdAtCount); err != nil {
+		createdAtCount = 0
+	}
+
+	if createdAtCount == 0 {
+		// 添加created_at列
+		addCreatedAtSQL := "ALTER TABLE evidence_records ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间' AFTER event_id"
+		if _, err := m.db.Exec(addCreatedAtSQL); err != nil {
+			log.Printf("Warning: failed to add created_at column: %v", err)
+		}
+	}
+
+	// 检查索引是否存在并添加
+	var indexCount int
+	checkIndexSQL := "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'evidence_records' AND INDEX_NAME = 'idx_event_id'"
+	if err := m.db.QueryRow(checkIndexSQL).Scan(&indexCount); err != nil {
+		indexCount = 0
+	}
+
+	if indexCount == 0 {
+		addIndexSQL := "ALTER TABLE evidence_records ADD INDEX idx_event_id (event_id)"
+		if _, err := m.db.Exec(addIndexSQL); err != nil {
+			log.Printf("Warning: failed to add idx_event_id index: %v", err)
+		}
 	}
 
 	// 创建证据分发表

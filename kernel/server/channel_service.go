@@ -679,7 +679,7 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 		// 首次接收，验证频道
 		if channelID == "" {
 			channelID = packet.ChannelId
-
+			
 			channel, err := s.channelManager.GetChannel(channelID)
 			if err != nil {
 				return fmt.Errorf("invalid channel: %v", err)
@@ -703,13 +703,13 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 			// 生成业务流程ID（用于跟踪完整的数据传输过程）
 			flowID = uuid.New().String()
 
-		// 记录传输开始
-		targetsStr := ""
-		if len(packet.TargetIds) > 0 {
-			targetsStr = fmt.Sprintf("%v", packet.TargetIds)
-		} else {
-			targetsStr = "broadcast"
-		}
+			// 记录传输开始
+			targetsStr := ""
+			if len(packet.TargetIds) > 0 {
+				targetsStr = fmt.Sprintf("%v", packet.TargetIds)
+			} else {
+				targetsStr = "broadcast"
+			}
 
 			// 生成业务流程ID
 			flowID = uuid.New().String()

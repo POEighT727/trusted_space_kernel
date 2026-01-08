@@ -441,10 +441,29 @@ func (c *Connector) ReceiveData(channelID string, handler func(*pb.DataPacket) e
 
 		log.Printf("✓ Received packet #%d (%d bytes)", packet.SequenceNumber, len(packet.Payload))
 
-		// 调用处理函数
-		if handler != nil {
-			if err := handler(packet); err != nil {
-				log.Printf("⚠ Handler error: %v", err)
+		// 检查数据包类型，过滤掉非数据频道应该接收的内容
+		if c.isEvidenceChannel(channelID) {
+			// 存证频道：继续使用原有逻辑
+			if err := c.processEvidencePacket(packet); err != nil {
+				log.Printf("⚠ Failed to process evidence packet: %v", err)
+			}
+		} else if c.isControlChannel(channelID) {
+			// 控制频道：处理控制消息
+			if err := c.processControlPacket(packet); err != nil {
+				log.Printf("⚠ Failed to process control packet: %v", err)
+			}
+		} else {
+			// 数据频道：只处理普通数据，跳过证据数据和控制消息
+			if !c.isEvidenceData(packet.Payload) && !c.isControlMessage(packet.Payload) {
+				// 调用处理函数处理普通数据
+				if handler != nil {
+					if err := handler(packet); err != nil {
+						log.Printf("⚠ Handler error: %v", err)
+					}
+				}
+			} else {
+				// 跳过证据数据和控制消息，减少日志输出
+				// log.Printf("⏭️ Skipped non-data packet #%d in data channel %s", packet.SequenceNumber, channelID)
 			}
 		}
 	}
@@ -478,7 +497,6 @@ func (c *Connector) ReceiveEvidenceData(channelID string) error {
 	}
 
 	log.Printf("✓ Subscribed to evidence channel: %s", channelID)
-	log.Println("Waiting for evidence data...")
 
 	// 初始化本地存证存储
 	if err := c.initializeEvidenceStorage(); err != nil {
@@ -496,11 +514,15 @@ func (c *Connector) ReceiveEvidenceData(channelID string) error {
 			return fmt.Errorf("evidence channel receive error: %w", err)
 		}
 
-		// 减少证据数据包接收的日志输出，避免过多信息
-
-		// 处理存证数据
-		if err := c.processEvidencePacket(packet); err != nil {
-			log.Printf("⚠ Failed to process evidence packet: %v", err)
+		// 只处理证据数据，跳过其他类型的数据
+		if c.isEvidenceData(packet.Payload) {
+			// 处理存证数据
+			if err := c.processEvidencePacket(packet); err != nil {
+				log.Printf("⚠ Failed to process evidence packet: %v", err)
+			}
+		} else {
+			// 跳过非证据数据
+			// log.Printf("⏭️ Skipped non-evidence packet #%d in evidence channel %s", packet.SequenceNumber, channelID)
 		}
 	}
 }
@@ -545,9 +567,15 @@ func (c *Connector) ReceiveControlData(channelID string) error {
 			return fmt.Errorf("control channel receive error: %w", err)
 		}
 
-		// 处理控制消息
-		if err := c.processControlPacket(packet); err != nil {
-			log.Printf("⚠ Failed to process control packet: %v", err)
+		// 只处理控制消息，跳过其他类型的数据
+		if c.isControlMessage(packet.Payload) {
+			// 处理控制消息
+			if err := c.processControlPacket(packet); err != nil {
+				log.Printf("⚠ Failed to process control packet: %v", err)
+			}
+		} else {
+			// 跳过非控制消息
+			// log.Printf("⏭️ Skipped non-control packet #%d in control channel %s", packet.SequenceNumber, channelID)
 		}
 	}
 }
@@ -1929,6 +1957,51 @@ func (c *Connector) IsChannelParticipant(channelID string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// isEvidenceChannel 检查是否为存证频道
+func (c *Connector) isEvidenceChannel(channelID string) bool {
+	c.channelsMu.RLock()
+	defer c.channelsMu.RUnlock()
+
+	channel, exists := c.channels[channelID]
+	if !exists {
+		return false
+	}
+
+	return channel.IsEvidenceChannel
+}
+
+// isControlChannel 检查是否为控制频道
+func (c *Connector) isControlChannel(channelID string) bool {
+	c.channelsMu.RLock()
+	defer c.channelsMu.RUnlock()
+
+	channel, exists := c.channels[channelID]
+	if !exists {
+		return false
+	}
+
+	return channel.ChannelType == pb.ChannelType_CHANNEL_TYPE_CONTROL
+}
+
+// isEvidenceData 检查数据包是否为证据数据
+func (c *Connector) isEvidenceData(payload []byte) bool {
+	payloadStr := string(payload)
+
+	// 检查是否包含证据数据的特征字段
+	return strings.Contains(payloadStr, `"event_type"`) &&
+		strings.Contains(payloadStr, `"tx_id"`) &&
+		strings.Contains(payloadStr, `"signature"`)
+}
+
+// isControlMessage 检查是否为控制消息
+func (c *Connector) isControlMessage(payload []byte) bool {
+	payloadStr := string(payload)
+
+	// 检查是否包含控制消息的特征字段
+	return strings.Contains(payloadStr, `"message_type"`) &&
+		strings.Contains(payloadStr, `"timestamp"`)
 }
 
 // RequestChannelAccess 申请订阅频道指定角色（频道外连接器使用）
