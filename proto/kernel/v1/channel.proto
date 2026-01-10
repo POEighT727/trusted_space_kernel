@@ -185,6 +185,18 @@ message ProposeChannelRequest {
   string approver_id = 9;       // 权限变更批准者ID（默认是创建者，可选）
   string reason = 7;            // 创建理由说明
   int32 timeout_seconds = 8;    // 提议超时时间（秒，默认300秒）
+  string config_file_path = 10; // 配置文件路径（可选，由创建者指定）
+  EvidenceConfig evidence_config = 11; // 存证配置（可选）
+}
+
+message EvidenceConfig {
+  string mode = 1;           // 存证方式：none, internal, external, hybrid
+  string strategy = 2;       // 存证策略：all, data, control, important
+  string connector_id = 3;   // 外部存证连接器ID
+  bool backup_enabled = 4;   // 是否启用备份存证
+  int32 retention_days = 5;  // 存证数据保留天数
+  bool compress_data = 6;    // 是否压缩存证数据
+  map<string, string> custom_settings = 7; // 自定义存证设置
 }
 
 message ProposeChannelResponse {

@@ -1324,6 +1324,110 @@ func (c *Connector) GetPermissionRequests(channelID string) (*pb.GetPermissionRe
 	return resp, nil
 }
 
+// ChannelConfigFile 频道配置文件结构（与kernel中的定义保持一致）
+type ChannelConfigFile struct {
+	ChannelID       string          `json:"channel_id"`
+	Name            string          `json:"name"`
+	Description     string          `json:"description"`
+	CreatorID       string          `json:"creator_id"`
+	ApproverID      string          `json:"approver_id"`
+	SenderIDs       []string        `json:"sender_ids"`
+	ReceiverIDs     []string        `json:"receiver_ids"`
+	DataTopic       string          `json:"data_topic"`
+	Encrypted       bool            `json:"encrypted"`
+	EvidenceConfig  *EvidenceConfig `json:"evidence_config"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+	Version         int             `json:"version"`
+}
+
+// EvidenceConfig 存证配置（与kernel中的定义保持一致）
+type EvidenceConfig struct {
+	Mode           string            `json:"mode"`
+	Strategy       string            `json:"strategy"`
+	ConnectorID    string            `json:"connector_id"`
+	BackupEnabled  bool              `json:"backup_enabled"`
+	RetentionDays  int               `json:"retention_days"`
+	CompressData   bool              `json:"compress_data"`
+	CustomSettings map[string]string `json:"custom_settings"`
+}
+
+// CreateChannelFromConfig 从配置文件创建频道
+func (c *Connector) CreateChannelFromConfig(configFilePath string) (*ChannelConfigFile, error) {
+	// 读取配置文件
+	data, err := os.ReadFile(configFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file %s: %w", configFilePath, err)
+	}
+
+	// 解析配置文件
+	var config ChannelConfigFile
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	// 验证配置
+	if config.ChannelID == "" {
+		return nil, fmt.Errorf("channel_id is required in config file")
+	}
+	if config.CreatorID == "" {
+		return nil, fmt.Errorf("creator_id is required in config file")
+	}
+	if len(config.SenderIDs) == 0 {
+		return nil, fmt.Errorf("at least one sender_id is required in config file")
+	}
+	if len(config.ReceiverIDs) == 0 {
+		return nil, fmt.Errorf("at least one receiver_id is required in config file")
+	}
+	if config.DataTopic == "" {
+		return nil, fmt.Errorf("data_topic is required in config file")
+	}
+
+	// 验证当前连接器是否是创建者
+	if config.CreatorID != c.connectorID {
+		return nil, fmt.Errorf("current connector (%s) is not the creator (%s) specified in config file", c.connectorID, config.CreatorID)
+	}
+
+	// 转换存证配置（如果有）
+	var evidenceConfig *pb.EvidenceConfig
+	if config.EvidenceConfig != nil {
+		evidenceConfig = &pb.EvidenceConfig{
+			Mode:           config.EvidenceConfig.Mode,
+			Strategy:       config.EvidenceConfig.Strategy,
+			ConnectorId:    config.EvidenceConfig.ConnectorID,
+			BackupEnabled:  config.EvidenceConfig.BackupEnabled,
+			RetentionDays:  int32(config.EvidenceConfig.RetentionDays),
+			CompressData:   config.EvidenceConfig.CompressData,
+			CustomSettings: config.EvidenceConfig.CustomSettings,
+		}
+	}
+
+	// 调用gRPC API提议创建频道
+	req := &pb.ProposeChannelRequest{
+		CreatorId:      config.CreatorID,
+		SenderIds:      config.SenderIDs,
+		ReceiverIds:    config.ReceiverIDs,
+		DataTopic:      config.DataTopic,
+		Encrypted:      config.Encrypted,
+		ApproverId:     config.ApproverID,
+		Reason:         fmt.Sprintf("Channel created from config file: %s", configFilePath),
+		ConfigFilePath: configFilePath, // 传递配置文件路径
+		EvidenceConfig: evidenceConfig, // 传递存证配置
+	}
+
+	resp, err := c.channelSvc.ProposeChannel(context.Background(), req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to propose channel: %w", err)
+	}
+
+	if !resp.Success {
+		return nil, fmt.Errorf("failed to propose channel: %s", resp.Message)
+	}
+
+	log.Printf("✓ Channel created from config file: %s (%s)", config.ChannelID, configFilePath)
+	return &config, nil
+}
+
 // ProposeChannel 提议创建频道（支持多对多模式）
 func (c *Connector) ProposeChannel(senderIDs []string, receiverIDs []string, dataTopic, approverID, reason string) (string, string, error) {
 	// 创建者固定为当前连接器

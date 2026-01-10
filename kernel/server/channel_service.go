@@ -348,6 +348,20 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 	}
 
 	// 创建频道提议
+	// 转换存证配置
+	var evidenceConfig *circulation.EvidenceConfig
+	if req.EvidenceConfig != nil {
+		evidenceConfig = &circulation.EvidenceConfig{
+			Mode:           circulation.EvidenceMode(req.EvidenceConfig.Mode),
+			Strategy:       circulation.EvidenceStrategy(req.EvidenceConfig.Strategy),
+			ConnectorID:    req.EvidenceConfig.ConnectorId,
+			BackupEnabled:  req.EvidenceConfig.BackupEnabled,
+			RetentionDays:  int(req.EvidenceConfig.RetentionDays),
+			CompressData:   req.EvidenceConfig.CompressData,
+			CustomSettings: req.EvidenceConfig.CustomSettings,
+		}
+	}
+
 	channel, err := s.channelManager.ProposeChannel(
 		creatorID,
 		approverID,
@@ -355,6 +369,8 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 		req.ReceiverIds,
 		req.DataTopic,
 		encrypted,
+		evidenceConfig, // evidenceConfig
+		req.ConfigFilePath, // configFilePath
 		req.Reason,
 		req.TimeoutSeconds,
 	)

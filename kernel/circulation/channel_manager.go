@@ -3,6 +3,7 @@ package circulation
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"sync"
 	"time"
@@ -55,6 +56,37 @@ type ChannelProposal struct {
 	ReceiverApprovals map[string]bool // key: receiverID, value: 是否已确认
 }
 
+// EvidenceMode 存证方式
+type EvidenceMode string
+
+const (
+	EvidenceModeNone         EvidenceMode = "none"         // 不进行存证
+	EvidenceModeInternal     EvidenceMode = "internal"     // 使用内核内置存证
+	EvidenceModeExternal     EvidenceMode = "external"     // 使用外部存证连接器
+	EvidenceModeHybrid       EvidenceMode = "hybrid"       // 同时使用内置和外部存证
+)
+
+// EvidenceStrategy 存证策略
+type EvidenceStrategy string
+
+const (
+	EvidenceStrategyAll       EvidenceStrategy = "all"       // 存证所有消息
+	EvidenceStrategyData      EvidenceStrategy = "data"      // 只存证数据消息
+	EvidenceStrategyControl   EvidenceStrategy = "control"   // 只存证控制消息
+	EvidenceStrategyImportant EvidenceStrategy = "important" // 只存证重要消息
+)
+
+// EvidenceConfig 存证配置
+type EvidenceConfig struct {
+	Mode           EvidenceMode     // 存证方式
+	Strategy       EvidenceStrategy // 存证策略
+	ConnectorID    string           // 外部存证连接器ID（当Mode为external或hybrid时使用）
+	BackupEnabled  bool             // 是否启用备份存证
+	RetentionDays  int              // 存证数据保留天数
+	CompressData   bool             // 是否压缩存证数据
+	CustomSettings map[string]string // 自定义存证设置
+}
+
 // Channel 数据传输频道（统一频道模式，支持多种消息类型）
 type Channel struct {
 	ChannelID     string
@@ -68,6 +100,12 @@ type Channel struct {
 	CreatedAt     time.Time
 	ClosedAt      *time.Time
 	LastActivity  time.Time
+
+	// 存证配置
+	EvidenceConfig *EvidenceConfig // 存证配置信息
+
+	// 配置文件路径（可选，由创建者指定）
+	ConfigFilePath string // 频道配置文件路径，如果为空则不使用配置文件
 
 	// 频道协商信息（提议阶段）
 	ChannelProposal *ChannelProposal // 协商提议信息
@@ -129,6 +167,18 @@ const (
 	ConnectorStatusOffline // 离线
 )
 
+// EvidenceConnector 外部存证连接器信息
+type EvidenceConnector struct {
+	ConnectorID   string            // 连接器ID
+	Name          string            // 连接器名称
+	Description   string            // 连接器描述
+	Capabilities  []string          // 支持的存证能力
+	Status        ConnectorStatus   // 连接器状态
+	RegisteredAt  time.Time         // 注册时间
+	LastHeartbeat time.Time         // 最后心跳时间
+	Config        map[string]string // 连接器配置
+}
+
 // ChannelManager 频道管理器
 type ChannelManager struct {
 	mu                   sync.RWMutex
@@ -140,15 +190,23 @@ type ChannelManager struct {
 	connectorBuffers map[string][]*DataPacket   // 离线连接器的个人缓冲区
 	lastActivity     map[string]time.Time       // 连接器最后活动时间
 	connectorMu      sync.RWMutex               // 连接器状态的锁
+
+	// 外部存证连接器管理
+	evidenceConnectors map[string]*EvidenceConnector // 已注册的存证连接器
+	evidenceMu         sync.RWMutex                   // 存证连接器的锁
+
+	// 频道配置管理（可选，由创建者指定配置文件路径时使用）
+	configManager *ChannelConfigManager // 频道配置管理器
 }
 
 // NewChannelManager 创建新的频道管理器
 func NewChannelManager() *ChannelManager {
 	return &ChannelManager{
-		channels:         make(map[string]*Channel),
-		connectorStatus:  make(map[string]ConnectorStatus),
-		connectorBuffers: make(map[string][]*DataPacket),
-		lastActivity:     make(map[string]time.Time),
+		channels:            make(map[string]*Channel),
+		connectorStatus:     make(map[string]ConnectorStatus),
+		connectorBuffers:    make(map[string][]*DataPacket),
+		lastActivity:        make(map[string]time.Time),
+		evidenceConnectors:  make(map[string]*EvidenceConnector),
 	}
 }
 
@@ -160,8 +218,50 @@ func (cm *ChannelManager) SetChannelCreatedCallback(callback func(*Channel)) {
 	log.Printf("✓ Channel creation callback set in ChannelManager")
 }
 
+// SetConfigManager 设置频道配置管理器
+func (cm *ChannelManager) SetConfigManager(configManager *ChannelConfigManager) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.configManager = configManager
+	log.Printf("✓ Channel config manager set")
+}
+
+// GetConfigManager 获取频道配置管理器
+func (cm *ChannelManager) GetConfigManager() *ChannelConfigManager {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.configManager
+}
+
+// SetDefaultEvidenceConfig 设置默认存证配置
+func (cm *ChannelManager) SetDefaultEvidenceConfig(config *EvidenceConfig) error {
+	if cm.configManager == nil {
+		return fmt.Errorf("config manager not set")
+	}
+
+	cm.configManager.SetDefaultEvidenceConfig(config)
+	log.Printf("✓ Default evidence config updated in ChannelManager")
+	return nil
+}
+
+// GetDefaultEvidenceConfig 获取默认存证配置
+func (cm *ChannelManager) GetDefaultEvidenceConfig() *EvidenceConfig {
+	if cm.configManager == nil {
+		return &EvidenceConfig{
+			Mode:           EvidenceModeNone,
+			Strategy:       EvidenceStrategyAll,
+			BackupEnabled:  false,
+			RetentionDays:  30,
+			CompressData:   true,
+			CustomSettings: make(map[string]string),
+		}
+	}
+
+	return cm.configManager.GetDefaultEvidenceConfig()
+}
+
 // ProposeChannel 提议创建频道（协商第一阶段）
-func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, encrypted bool, reason string, timeoutSeconds int32) (*Channel, error) {
+func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, encrypted bool, evidenceConfig *EvidenceConfig, configFilePath string, reason string, timeoutSeconds int32) (*Channel, error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -214,6 +314,20 @@ func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs
 		receiverApprovals[id] = false
 	}
 
+	// 创建者自动批准自己的提议
+	for _, id := range senderIDs {
+		if id == creatorID {
+			senderApprovals[id] = true
+			break
+		}
+	}
+	for _, id := range receiverIDs {
+		if id == creatorID {
+			receiverApprovals[id] = true
+			break
+		}
+	}
+
 	channel := &Channel{
 		ChannelID:         channelID,
 		CreatorID:         creatorID,
@@ -225,6 +339,8 @@ func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs
 		Status:            ChannelStatusProposed,
 		CreatedAt:         time.Now(),
 		LastActivity:      time.Now(),
+		EvidenceConfig:    evidenceConfig, // 设置存证配置
+		ConfigFilePath:    configFilePath, // 设置配置文件路径
 		manager:           cm, // 设置ChannelManager引用
 		ChannelProposal: &ChannelProposal{
 			ProposalID:        proposalID,
@@ -392,9 +508,14 @@ func (cm *ChannelManager) RejectChannelProposal(channelID, rejecterID, reason st
 }
 
 // CreateChannel 创建新的数据传输频道（统一频道模式）
-func (cm *ChannelManager) CreateChannel(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, encrypted bool) (*Channel, error) {
+func (cm *ChannelManager) CreateChannel(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, encrypted bool, evidenceConfig *EvidenceConfig, configFilePath string) (*Channel, error) {
+	// 如果没有提供存证配置，使用默认配置
+	if evidenceConfig == nil && cm.configManager != nil {
+		evidenceConfig = cm.configManager.GetDefaultEvidenceConfig()
+	}
+
 	// 创建主频道
-	channel, err := cm.createChannelInternal(creatorID, approverID, senderIDs, receiverIDs, dataTopic, encrypted)
+	channel, err := cm.createChannelInternal(creatorID, approverID, senderIDs, receiverIDs, dataTopic, encrypted, evidenceConfig, configFilePath)
 	if err != nil {
 		return nil, err
 	}
@@ -405,8 +526,131 @@ func (cm *ChannelManager) CreateChannel(creatorID, approverID string, senderIDs,
 	return channel, nil
 }
 
+// CreateChannelFromConfig 从配置文件创建频道
+func (cm *ChannelManager) CreateChannelFromConfig(configFilePath string) (*Channel, error) {
+	// 直接从指定文件路径加载配置
+	data, err := ioutil.ReadFile(configFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file %s: %v", configFilePath, err)
+	}
+
+	var config ChannelConfigFile
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal config: %v", err)
+	}
+
+	// 验证配置
+	if config.ChannelID == "" {
+		return nil, fmt.Errorf("channel ID is required in config file")
+	}
+
+	// 创建频道
+	channel := &Channel{
+		ChannelID:       config.ChannelID,
+		CreatorID:       config.CreatorID,
+		ApproverID:      config.ApproverID,
+		SenderIDs:       make([]string, len(config.SenderIDs)),
+		ReceiverIDs:     make([]string, len(config.ReceiverIDs)),
+		Encrypted:       config.Encrypted,
+		DataTopic:       config.DataTopic,
+		Status:          ChannelStatusActive,
+		CreatedAt:       config.CreatedAt,
+		LastActivity:    time.Now(),
+		EvidenceConfig:  config.EvidenceConfig,
+		ConfigFilePath:  configFilePath, // 设置配置文件路径
+		dataQueue:       make(chan *DataPacket, 1000),
+		subscribers:     make(map[string]chan *DataPacket),
+		buffer:          make([]*DataPacket, 0),
+		maxBufferSize:   10000,
+		permissionRequests: make([]*PermissionChangeRequest, 0),
+		manager:         cm, // 设置ChannelManager引用
+	}
+
+	// 复制切片
+	copy(channel.SenderIDs, config.SenderIDs)
+	copy(channel.ReceiverIDs, config.ReceiverIDs)
+
+	// 注册到管理器
+	cm.mu.Lock()
+	cm.channels[config.ChannelID] = channel
+	cm.mu.Unlock()
+
+	// 启动数据分发协程
+	go channel.startDataDistribution()
+
+	// 调用创建通知回调
+	if cm.notifyChannelCreated != nil {
+		go cm.notifyChannelCreated(channel)
+	}
+
+	log.Printf("✓ Channel created from config file: %s", configFilePath)
+	return channel, nil
+}
+
+// SaveChannelConfig 保存频道配置到文件
+func (cm *ChannelManager) SaveChannelConfig(channelID, name, description string) error {
+	cm.mu.RLock()
+	channel, exists := cm.channels[channelID]
+	cm.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("channel %s not found", channelID)
+	}
+
+	// 如果频道指定了配置文件路径，直接保存到该文件
+	if channel.ConfigFilePath != "" {
+		config := &ChannelConfigFile{
+			ChannelID:      channelID,
+			Name:           name,
+			Description:    description,
+			CreatorID:      channel.CreatorID,
+			ApproverID:     channel.ApproverID,
+			SenderIDs:      make([]string, len(channel.SenderIDs)),
+			ReceiverIDs:    make([]string, len(channel.ReceiverIDs)),
+			DataTopic:      channel.DataTopic,
+			Encrypted:      channel.Encrypted,
+			EvidenceConfig: channel.EvidenceConfig,
+			CreatedAt:      channel.CreatedAt,
+			UpdatedAt:      time.Now(),
+			Version:        1,
+		}
+
+		copy(config.SenderIDs, channel.SenderIDs)
+		copy(config.ReceiverIDs, channel.ReceiverIDs)
+
+		data, err := json.MarshalIndent(config, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal config: %v", err)
+		}
+
+		if err := ioutil.WriteFile(channel.ConfigFilePath, data, 0644); err != nil {
+			return fmt.Errorf("failed to write config file: %v", err)
+		}
+
+		log.Printf("✓ Channel config saved: %s", channel.ConfigFilePath)
+		return nil
+	}
+
+	// 如果没有指定配置文件路径，使用全局配置管理器（向后兼容）
+	if cm.configManager == nil {
+		return fmt.Errorf("config manager not set and no config file path specified")
+	}
+
+	config := cm.configManager.CreateConfigFromChannel(channel, name, description)
+	return cm.configManager.SaveConfig(config)
+}
+
+// LoadChannelConfig 加载频道配置
+func (cm *ChannelManager) LoadChannelConfig(channelID string) (*ChannelConfigFile, error) {
+	if cm.configManager == nil {
+		return nil, fmt.Errorf("config manager not set")
+	}
+
+	return cm.configManager.LoadConfig(channelID)
+}
+
 // createChannelInternal 创建频道的核心逻辑
-func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, encrypted bool) (*Channel, error) {
+func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, encrypted bool, evidenceConfig *EvidenceConfig, configFilePath string) (*Channel, error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -455,6 +699,8 @@ func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, se
 		Status:             ChannelStatusActive,
 		CreatedAt:          time.Now(),
 		LastActivity:       time.Now(),
+		EvidenceConfig:     evidenceConfig, // 设置存证配置
+		ConfigFilePath:     configFilePath, // 设置配置文件路径
 		dataQueue:          make(chan *DataPacket, 1000), // 缓冲队列
 		subscribers:        make(map[string]chan *DataPacket),
 		buffer:             make([]*DataPacket, 0),
@@ -1597,6 +1843,213 @@ func (c *Channel) sendControlMessage(channel *Channel, message ControlMessage) {
 		log.Printf("✓ Control message sent to channel %s: %s", channel.ChannelID, message.MessageType)
 	default:
 		log.Printf("⚠ Channel %s queue full, message dropped", channel.ChannelID)
+	}
+}
+
+// -----------------------------------------------------------
+// 配置文件管理说明：
+// 现在频道配置文件由创建者自主指定路径，不再由内核统一管理目录。
+// 这提供了更大的灵活性，支持不同的配置管理策略。
+//
+// 使用方式：
+// 1. 创建频道时可选指定配置文件路径
+//    channel, err := channelManager.CreateChannel("creator-1", "approver-1",
+//        []string{"sender-1"}, []string{"receiver-1"}, "topic-1", false,
+//        evidenceConfig, "/path/to/my-channel-config.json")
+//
+// 2. 从任意配置文件路径创建频道
+//    channel, err := channelManager.CreateChannelFromConfig("/any/path/channel-config.json")
+//
+// 3. 保存频道配置到指定路径
+//    err := channelManager.SaveChannelConfig(channelID, "频道名称", "频道描述")
+//
+// 配置文件JSON格式：
+// {
+//   "channel_id": "channel-123",
+//   "name": "测试频道",
+//   "description": "用于测试的频道",
+//   "creator_id": "creator-1",
+//   "approver_id": "approver-1",
+//   "sender_ids": ["sender-1"],
+//   "receiver_ids": ["receiver-1"],
+//   "data_topic": "test-topic",
+//   "encrypted": false,
+//   "evidence_config": {
+//     "mode": "external",
+//     "strategy": "all",
+//     "connector_id": "evidence-connector-1",
+//     "backup_enabled": false,
+//     "retention_days": 30,
+//     "compress_data": true
+//   },
+//   "created_at": "2024-01-01T00:00:00Z",
+//   "updated_at": "2024-01-01T00:00:00Z",
+//   "version": 1
+// }
+//
+// 优势：
+// - 创建者可选择本地文件、共享存储或云存储
+// - 支持不同的配置管理策略和工具链
+// - 更符合分布式系统的设计理念
+// - 内核职责简化，专注核心功能
+// -----------------------------------------------------------
+
+// -----------------------------------------------------------
+// 外部存证连接器管理方法
+// -----------------------------------------------------------
+
+// RegisterEvidenceConnector 注册外部存证连接器
+func (cm *ChannelManager) RegisterEvidenceConnector(connectorID, name, description string, capabilities []string, config map[string]string) (*EvidenceConnector, error) {
+	cm.evidenceMu.Lock()
+	defer cm.evidenceMu.Unlock()
+
+	if connectorID == "" {
+		return nil, fmt.Errorf("connector ID cannot be empty")
+	}
+
+	if _, exists := cm.evidenceConnectors[connectorID]; exists {
+		return nil, fmt.Errorf("evidence connector %s already registered", connectorID)
+	}
+
+	connector := &EvidenceConnector{
+		ConnectorID:   connectorID,
+		Name:          name,
+		Description:   description,
+		Capabilities:  capabilities,
+		Status:        ConnectorStatusOnline,
+		RegisteredAt:  time.Now(),
+		LastHeartbeat: time.Now(),
+		Config:        config,
+	}
+
+	cm.evidenceConnectors[connectorID] = connector
+
+	log.Printf("✓ Evidence connector registered: %s (%s)", connectorID, name)
+	return connector, nil
+}
+
+// UnregisterEvidenceConnector 注销外部存证连接器
+func (cm *ChannelManager) UnregisterEvidenceConnector(connectorID string) error {
+	cm.evidenceMu.Lock()
+	defer cm.evidenceMu.Unlock()
+
+	if _, exists := cm.evidenceConnectors[connectorID]; !exists {
+		return fmt.Errorf("evidence connector %s not found", connectorID)
+	}
+
+	delete(cm.evidenceConnectors, connectorID)
+	log.Printf("✓ Evidence connector unregistered: %s", connectorID)
+	return nil
+}
+
+// GetEvidenceConnector 获取存证连接器信息
+func (cm *ChannelManager) GetEvidenceConnector(connectorID string) (*EvidenceConnector, error) {
+	cm.evidenceMu.RLock()
+	defer cm.evidenceMu.RUnlock()
+
+	connector, exists := cm.evidenceConnectors[connectorID]
+	if !exists {
+		return nil, fmt.Errorf("evidence connector %s not found", connectorID)
+	}
+
+	return connector, nil
+}
+
+// ListEvidenceConnectors 列出所有已注册的存证连接器
+func (cm *ChannelManager) ListEvidenceConnectors() []*EvidenceConnector {
+	cm.evidenceMu.RLock()
+	defer cm.evidenceMu.RUnlock()
+
+	connectors := make([]*EvidenceConnector, 0, len(cm.evidenceConnectors))
+	for _, connector := range cm.evidenceConnectors {
+		connectors = append(connectors, connector)
+	}
+
+	return connectors
+}
+
+// UpdateEvidenceConnectorHeartbeat 更新存证连接器心跳
+func (cm *ChannelManager) UpdateEvidenceConnectorHeartbeat(connectorID string) error {
+	cm.evidenceMu.Lock()
+	defer cm.evidenceMu.Unlock()
+
+	connector, exists := cm.evidenceConnectors[connectorID]
+	if !exists {
+		return fmt.Errorf("evidence connector %s not found", connectorID)
+	}
+
+	connector.LastHeartbeat = time.Now()
+	connector.Status = ConnectorStatusOnline
+
+	return nil
+}
+
+// IsEvidenceConnectorAvailable 检查存证连接器是否可用
+func (cm *ChannelManager) IsEvidenceConnectorAvailable(connectorID string) bool {
+	cm.evidenceMu.RLock()
+	defer cm.evidenceMu.RUnlock()
+
+	connector, exists := cm.evidenceConnectors[connectorID]
+	if !exists {
+		return false
+	}
+
+	// 检查连接器是否在线且心跳在合理时间内
+	return connector.Status == ConnectorStatusOnline &&
+		   time.Since(connector.LastHeartbeat) < 5*time.Minute
+}
+
+// GetAvailableEvidenceConnectors 获取所有可用的存证连接器
+func (cm *ChannelManager) GetAvailableEvidenceConnectors() []*EvidenceConnector {
+	cm.evidenceMu.RLock()
+	defer cm.evidenceMu.RUnlock()
+
+	connectors := make([]*EvidenceConnector, 0)
+	for _, connector := range cm.evidenceConnectors {
+		if cm.IsEvidenceConnectorAvailable(connector.ConnectorID) {
+			connectors = append(connectors, connector)
+		}
+	}
+
+	return connectors
+}
+
+// StartEvidenceConnectorHeartbeatCheck 启动存证连接器心跳检查协程
+func (cm *ChannelManager) StartEvidenceConnectorHeartbeatCheck() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute) // 每分钟检查一次
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				cm.checkEvidenceConnectorHeartbeats()
+			}
+		}
+	}()
+	log.Println("✓ Started evidence connector heartbeat check routine")
+}
+
+// checkEvidenceConnectorHeartbeats 检查存证连接器心跳状态
+func (cm *ChannelManager) checkEvidenceConnectorHeartbeats() {
+	cm.evidenceMu.Lock()
+	defer cm.evidenceMu.Unlock()
+
+	now := time.Now()
+	offlineCount := 0
+
+	for _, connector := range cm.evidenceConnectors {
+		if now.Sub(connector.LastHeartbeat) > 5*time.Minute {
+			if connector.Status == ConnectorStatusOnline {
+				connector.Status = ConnectorStatusOffline
+				offlineCount++
+				log.Printf("📴 Evidence connector %s marked as offline", connector.ConnectorID)
+			}
+		}
+	}
+
+	if offlineCount > 0 {
+		log.Printf("📊 Marked %d evidence connectors as offline", offlineCount)
 	}
 }
 

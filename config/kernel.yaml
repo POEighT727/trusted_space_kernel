@@ -30,3 +30,18 @@ policy:
   # 默认策略：true=允许所有连接，false=需要显式授权
   default_allow: true
 
+channel:
+  evidence:
+    # 默认存证方式：none, internal, external, hybrid
+    default_mode: "none"
+    # 默认存证策略：all, data, control, important
+    default_strategy: "all"
+    # 默认外部存证连接器ID（当mode为external或hybrid时使用）
+    default_connector_id: ""
+    # 默认启用备份存证
+    default_backup_enabled: false
+    # 默认存证数据保留天数
+    default_retention_days: 30
+    # 默认压缩存证数据
+    default_compress_data: true
+

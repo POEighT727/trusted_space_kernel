@@ -1,0 +1,14 @@
+{
+  "channel_id": "channel-B-to-A-simple",
+  "name": "connector-B 向 connector-A 发送数据频道",
+  "description": "connector-B 向 connector-A 的简单数据传输频道",
+  "creator_id": "connector-B",
+  "approver_id": "connector-B",
+  "sender_ids": ["connector-B"],
+  "receiver_ids": ["connector-A"],
+  "data_topic": "data.from.B.to.A",
+  "encrypted": false,
+  "created_at": "2024-01-15T15:00:00Z",
+  "updated_at": "2024-01-15T15:00:00Z",
+  "version": 1
+}

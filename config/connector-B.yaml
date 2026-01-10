@@ -25,3 +25,8 @@ evidence:
   local_storage: true      # 是否启用本地存证存储（接收到的分布式存证数据）
   storage_path: "./evidence" # 本地存证存储路径
 
+channel:
+  # 频道配置文件目录
+  # 如果为空，将自动创建 ./channels/{connector_id} 目录
+  config_dir: "./channels/connector-B"
+

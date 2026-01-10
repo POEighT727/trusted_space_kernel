@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -43,6 +44,10 @@ type Config struct {
 		LocalStorage bool   `yaml:"local_storage"` // 是否启用本地存证存储
 		StoragePath  string `yaml:"storage_path"`  // 本地存证存储路径
 	} `yaml:"evidence"`
+
+	Channel struct {
+		ConfigDir string `yaml:"config_dir"` // 频道配置文件目录
+	} `yaml:"channel"`
 }
 
 func main() {
@@ -118,6 +123,21 @@ func main() {
 	}
 	defer connector.Close()
 
+	// 创建频道配置文件目录
+	channelConfigDir := config.Channel.ConfigDir
+	if channelConfigDir == "" {
+		// 默认使用相对路径: ./channels/{connector_id}
+		channelConfigDir = fmt.Sprintf("./channels/%s", config.Connector.ID)
+	}
+
+	if err := os.MkdirAll(channelConfigDir, 0755); err != nil {
+		log.Fatalf("Failed to create channel config directory %s: %v", channelConfigDir, err)
+	}
+	fmt.Printf("✓ 频道配置目录已创建: %s\n", channelConfigDir)
+
+	// 将配置目录路径存储在连接器中（如果需要的话）
+	// 这里可以考虑将channelConfigDir传递给连接器客户端
+
 	// 连接到内核
 	fmt.Printf("正在连接到内核 %s...\n", serverAddr)
 	if err := connector.Connect(); err != nil {
@@ -164,7 +184,7 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// 启动交互式命令行
-	go runInteractiveShell(connector, config.Connector.ID)
+	go runInteractiveShell(connector, config)
 
 	// 等待信号
 	<-sigChan
@@ -172,7 +192,15 @@ func main() {
 }
 
 // runInteractiveShell 运行交互式命令行
-func runInteractiveShell(connector *client.Connector, connectorID string) {
+func runInteractiveShell(connector *client.Connector, config *Config) {
+	connectorID := config.Connector.ID
+
+	// 获取默认配置目录
+	defaultConfigDir := config.Channel.ConfigDir
+	if defaultConfigDir == "" {
+		defaultConfigDir = fmt.Sprintf("./channels/%s", config.Connector.ID)
+	}
+
 	scanner := bufio.NewScanner(os.Stdin)
 	
 	for {
@@ -197,13 +225,17 @@ func runInteractiveShell(connector *client.Connector, connectorID string) {
 
 		switch command {
 		case "help", "h":
-			printHelp()
+			printHelp(defaultConfigDir)
 		case "list", "ls":
 			handleList(connector)
 		case "info":
 			handleInfo(connector, args)
 		case "create":
-			handleCreateChannel(connector, args)
+			defaultConfigDir := config.Channel.ConfigDir
+			if defaultConfigDir == "" {
+				defaultConfigDir = fmt.Sprintf("./channels/%s", config.Connector.ID)
+			}
+			handleCreateChannel(connector, args, defaultConfigDir)
 		case "accept":
 			handleAcceptProposal(connector, args)
 		case "reject":
@@ -240,14 +272,17 @@ func runInteractiveShell(connector *client.Connector, connectorID string) {
 }
 
 // printHelp 打印帮助信息
-func printHelp() {
+func printHelp(defaultConfigDir string) {
 	fmt.Println("可用命令:")
 	fmt.Println("  list, ls              - 列出空间中的所有连接器")
 	fmt.Println("  info <connector_id>   - 查看指定连接器的详细信息")
-	fmt.Println("  create --sender <sender_ids> --receiver <receiver_ids> [--approver <approver_id>] [--reason <reason>] - 创建频道")
+	fmt.Println("  create --config <config_file> | --sender <sender_ids> --receiver <receiver_ids> [--approver <approver_id>] [--reason <reason>] - 创建频道")
+	fmt.Printf("    支持两种方式：\n")
+	fmt.Printf("    1. 从配置文件创建: create --config channel-config.json (在 %s 中查找)\n", defaultConfigDir)
+	fmt.Println("    2. 手动指定参数: create --sender connector-A --receiver connector-B --reason \"data exchange\"")
     fmt.Println("    发起频道创建提议，支持多个发送方和接收方，需要所有参与方确认后才能使用")
-    fmt.Println("    示例: create --sender connector-A --receiver connector-B --reason \"data exchange\"")
-    fmt.Println("    示例: create --sender connector-A,connector-B --receiver connector-C,connector-D --reason \"group chat\"")
+    fmt.Printf("    示例: create --config channel-simple-config.json\n")
+    fmt.Println("    示例: create --sender connector-A,connector-B --receiver connector-C --reason \"group chat\"")
 	fmt.Println("  accept <channel_id> <proposal_id> - 接受频道提议")
 	fmt.Println("    示例: accept channel-123 proposal-456")
 	fmt.Println("  reject <channel_id> <proposal_id> [--reason <reason>] - 拒绝频道提议")
@@ -347,14 +382,90 @@ func handleInfo(connector *client.Connector, args []string) {
 	}
 
 // handleCreateChannel 处理创建频道命令
-func handleCreateChannel(connector *client.Connector, args []string) {
+func handleCreateChannel(connector *client.Connector, args []string, defaultConfigDir string) {
 	if len(args) < 2 {
-		fmt.Println("❌ 参数错误: create --sender <sender_ids> --receiver <receiver_ids> [--approver <approver_id>] [--reason <reason>]")
-		fmt.Println("   支持多个发送方和接收方，使用逗号分隔多个ID")
-		fmt.Println("   示例: create --sender connector-A,connector-B --receiver connector-C --reason \"data exchange\"")
+		fmt.Println("❌ 参数错误: create --config <config_file> | --sender <sender_ids> --receiver <receiver_ids> [--approver <approver_id>] [--reason <reason>]")
+		fmt.Println("   支持两种方式：")
+		fmt.Printf("   1. 从配置文件: create --config channel-config.json (在 %s 中查找)\n", defaultConfigDir)
+		fmt.Println("   2. 手动指定: create --sender connector-A --receiver connector-B --reason \"data exchange\"")
+		return
+	}
+
+	// 检查是否使用配置文件模式
+	var configFile string
+	var useConfigFile bool
+
+	// 快速检查第一个参数是否是--config
+	if len(args) >= 2 && args[0] == "--config" {
+		useConfigFile = true
+		if len(args) >= 2 {
+			configFile = args[1]
+		} else {
+			fmt.Println("❌ --config 参数需要提供配置文件路径")
 			return
 		}
+	}
 
+	if useConfigFile {
+		// 从配置文件创建频道
+		handleCreateChannelFromConfigFile(connector, configFile, defaultConfigDir)
+	} else {
+		// 使用命令行参数创建频道
+		handleCreateChannelFromArgs(connector, args)
+	}
+}
+
+// handleCreateChannelFromConfigFile 从配置文件创建频道
+func handleCreateChannelFromConfigFile(connector *client.Connector, configFile string, defaultConfigDir string) {
+	// 如果配置文件路径不包含目录分隔符，则在默认配置目录中查找
+	if !filepath.IsAbs(configFile) && !strings.Contains(configFile, string(filepath.Separator)) {
+		configFile = filepath.Join(defaultConfigDir, configFile)
+	}
+
+	// 检查文件是否存在
+	if _, err := os.Stat(configFile); os.IsNotExist(err) {
+		fmt.Printf("❌ 配置文件不存在: %s\n", configFile)
+		return
+	}
+
+	fmt.Printf("正在从配置文件创建频道: %s...\n", configFile)
+
+	config, err := connector.CreateChannelFromConfig(configFile)
+	if err != nil {
+		fmt.Printf("❌ 创建频道失败: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✓ 频道创建提议已提交\n")
+	fmt.Printf("  频道ID: %s\n", config.ChannelID)
+	fmt.Printf("  创建者: %s\n", config.CreatorID)
+	fmt.Printf("  发送方: %v\n", config.SenderIDs)
+	fmt.Printf("  接收方: %v\n", config.ReceiverIDs)
+	fmt.Printf("  数据主题: %s\n", config.DataTopic)
+	fmt.Printf("  加密: %v\n", config.Encrypted)
+
+	// 显示需要哪些参与方确认（创建者自动接受，不需要确认）
+	fmt.Println("  需要以下参与方确认:")
+	connectorID := connector.GetID()
+	hasOthers := false
+	for _, senderID := range config.SenderIDs {
+		if senderID != connectorID { // 创建者自己不需要确认
+			fmt.Printf("    - 发送方 %s 需要确认\n", senderID)
+			hasOthers = true
+		}
+	}
+	for _, receiverID := range config.ReceiverIDs {
+		fmt.Printf("    - 接收方 %s 需要确认\n", receiverID)
+		hasOthers = true
+	}
+	if !hasOthers {
+		fmt.Println("    - 无（所有参与方都是创建者自己）")
+	}
+	fmt.Println("  创建者已自动接受，等待其他参与方确认后频道将自动激活...")
+}
+
+// handleCreateChannelFromArgs 从命令行参数创建频道
+func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 	var senderIDs []string
 	var receiverIDs []string
 	approverID := "" // 默认为空，表示使用创建者作为批准者
@@ -412,6 +523,7 @@ func handleCreateChannel(connector *client.Connector, args []string) {
 			}
 		default:
 			fmt.Printf("❌ 未知参数: %s\n", args[i])
+			fmt.Println("   支持的参数: --sender, --receiver, --approver, --reason")
 			return
 		}
 	}
@@ -433,7 +545,7 @@ func handleCreateChannel(connector *client.Connector, args []string) {
 	}
 
 	channelID, proposalID, err := connector.ProposeChannel(senderIDs, receiverIDs, "", approverID, reason)
-		if err != nil {
+	if err != nil {
 		fmt.Printf("❌ 提议创建频道失败: %v\n", err)
 		return
 	}
@@ -441,7 +553,7 @@ func handleCreateChannel(connector *client.Connector, args []string) {
 	fmt.Printf("✓ 频道提议创建成功\n")
 	fmt.Printf("  频道ID: %s\n", channelID)
 	fmt.Printf("  提议ID: %s\n", proposalID)
-	
+
 	// 显示需要哪些参与方确认（创建者自动接受，不需要确认）
 	fmt.Println("  需要以下参与方确认:")
 	selfID := connector.GetID()
@@ -461,6 +573,7 @@ func handleCreateChannel(connector *client.Connector, args []string) {
 	}
 	fmt.Println("  创建者已自动接受，等待其他参与方确认后频道将自动激活...")
 }
+
 
 // handleAcceptProposal 处理接受提议命令
 func handleAcceptProposal(connector *client.Connector, args []string) {

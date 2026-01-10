@@ -53,11 +53,31 @@ type Config struct {
 	Policy struct {
 		DefaultAllow bool `yaml:"default_allow"`
 	} `yaml:"policy"`
+
+	Channel struct {
+		Evidence struct {
+			DefaultMode          string `yaml:"default_mode"`
+			DefaultStrategy      string `yaml:"default_strategy"`
+			DefaultConnectorID   string `yaml:"default_connector_id"`
+			DefaultBackupEnabled bool   `yaml:"default_backup_enabled"`
+			DefaultRetentionDays int    `yaml:"default_retention_days"`
+			DefaultCompressData  bool   `yaml:"default_compress_data"`
+		} `yaml:"evidence"`
+	} `yaml:"channel"`
 }
 
 func main() {
 	// 解析命令行参数
 	configPath := flag.String("config", "config/kernel.yaml", "path to config file")
+
+	// 默认存证配置相关参数（带默认值，会被配置文件覆盖）
+	defaultEvidenceMode := flag.String("default-evidence-mode", "none", "default evidence mode (none, internal, external, hybrid)")
+	defaultEvidenceStrategy := flag.String("default-evidence-strategy", "all", "default evidence strategy (all, data, control, important)")
+	defaultEvidenceConnector := flag.String("default-evidence-connector", "", "default external evidence connector ID")
+	defaultEvidenceBackup := flag.Bool("default-evidence-backup", false, "enable backup evidence by default")
+	defaultEvidenceRetention := flag.Int("default-evidence-retention", 30, "default evidence retention days")
+	defaultEvidenceCompress := flag.Bool("default-evidence-compress", true, "compress evidence data by default")
+
 	flag.Parse()
 
 	// 加载配置
@@ -65,6 +85,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	// 使用配置文件中的值覆盖命令行参数（如果配置文件中有设置）
+	if config.Channel.Evidence.DefaultMode != "" {
+		*defaultEvidenceMode = config.Channel.Evidence.DefaultMode
+	}
+	if config.Channel.Evidence.DefaultStrategy != "" {
+		*defaultEvidenceStrategy = config.Channel.Evidence.DefaultStrategy
+	}
+	if config.Channel.Evidence.DefaultConnectorID != "" {
+		*defaultEvidenceConnector = config.Channel.Evidence.DefaultConnectorID
+	}
+	if config.Channel.Evidence.DefaultRetentionDays > 0 {
+		*defaultEvidenceRetention = config.Channel.Evidence.DefaultRetentionDays
+	}
+	*defaultEvidenceBackup = config.Channel.Evidence.DefaultBackupEnabled
+	*defaultEvidenceCompress = config.Channel.Evidence.DefaultCompressData
 
 	// 初始化组件
 	log.Println("Initializing kernel components...")
@@ -83,6 +119,32 @@ func main() {
 	channelManager := circulation.NewChannelManager()
 	channelManager.StartCleanupRoutine()
 	channelManager.StartBufferCleanupRoutine() // 启动连接器缓冲清理协程
+
+	// 初始化频道配置管理器
+	configManager, err := circulation.NewChannelConfigManager("./channel_configs")
+	if err != nil {
+		log.Fatalf("Failed to create channel config manager: %v", err)
+	}
+	channelManager.SetConfigManager(configManager)
+
+	// 设置默认存证配置（当频道未指定配置文件时使用）
+	defaultEvidenceConfig := &circulation.EvidenceConfig{
+		Mode:           circulation.EvidenceMode(*defaultEvidenceMode),
+		Strategy:       circulation.EvidenceStrategy(*defaultEvidenceStrategy),
+		ConnectorID:    *defaultEvidenceConnector,
+		BackupEnabled:  *defaultEvidenceBackup,
+		RetentionDays:  *defaultEvidenceRetention,
+		CompressData:   *defaultEvidenceCompress,
+		CustomSettings: make(map[string]string),
+	}
+
+	if err := channelManager.SetDefaultEvidenceConfig(defaultEvidenceConfig); err != nil {
+		log.Fatalf("Failed to set default evidence config: %v", err)
+	}
+
+	// 启动存证连接器心跳检查
+	channelManager.StartEvidenceConnectorHeartbeatCheck()
+
 	log.Println("✓ Channel manager initialized")
 
 	// 4. 数据库管理器（如果启用）
