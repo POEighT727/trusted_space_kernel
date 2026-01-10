@@ -151,13 +151,8 @@ func NewChannelServiceServer(
 
 // notifyChannelCreated 处理异步创建的频道通知（特别是evidence频道）
 func (s *ChannelServiceServer) notifyChannelCreated(channel *circulation.Channel) {
-	log.Printf("📢 发送异步创建频道通知: %s (类型: %v, 发送方: %v, 接收方: %v)",
-		channel.ChannelID, channel.ChannelType, channel.SenderIDs, channel.ReceiverIDs)
-
-	// 特别标记evidence频道
-	if channel.ChannelType == circulation.ChannelTypeLog {
-		log.Printf("📋 EVIDENCE频道已创建: %s", channel.ChannelID)
-	}
+	log.Printf("📢 发送异步创建频道通知: %s (发送方: %v, 接收方: %v)",
+		channel.ChannelID, channel.SenderIDs, channel.ReceiverIDs)
 
 	// 构建通知消息
 	notification := &pb.ChannelNotification{
@@ -165,9 +160,9 @@ func (s *ChannelServiceServer) notifyChannelCreated(channel *circulation.Channel
 		CreatorId:         channel.CreatorID,
 		SenderIds:         channel.SenderIDs,
 		ReceiverIds:       channel.ReceiverIDs,
-		ChannelType:       pb.ChannelType(channel.ChannelType),
+		ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道都作为数据频道处理
 		Encrypted:         channel.Encrypted,
-		RelatedChannelIds: channel.RelatedChannelIDs,
+		RelatedChannelIds: []string{}, // 统一频道不再有关联频道
 		DataTopic:         channel.DataTopic,
 		CreatedAt:         channel.CreatedAt.Unix(),
 		NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED, // 异步创建的频道直接激活
@@ -314,17 +309,10 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 		}
 	}
 
-	// 确定频道类型和加密设置
-	channelType := circulation.ChannelTypeData // 默认数据频道
-	if req.ChannelType == pb.ChannelType_CHANNEL_TYPE_CONTROL {
-		channelType = circulation.ChannelTypeControl
-	} else if req.ChannelType == pb.ChannelType_CHANNEL_TYPE_LOG {
-		channelType = circulation.ChannelTypeLog
-	}
-
+	// 统一频道模式，所有频道都使用相同处理逻辑
 	encrypted := req.Encrypted
-	if channelType == circulation.ChannelTypeData && !req.Encrypted {
-		encrypted = true // 数据频道默认加密
+	if !req.Encrypted {
+		encrypted = true // 统一频道默认加密
 	}
 
 	// 权限检查：检查所有发送方到所有接收方的权限（ACL）
@@ -366,7 +354,6 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 		req.SenderIds,
 		req.ReceiverIds,
 		req.DataTopic,
-		channelType,
 		encrypted,
 		req.Reason,
 		req.TimeoutSeconds,
@@ -514,9 +501,9 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 				CreatorId:         channel.CreatorID,
 				SenderIds:         channel.SenderIDs,
 				ReceiverIds:       channel.ReceiverIDs,
-				ChannelType:       pb.ChannelType(channel.ChannelType),
+				ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA,
 				Encrypted:         channel.Encrypted,
-				RelatedChannelIds: channel.RelatedChannelIDs,
+				RelatedChannelIds: []string{},
 				DataTopic:         channel.DataTopic,
 				CreatedAt:         channel.CreatedAt.Unix(),
 				NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED,
@@ -615,7 +602,7 @@ func (s *ChannelServiceServer) RejectChannelProposal(ctx context.Context, req *p
 			CreatorId:         channel.CreatorID,
 			SenderIds:         channel.SenderIDs,
 			ReceiverIds:       channel.ReceiverIDs,
-			ChannelType:       pb.ChannelType(channel.ChannelType),
+			ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
 			Encrypted:         channel.Encrypted,
 			DataTopic:         channel.DataTopic,
 			CreatedAt:         channel.CreatedAt.Unix(),
@@ -814,11 +801,6 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 		log.Printf("🔄 Connector %s recovered from offline state, sending channel notification", req.ConnectorId)
 		go func() {
 			// 构造频道通知
-			channelType := pb.ChannelType_CHANNEL_TYPE_DATA
-			if channel.ChannelType == circulation.ChannelTypeLog {
-				channelType = pb.ChannelType_CHANNEL_TYPE_LOG
-			}
-
 			negotiationStatus := pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED
 
 			notification := &pb.ChannelNotification{
@@ -826,9 +808,9 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 				CreatorId:         channel.CreatorID,
 				SenderIds:         channel.SenderIDs,
 				ReceiverIds:       channel.ReceiverIDs,
-				ChannelType:       channelType,
+				ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
 				Encrypted:         channel.Encrypted,
-				RelatedChannelIds: channel.RelatedChannelIDs,
+				RelatedChannelIds: []string{},
 				DataTopic:         channel.DataTopic,
 				CreatedAt:         channel.CreatedAt.Unix(),
 				NegotiationStatus: negotiationStatus,
@@ -963,27 +945,15 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 		}, nil
 	}
 
-	// 转换频道类型
-	var channelType pb.ChannelType
-	switch channel.ChannelType {
-	case circulation.ChannelTypeData:
-		channelType = pb.ChannelType_CHANNEL_TYPE_DATA
-	case circulation.ChannelTypeControl:
-		channelType = pb.ChannelType_CHANNEL_TYPE_CONTROL
-	case circulation.ChannelTypeLog:
-		channelType = pb.ChannelType_CHANNEL_TYPE_LOG
-	default:
-		channelType = pb.ChannelType_CHANNEL_TYPE_DATA
-	}
-
+	// 统一频道都作为数据频道处理
 	notification := &pb.ChannelNotification{
 		ChannelId:         req.ChannelId,
 		CreatorId:         channel.CreatorID,
 		SenderIds:         channel.SenderIDs,
 		ReceiverIds:       channel.ReceiverIDs,
-		ChannelType:       channelType,
+		ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
 		Encrypted:         channel.Encrypted,
-		RelatedChannelIds: channel.RelatedChannelIDs,
+		RelatedChannelIds: []string{}, // 统一频道无关联频道
 		DataTopic:         channel.DataTopic,
 		CreatedAt:         channel.CreatedAt.Unix(),
 	}
@@ -1020,18 +990,7 @@ func (s *ChannelServiceServer) GetChannelInfo(ctx context.Context, req *pb.GetCh
 		}, nil
 	}
 
-	// 转换频道类型
-	var channelType pb.ChannelType
-	switch channel.ChannelType {
-	case circulation.ChannelTypeData:
-		channelType = pb.ChannelType_CHANNEL_TYPE_DATA
-	case circulation.ChannelTypeControl:
-		channelType = pb.ChannelType_CHANNEL_TYPE_CONTROL
-	case circulation.ChannelTypeLog:
-		channelType = pb.ChannelType_CHANNEL_TYPE_LOG
-	default:
-		channelType = pb.ChannelType_CHANNEL_TYPE_DATA
-	}
+	// 统一频道都作为数据频道处理
 
 	// 获取协商状态
 	var negotiationStatus pb.ChannelNegotiationStatus
@@ -1065,9 +1024,9 @@ func (s *ChannelServiceServer) GetChannelInfo(ctx context.Context, req *pb.GetCh
 		ApproverId:        channel.ApproverID,
 		SenderIds:         channel.SenderIDs,
 		ReceiverIds:       channel.ReceiverIDs,
-		ChannelType:       channelType,
+		ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
 		Encrypted:         channel.Encrypted,
-		RelatedChannelIds: channel.RelatedChannelIDs,
+		RelatedChannelIds: []string{}, // 统一频道无关联频道
 		DataTopic:         channel.DataTopic,
 		Status:            string(channel.Status),
 		CreatedAt:         channel.CreatedAt.Unix(),
@@ -1336,11 +1295,7 @@ func (s *ChannelServiceServer) RejectChannelSubscription(ctx context.Context, re
 
 // sendChannelUpdateNotification 发送频道更新通知给指定连接器
 func (s *ChannelServiceServer) sendChannelUpdateNotification(channel *circulation.Channel, subscriberID string) error {
-	// 构造频道通知
-	channelType := pb.ChannelType_CHANNEL_TYPE_DATA
-	if channel.ChannelType == circulation.ChannelTypeLog {
-		channelType = pb.ChannelType_CHANNEL_TYPE_LOG
-	}
+	// 构造频道通知（统一频道）
 
 	negotiationStatus := pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED
 
@@ -1349,9 +1304,9 @@ func (s *ChannelServiceServer) sendChannelUpdateNotification(channel *circulatio
 		CreatorId:         channel.CreatorID,
 		SenderIds:         channel.SenderIDs,
 		ReceiverIds:       channel.ReceiverIDs,
-		ChannelType:       channelType,
+		ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
 		Encrypted:         channel.Encrypted,
-		RelatedChannelIds: channel.RelatedChannelIDs,
+		RelatedChannelIds: []string{}, // 统一频道无关联频道
 		DataTopic:         channel.DataTopic,
 		CreatedAt:         channel.CreatedAt.Unix(),
 		NegotiationStatus: negotiationStatus,

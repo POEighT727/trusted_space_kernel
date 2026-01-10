@@ -132,11 +132,7 @@ func (s *IdentityServiceServer) sendChannelRecoveryNotifications(connectorID str
 				if channel.Status == circulation.ChannelStatusActive && channel.IsParticipant(connectorID) {
 					totalCount++
 
-					// 构造频道通知
-					channelType := pb.ChannelType_CHANNEL_TYPE_DATA
-					if channel.ChannelType == circulation.ChannelTypeLog {
-						channelType = pb.ChannelType_CHANNEL_TYPE_LOG
-					}
+					// 构造频道通知（统一频道）
 
 					negotiationStatus := pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED
 
@@ -145,9 +141,9 @@ func (s *IdentityServiceServer) sendChannelRecoveryNotifications(connectorID str
 						CreatorId:         channel.CreatorID,
 						SenderIds:         channel.SenderIDs,
 						ReceiverIds:       channel.ReceiverIDs,
-						ChannelType:       channelType,
+						ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
 						Encrypted:         channel.Encrypted,
-						RelatedChannelIds: channel.RelatedChannelIDs,
+						RelatedChannelIds: []string{}, // 统一频道无关联频道
 						DataTopic:         channel.DataTopic,
 						CreatedAt:         channel.CreatedAt.Unix(),
 						NegotiationStatus: negotiationStatus,

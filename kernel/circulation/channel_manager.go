@@ -28,13 +28,13 @@ const (
 	NegotiationStatusRejected NegotiationStatus = 3 // 已拒绝
 )
 
-// ChannelType 频道类型
-type ChannelType int
+// MessageType 消息类型
+type MessageType string
 
 const (
-	ChannelTypeData    ChannelType = 1 // 真实数据频道
-	ChannelTypeControl ChannelType = 2 // 控制数据频道
-	ChannelTypeLog     ChannelType = 3 // 日志数据频道
+	MessageTypeData     MessageType = "data"     // 业务数据消息
+	MessageTypeControl  MessageType = "control"  // 控制消息
+	MessageTypeEvidence MessageType = "evidence" // 存证数据消息
 )
 
 // ChannelProposal 频道提议信息
@@ -55,16 +55,14 @@ type ChannelProposal struct {
 	ReceiverApprovals map[string]bool // key: receiverID, value: 是否已确认
 }
 
-// Channel 数据传输频道（单对单模式，明确指定发送方和接收方）
+// Channel 数据传输频道（统一频道模式，支持多种消息类型）
 type Channel struct {
 	ChannelID     string
 	CreatorID     string        // 创建者ID（不一定是发送方）
 	ApproverID    string        // 权限变更批准者ID（默认是创建者）
 	SenderIDs     []string      // 发送方ID列表
 	ReceiverIDs   []string      // 接收方ID列表
-	ChannelType   ChannelType   // 频道类型（数据/控制/日志）
 	Encrypted     bool          // 是否加密传输
-	RelatedChannelIDs []string  // 关联频道ID列表（数据频道关联控制和日志频道）
 	DataTopic     string
 	Status        ChannelStatus
 	CreatedAt     time.Time
@@ -79,7 +77,7 @@ type Channel struct {
 	subscribers   map[string]chan *DataPacket // key: subscriber ID
 	mu            sync.RWMutex
 	participantsMu sync.RWMutex // 参与者集合的锁（保留用于兼容）
-	
+
 	// 数据暂存（在接收方订阅前暂存数据）
 	buffer        []*DataPacket  // 暂存的数据包
 	bufferMu      sync.RWMutex   // 暂存缓冲区的锁
@@ -100,8 +98,9 @@ type DataPacket struct {
 	Payload        []byte
 	Signature      string
 	Timestamp      int64
-	SenderID       string   // 发送方ID
-	TargetIDs      []string // 目标接收者ID列表（为空则广播给所有订阅者）
+	SenderID       string     // 发送方ID
+	TargetIDs      []string   // 目标接收者ID列表（为空则广播给所有订阅者）
+	MessageType    MessageType // 消息类型（数据/控制/存证）
 }
 
 // PermissionChangeRequest 权限变更请求
@@ -162,7 +161,7 @@ func (cm *ChannelManager) SetChannelCreatedCallback(callback func(*Channel)) {
 }
 
 // ProposeChannel 提议创建频道（协商第一阶段）
-func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, channelType ChannelType, encrypted bool, reason string, timeoutSeconds int32) (*Channel, error) {
+func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, encrypted bool, reason string, timeoutSeconds int32) (*Channel, error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -182,7 +181,7 @@ func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs
 		if id == "" {
 			return nil, fmt.Errorf("sender ID cannot be empty")
 		}
-		if allIDs[id] && channelType != ChannelTypeLog && channelType != ChannelTypeControl {
+		if allIDs[id] {
 			return nil, fmt.Errorf("duplicate sender ID: %s", id)
 		}
 		allIDs[id] = true
@@ -191,7 +190,7 @@ func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs
 		if id == "" {
 			return nil, fmt.Errorf("receiver ID cannot be empty")
 		}
-		if allIDs[id] && channelType != ChannelTypeLog && channelType != ChannelTypeControl {
+		if allIDs[id] {
 			return nil, fmt.Errorf("receiver ID %s conflicts with sender", id)
 		}
 		allIDs[id] = true
@@ -221,9 +220,7 @@ func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs
 		ApproverID:        approverID,
 		SenderIDs:         senderIDs,
 		ReceiverIDs:       receiverIDs,
-		ChannelType:       channelType,
 		Encrypted:         encrypted,
-		RelatedChannelIDs: []string{}, // 协商阶段先为空
 		DataTopic:         dataTopic,
 		Status:            ChannelStatusProposed,
 		CreatedAt:         time.Now(),
@@ -332,80 +329,6 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 		// 启动数据分发协程（确保数据能够被分发到订阅者）
 		go channel.startDataDistribution()
 
-		// 如果是数据频道，异步创建配套的控制频道和存证频道（避免死锁）
-		if channel.ChannelType == ChannelTypeData {
-			log.Printf("🔄 Starting asynchronous control and evidence channel creation for data channel %s", channelID)
-			go func() {
-				log.Printf("🔄 Channel creation goroutine started for %s", channelID)
-				cm.mu.Lock()
-				// 重新获取频道引用（以防在异步操作期间被修改）
-				dataChannel, exists := cm.channels[channelID]
-				cm.mu.Unlock()
-
-				if !exists {
-					log.Printf("⚠ Data channel %s no longer exists, skipping channel creation", channelID)
-					return
-				}
-
-				// 创建控制频道
-				log.Printf("🔄 Creating control channel for data channel %s", channelID)
-				controlChannel, err := cm.createControlChannel(dataChannel)
-				if err != nil {
-					log.Printf("⚠ Failed to create control channel for %s: %v", channelID, err)
-				} else {
-					log.Printf("✓ Created control channel %s for data channel %s", controlChannel.ChannelID, channelID)
-
-					// 发送控制频道创建通知
-					if cm.notifyChannelCreated != nil {
-						log.Printf("📢 Sending notification for control channel %s", controlChannel.ChannelID)
-						cm.notifyChannelCreated(controlChannel)
-					}
-
-					// 通过控制频道广播频道提议信息
-					if dataChannel.ChannelProposal != nil {
-						go dataChannel.broadcastChannelProposal(dataChannel.ChannelProposal)
-					}
-				}
-
-				// 创建存证频道
-				log.Printf("🔄 Creating evidence channel for data channel %s", channelID)
-				evidenceChannel, err := cm.createEvidenceChannel(dataChannel)
-				if err != nil {
-					log.Printf("⚠ Failed to create evidence channel for %s: %v", channelID, err)
-					return
-				}
-
-				log.Printf("✓ Created evidence channel %s for data channel %s", evidenceChannel.ChannelID, channelID)
-
-				// 更新关联频道ID
-				cm.mu.Lock()
-				if ch, exists := cm.channels[channelID]; exists {
-					// 添加控制频道ID（如果创建成功）
-					if controlChannel != nil {
-						ch.RelatedChannelIDs = append(ch.RelatedChannelIDs, controlChannel.ChannelID)
-						controlChannel.RelatedChannelIDs = []string{channel.ChannelID, evidenceChannel.ChannelID}
-						log.Printf("✓ Updated data channel %s with control channel %s", channelID, controlChannel.ChannelID)
-					}
-
-					// 添加存证频道ID
-					ch.RelatedChannelIDs = append(ch.RelatedChannelIDs, evidenceChannel.ChannelID)
-					evidenceChannel.RelatedChannelIDs = []string{channel.ChannelID}
-					if controlChannel != nil {
-						evidenceChannel.RelatedChannelIDs = append(evidenceChannel.RelatedChannelIDs, controlChannel.ChannelID)
-					}
-					log.Printf("✓ Updated data channel %s with evidence channel %s", channelID, evidenceChannel.ChannelID)
-				}
-				cm.mu.Unlock()
-
-				// 发送evidence频道创建通知
-				if cm.notifyChannelCreated != nil {
-					log.Printf("📢 Sending notification for evidence channel %s", evidenceChannel.ChannelID)
-					cm.notifyChannelCreated(evidenceChannel)
-				} else {
-					log.Printf("⚠ No notification callback set for evidence channel %s", evidenceChannel.ChannelID)
-				}
-			}()
-		}
 	} else {
 		log.Printf("⏳ Channel %s still waiting for approvals", channelID)
 	}
@@ -468,10 +391,10 @@ func (cm *ChannelManager) RejectChannelProposal(channelID, rejecterID, reason st
 	return nil
 }
 
-// CreateChannel 创建新的数据传输频道（单对单模式，明确指定发送方和接收方）
-func (cm *ChannelManager) CreateChannel(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, channelType ChannelType, encrypted bool, relatedChannelIDs []string) (*Channel, error) {
+// CreateChannel 创建新的数据传输频道（统一频道模式）
+func (cm *ChannelManager) CreateChannel(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, encrypted bool) (*Channel, error) {
 	// 创建主频道
-	channel, err := cm.createChannelInternal(creatorID, approverID, senderIDs, receiverIDs, dataTopic, channelType, encrypted, relatedChannelIDs)
+	channel, err := cm.createChannelInternal(creatorID, approverID, senderIDs, receiverIDs, dataTopic, encrypted)
 	if err != nil {
 		return nil, err
 	}
@@ -482,8 +405,8 @@ func (cm *ChannelManager) CreateChannel(creatorID, approverID string, senderIDs,
 	return channel, nil
 }
 
-// createChannelInternal 创建频道的核心逻辑（不包含存证频道创建）
-func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, channelType ChannelType, encrypted bool, relatedChannelIDs []string) (*Channel, error) {
+// createChannelInternal 创建频道的核心逻辑
+func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, encrypted bool) (*Channel, error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -503,7 +426,7 @@ func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, se
 		if id == "" {
 			return nil, fmt.Errorf("sender ID cannot be empty")
 		}
-		if allIDs[id] && channelType != ChannelTypeLog && channelType != ChannelTypeControl {
+		if allIDs[id] {
 			return nil, fmt.Errorf("duplicate sender ID: %s", id)
 		}
 		allIDs[id] = true
@@ -512,7 +435,7 @@ func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, se
 		if id == "" {
 			return nil, fmt.Errorf("receiver ID cannot be empty")
 		}
-		if allIDs[id] && channelType != ChannelTypeLog && channelType != ChannelTypeControl {
+		if allIDs[id] {
 			return nil, fmt.Errorf("receiver ID %s conflicts with sender", id)
 		}
 		allIDs[id] = true
@@ -527,9 +450,7 @@ func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, se
 		ApproverID:         approverID,
 		SenderIDs:          senderIDs,
 		ReceiverIDs:        receiverIDs,
-		ChannelType:        channelType,
 		Encrypted:          encrypted,
-		RelatedChannelIDs:  relatedChannelIDs,
 		DataTopic:          dataTopic,
 		Status:             ChannelStatusActive,
 		CreatedAt:          time.Now(),
@@ -550,40 +471,6 @@ func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, se
 	return channel, nil
 }
 
-// CreateChannelGroup 创建频道组（数据频道+控制频道+日志频道）
-func (cm *ChannelManager) CreateChannelGroup(creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string) (dataChannel, controlChannel, logChannel *Channel, err error) {
-	// 创建数据频道（加密）
-	dataChannel, err = cm.CreateChannel(creatorID, approverID, senderIDs, receiverIDs, dataTopic, ChannelTypeData, true, nil)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create data channel: %w", err)
-	}
-
-	// 创建控制频道（明文）
-	controlChannel, err = cm.CreateChannel(creatorID, approverID, senderIDs, receiverIDs, dataTopic+"-control", ChannelTypeControl, false, nil)
-	if err != nil {
-		// 如果控制频道创建失败，关闭数据频道
-		cm.CloseChannel(dataChannel.ChannelID)
-		return nil, nil, nil, fmt.Errorf("failed to create control channel: %w", err)
-	}
-
-	// 创建日志频道（明文）
-	logChannel, err = cm.CreateChannel(creatorID, approverID, senderIDs, receiverIDs, dataTopic+"-log", ChannelTypeLog, false, nil)
-	if err != nil {
-		// 如果日志频道创建失败，关闭数据频道和控制频道
-		cm.CloseChannel(dataChannel.ChannelID)
-		cm.CloseChannel(controlChannel.ChannelID)
-		return nil, nil, nil, fmt.Errorf("failed to create log channel: %w", err)
-	}
-
-	// 更新关联频道ID
-	cm.mu.Lock()
-	dataChannel.RelatedChannelIDs = []string{controlChannel.ChannelID, logChannel.ChannelID}
-	controlChannel.RelatedChannelIDs = []string{dataChannel.ChannelID, logChannel.ChannelID}
-	logChannel.RelatedChannelIDs = []string{dataChannel.ChannelID, controlChannel.ChannelID}
-	cm.mu.Unlock()
-
-	return dataChannel, controlChannel, logChannel, nil
-}
 
 // AddParticipant 添加参与者到频道（已废弃，单对单模式下发送方和接收方在创建时已确定）
 // 保留此方法以保持兼容性，但不会实际添加参与者
@@ -1431,10 +1318,8 @@ func (c *Channel) RequestPermissionChange(requesterID, changeType, targetID, rea
 	c.permissionRequests = append(c.permissionRequests, request)
 	c.LastActivity = time.Now()
 
-	// 通过控制频道广播权限变更请求
-	if c.ChannelType == ChannelTypeData {
-		go c.broadcastPermissionRequest(request)
-	}
+	// 在统一频道中广播权限变更请求
+	go c.broadcastPermissionRequest(request)
 
 	return request, nil
 }
@@ -1499,10 +1384,8 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 
 	c.LastActivity = time.Now()
 
-	// 通过控制频道广播批准结果
-	if c.ChannelType == ChannelTypeData {
-		go c.broadcastPermissionResult(requestID, "approved", approverID, "")
-	}
+	// 在统一频道中广播批准结果
+	go c.broadcastPermissionResult(requestID, "approved", approverID, "")
 
 	return nil
 }
@@ -1543,10 +1426,8 @@ func (c *Channel) RejectPermissionChange(approverID, requestID, reason string) e
 
 	c.LastActivity = time.Now()
 
-	// 通过控制频道广播拒绝结果
-	if c.ChannelType == ChannelTypeData {
-		go c.broadcastPermissionResult(requestID, "rejected", approverID, reason)
-	}
+	// 在统一频道中广播拒绝结果
+	go c.broadcastPermissionResult(requestID, "rejected", approverID, reason)
 
 	return nil
 }
@@ -1576,87 +1457,7 @@ func (cm *ChannelManager) StartCleanupRoutine() {
 	}()
 }
 
-// createControlChannel 为数据频道创建配套的控制频道
-func (cm *ChannelManager) createControlChannel(dataChannel *Channel) (*Channel, error) {
-	// 控制频道包含所有数据传输的参与者（发送方+接收方+批准者）
-	allParticipants := append(dataChannel.SenderIDs, dataChannel.ReceiverIDs...)
-	if dataChannel.ApproverID != "" {
-		// 避免重复添加批准者
-		found := false
-		for _, id := range allParticipants {
-			if id == dataChannel.ApproverID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			allParticipants = append(allParticipants, dataChannel.ApproverID)
-		}
-	}
 
-	// 控制频道是广播模式：所有参与者都可以发送和接收控制消息
-	// 但是createChannelInternal不允许同一个ID既是发送方又是接收方
-	// 所以我们需要为control频道创建特殊的角色分配，类似于evidence频道
-	controlSenders := make([]string, len(allParticipants))
-	controlReceivers := make([]string, len(allParticipants))
-	copy(controlSenders, allParticipants)
-	copy(controlReceivers, allParticipants)
-
-	controlTopic := dataChannel.DataTopic + "-control"
-
-	controlChannel, err := cm.createChannelInternal(
-		dataChannel.CreatorID,           // 控制频道创建者与数据频道相同
-		dataChannel.ApproverID,          // 控制频道批准者与数据频道相同
-		controlSenders,                  // 发送方：所有参与者都可以发送控制消息
-		controlReceivers,                // 接收方：所有参与者都可以接收控制消息
-		controlTopic,                    // 主题：数据主题 + "-control"
-		ChannelTypeControl,              // 类型：控制频道（明文传输）
-		false,                           // 不加密（控制消息需要高效传输）
-		nil,                             // 关联频道ID（稍后设置）
-	)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to create control channel: %w", err)
-	}
-
-	return controlChannel, nil
-}
-
-// createEvidenceChannel 为数据频道创建配套的存证频道
-func (cm *ChannelManager) createEvidenceChannel(dataChannel *Channel) (*Channel, error) {
-	// 存证频道包含所有数据传输的参与者（发送方+接收方）
-	allParticipants := append(dataChannel.SenderIDs, dataChannel.ReceiverIDs...)
-
-	// 存证频道是广播模式：所有参与者都可以发送和接收存证数据
-	// 但是createChannelInternal不允许同一个ID既是发送方又是接收方
-	// 所以我们需要为evidence频道创建特殊的角色分配
-
-	// 对于evidence频道，我们将所有参与者都设为发送方，所有参与者都设为接收方
-	// 但要避免ID冲突，所以我们使用不同的ID列表来绕过验证
-	evidenceSenders := make([]string, len(allParticipants))
-	evidenceReceivers := make([]string, len(allParticipants))
-	copy(evidenceSenders, allParticipants)
-	copy(evidenceReceivers, allParticipants)
-
-	evidenceTopic := dataChannel.DataTopic + "-evidence"
-
-	evidenceChannel, err := cm.createChannelInternal(
-		dataChannel.CreatorID,           // 存证频道创建者与数据频道相同
-		dataChannel.ApproverID,          // 存证频道批准者与数据频道相同
-		evidenceSenders,                 // 发送方：所有参与者都可以发送存证数据
-		evidenceReceivers,               // 接收方：所有参与者都可以接收存证数据
-		evidenceTopic,                   // 主题：数据主题 + "-evidence"
-		ChannelTypeLog,                  // 类型：日志频道（明文传输）
-		false,                           // 不加密（存证数据本身需要可验证）
-		nil,                             // 关联频道ID（稍后设置）
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return evidenceChannel, nil
-}
 
 // GetAllChannels 获取所有频道
 func (cm *ChannelManager) GetAllChannels() []*Channel {
@@ -1713,14 +1514,8 @@ type ChannelProposalMessage struct {
 	Reason         string   `json:"reason"`
 }
 
-// broadcastPermissionRequest 通过控制频道广播权限变更请求
+// broadcastPermissionRequest 在统一频道中广播权限变更请求
 func (c *Channel) broadcastPermissionRequest(request *PermissionChangeRequest) {
-	controlChannel := c.findControlChannel()
-	if controlChannel == nil {
-		log.Printf("⚠ No control channel found for data channel %s", c.ChannelID)
-		return
-	}
-
 	message := ControlMessage{
 		MessageType: "permission_request",
 		Timestamp:   time.Now(),
@@ -1734,17 +1529,11 @@ func (c *Channel) broadcastPermissionRequest(request *PermissionChangeRequest) {
 		},
 	}
 
-	c.sendControlMessage(controlChannel, message)
+	c.sendControlMessage(c, message) // 在当前频道中发送
 }
 
-// broadcastPermissionResult 通过控制频道广播权限变更结果
+// broadcastPermissionResult 在统一频道中广播权限变更结果
 func (c *Channel) broadcastPermissionResult(requestID, action, approverID, rejectReason string) {
-	controlChannel := c.findControlChannel()
-	if controlChannel == nil {
-		log.Printf("⚠ No control channel found for data channel %s", c.ChannelID)
-		return
-	}
-
 	message := ControlMessage{
 		MessageType: "permission_result",
 		Timestamp:   time.Now(),
@@ -1758,17 +1547,11 @@ func (c *Channel) broadcastPermissionResult(requestID, action, approverID, rejec
 		},
 	}
 
-	c.sendControlMessage(controlChannel, message)
+	c.sendControlMessage(c, message) // 在当前频道中发送
 }
 
-// broadcastChannelProposal 通过控制频道广播频道提议
+// broadcastChannelProposal 在统一频道中广播频道提议
 func (c *Channel) broadcastChannelProposal(proposal *ChannelProposal) {
-	controlChannel := c.findControlChannel()
-	if controlChannel == nil {
-		log.Printf("⚠ No control channel found for data channel %s", c.ChannelID)
-		return
-	}
-
 	message := ControlMessage{
 		MessageType: "channel_proposal",
 		Timestamp:   time.Now(),
@@ -1784,55 +1567,36 @@ func (c *Channel) broadcastChannelProposal(proposal *ChannelProposal) {
 		},
 	}
 
-	c.sendControlMessage(controlChannel, message)
+	c.sendControlMessage(c, message) // 在当前频道中发送
 }
 
-// findControlChannel 查找数据频道的控制频道
-func (c *Channel) findControlChannel() *Channel {
-	if c.manager == nil {
-		return nil
-	}
 
-	c.manager.mu.RLock()
-	defer c.manager.mu.RUnlock()
-
-	for _, relatedID := range c.RelatedChannelIDs {
-		if relatedChannel, exists := c.manager.channels[relatedID]; exists {
-			if relatedChannel.ChannelType == ChannelTypeControl &&
-			   relatedChannel.DataTopic == c.DataTopic+"-control" {
-				return relatedChannel
-			}
-		}
-	}
-
-	return nil
-}
-
-// sendControlMessage 发送控制消息到控制频道
-func (c *Channel) sendControlMessage(controlChannel *Channel, message ControlMessage) {
+// sendControlMessage 发送控制消息到统一频道
+func (c *Channel) sendControlMessage(channel *Channel, message ControlMessage) {
 	messageData, err := json.Marshal(message)
 	if err != nil {
 		log.Printf("⚠ Failed to marshal control message: %v", err)
 		return
 	}
 
-	// 创建数据包并推送到控制频道
-	sequenceNumber := int64(len(controlChannel.buffer))
+	// 创建数据包并推送到统一频道
+	sequenceNumber := int64(len(channel.buffer))
 	packet := &DataPacket{
-		ChannelID:      controlChannel.ChannelID,
+		ChannelID:      channel.ChannelID,
 		SequenceNumber: sequenceNumber,
 		Payload:        messageData,
 		SenderID:       message.SenderID,
 		TargetIDs:      []string{}, // 广播给所有订阅者
 		Timestamp:      message.Timestamp.Unix(),
+		MessageType:    MessageTypeControl, // 设置为控制消息类型
 	}
 
-	// 推送到控制频道的缓冲队列
+	// 推送到频道的缓冲队列
 	select {
-	case controlChannel.dataQueue <- packet:
-		log.Printf("✓ Control message sent to channel %s: %s", controlChannel.ChannelID, message.MessageType)
+	case channel.dataQueue <- packet:
+		log.Printf("✓ Control message sent to channel %s: %s", channel.ChannelID, message.MessageType)
 	default:
-		log.Printf("⚠ Control channel %s queue full, message dropped", controlChannel.ChannelID)
+		log.Printf("⚠ Channel %s queue full, message dropped", channel.ChannelID)
 	}
 }
 

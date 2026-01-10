@@ -145,11 +145,9 @@ func main() {
 		fmt.Printf("   创建者: %s\n", notification.CreatorId)
 		fmt.Printf("   发送方: %v\n", notification.SenderIds)
 		fmt.Printf("   接收方: %v\n", notification.ReceiverIds)
-		fmt.Printf("   频道类型: %s\n", notification.ChannelType.String())
+		fmt.Printf("   频道模式: 统一频道\n")
 		fmt.Printf("   加密: %v\n", notification.Encrypted)
-		if len(notification.RelatedChannelIds) > 0 {
-			fmt.Printf("   关联频道: %v\n", notification.RelatedChannelIds)
-		}
+		// 统一频道不再显示关联频道信息
 		fmt.Printf("   数据主题: %s\n", notification.DataTopic)
 		fmt.Printf("   创建时间: %s\n", time.Unix(notification.CreatedAt, 0).Format("2006-01-02 15:04:05"))
 	}); err != nil {
@@ -712,100 +710,10 @@ func handleSendTo(connector *client.Connector, args []string) {
 }
 
 // handleSubscribe 处理订阅频道命令
-// 支持频道外连接器申请加入和频道内连接器直接订阅
 func handleSubscribe(connector *client.Connector, args []string) {
 	if len(args) == 0 {
-		// 如果没有指定channel_id，则等待通知
-		fmt.Println("等待频道创建通知...")
-		fmt.Println("（当有发送方创建频道时，会自动收到通知）")
-		
-		notifyChan, err := connector.WaitForChannelNotification()
-		if err != nil {
-			fmt.Printf("❌ 等待通知失败: %v\n", err)
-			return
-		}
-
-		// 创建文件接收器（用于接收文件）
-		outputDir := "./received"
-		if err := os.MkdirAll(outputDir, 0755); err != nil {
-			log.Printf("⚠ 创建接收目录失败: %v", err)
-		}
-		fileReceiver := client.NewFileReceiver(outputDir, func(filePath, fileHash string) {
-			fmt.Printf("\n✓ 文件接收并保存成功:\n")
-			fmt.Printf("  文件路径: %s\n", filePath)
-			fmt.Printf("  文件哈希: %s\n", fileHash)
-		})
-
-		// 在goroutine中等待通知
-		go func() {
-			for notification := range notifyChan {
-				fmt.Printf("\n📢 收到频道创建通知:\n")
-				fmt.Printf("   频道ID: %s\n", notification.ChannelId)
-				fmt.Printf("   创建者: %s\n", notification.CreatorId)
-				fmt.Printf("   发送方: %v\n", notification.SenderIds)
-				fmt.Printf("   接收方: %v\n", notification.ReceiverIds)
-				fmt.Printf("   频道类型: %s\n", notification.ChannelType.String())
-				fmt.Printf("   加密: %v\n", notification.Encrypted)
-				if len(notification.RelatedChannelIds) > 0 {
-					fmt.Printf("   关联频道: %v\n", notification.RelatedChannelIds)
-				}
-				fmt.Printf("   数据主题: %s\n", notification.DataTopic)
-				fmt.Printf("   创建时间: %s\n", time.Unix(notification.CreatedAt, 0).Format("2006-01-02 15:04:05"))
-				fmt.Println("正在自动订阅频道...")
-
-				// 自动订阅并接收数据
-				go func(chID string) {
-					err := connector.ReceiveData(chID, func(packet *pb.DataPacket) error {
-						// 检查是否是文件传输数据包
-						if client.IsFileTransferPacket(packet.Payload) {
-							// 处理文件传输数据包
-							if err := fileReceiver.HandleFilePacket(packet); err != nil {
-								log.Printf("⚠ 处理文件数据包失败: %v", err)
-							}
-						} else {
-							// 普通数据包，显示文本
-						senderInfo := ""
-						if packet.SenderId != "" {
-							senderInfo = fmt.Sprintf("来自 %s, ", packet.SenderId)
-						}
-
-						// 检查是否是存证数据（JSON格式且包含特定字段）
-						payloadStr := string(packet.Payload)
-						isEvidenceData := strings.Contains(payloadStr, `"event_type"`) &&
-							strings.Contains(payloadStr, `"tx_id"`) &&
-							strings.Contains(payloadStr, `"signature"`)
-
-						if isEvidenceData {
-							// 存证数据，简化显示
-							var evidenceBrief struct {
-								EventType   string `json:"event_type"`
-								ConnectorID string `json:"connector_id"`
-								TxID        string `json:"tx_id"`
-							}
-							if err := json.Unmarshal(packet.Payload, &evidenceBrief); err == nil {
-								fmt.Printf("📋 [序列号: %d] 存证记录: %s (%s) - TxID: %s\n",
-									packet.SequenceNumber, evidenceBrief.EventType,
-									evidenceBrief.ConnectorID, evidenceBrief.TxID[:8]+"...")
-							} else {
-								fmt.Printf("📋 [序列号: %d] 存证数据 (%d bytes)\n", packet.SequenceNumber, len(packet.Payload))
-							}
-						} else {
-							// 普通数据，显示完整内容
-							fmt.Printf("📦 [序列号: %d] %s数据: %s\n", packet.SequenceNumber, senderInfo, payloadStr)
-						}
-						}
-						return nil
-					})
-					if err != nil {
-						fmt.Printf("❌ 接收失败: %v\n", err)
-					} else {
-						fmt.Printf("✓ 频道 %s 已关闭\n", chID)
-					}
-				}(notification.ChannelId)
-			}
-		}()
-
-		fmt.Println("✓ 已开始等待通知... (输入任意命令继续)")
+		fmt.Println("❌ 请指定要订阅的频道ID")
+		fmt.Println("用法: subscribe <channel_id> [--role <sender|receiver>] [--reason <reason>] [--output <dir>]")
 		return
 	}
 
@@ -840,6 +748,14 @@ func handleSubscribe(connector *client.Connector, args []string) {
 				fmt.Println("❌ --reason 参数需要提供理由")
 				return
 			}
+		case "--output":
+			if i+1 < len(args) {
+				outputDir = args[i+1]
+				i += 2
+			} else {
+				fmt.Println("❌ --output 参数需要提供目录路径")
+				return
+			}
 		default:
 			// 如果不是以--开头，当作output_dir
 			if !strings.HasPrefix(args[i], "--") {
@@ -871,7 +787,7 @@ func handleSubscribe(connector *client.Connector, args []string) {
 		// 不是频道参与者，需要申请加入
 		if role == "" {
 			fmt.Printf("❌ 您不是频道 %s 的参与者，请指定要申请的角色\n", channelID)
-			fmt.Println("   使用: subscribe <channel_id> --role <sender|receiver> [--reason <reason>]")
+			fmt.Println("   使用: subscribe <channel_id> --role <sender|receiver> [--reason <reason>] [--output <dir>]")
 			return
 		}
 
@@ -900,24 +816,22 @@ func handleSubscribe(connector *client.Connector, args []string) {
 	fmt.Printf("正在订阅频道 %s...\n", channelID)
 	fmt.Printf("文件将保存到: %s\n", outputDir)
 
-		// 获取频道信息并记录到本地
-		go func() {
-			channelInfo, err := connector.GetChannelInfo(channelID)
-			if err == nil && channelInfo != nil && channelInfo.Found {
-				// 记录频道信息到本地
-				connector.RecordChannelFromNotification(&pb.ChannelNotification{
-					ChannelId:         channelInfo.ChannelId,
-					CreatorId:         channelInfo.CreatorId,
-					SenderIds:         channelInfo.SenderIds,
-					ReceiverIds:       channelInfo.ReceiverIds,
-					ChannelType:       channelInfo.ChannelType,
-					Encrypted:         channelInfo.Encrypted,
-					RelatedChannelIds: channelInfo.RelatedChannelIds,
-					DataTopic:         channelInfo.DataTopic,
-					CreatedAt:         channelInfo.CreatedAt,
-				})
-			}
-		}()
+	// 获取频道信息并记录到本地
+	go func() {
+		channelInfo, err := connector.GetChannelInfo(channelID)
+		if err == nil && channelInfo != nil && channelInfo.Found {
+			// 记录频道信息到本地
+			connector.RecordChannelFromNotification(&pb.ChannelNotification{
+				ChannelId:         channelInfo.ChannelId,
+				CreatorId:         channelInfo.CreatorId,
+				SenderIds:         channelInfo.SenderIds,
+				ReceiverIds:       channelInfo.ReceiverIds,
+				Encrypted:         channelInfo.Encrypted,
+				DataTopic:         channelInfo.DataTopic,
+				CreatedAt:         channelInfo.CreatedAt,
+			})
+		}
+	}()
 
 	// 在goroutine中接收数据
 	go func() {
@@ -935,14 +849,15 @@ func handleSubscribe(connector *client.Connector, args []string) {
 				}
 			} else {
 				// 普通数据包，显示文本
-			senderInfo := ""
-			if packet.SenderId != "" {
-				senderInfo = fmt.Sprintf("来自 %s, ", packet.SenderId)
-			}
-			fmt.Printf("📦 [序列号: %d] %s数据: %s\n", packet.SequenceNumber, senderInfo, string(packet.Payload))
+				senderInfo := ""
+				if packet.SenderId != "" {
+					senderInfo = fmt.Sprintf("来自 %s, ", packet.SenderId)
+				}
+				fmt.Printf("📦 [序列号: %d] %s数据: %s\n", packet.SequenceNumber, senderInfo, string(packet.Payload))
 			}
 			return nil
 		})
+
 		if err != nil {
 			fmt.Printf("❌ 接收失败: %v\n", err)
 		} else {
@@ -1346,9 +1261,7 @@ func handleChannels(connector *client.Connector) {
 				CreatorId:         channelInfo.CreatorId,
 				SenderIds:         channelInfo.SenderIds,
 				ReceiverIds:       channelInfo.ReceiverIds,
-				ChannelType:       channelInfo.ChannelType,
 				Encrypted:        channelInfo.Encrypted,
-				RelatedChannelIds: channelInfo.RelatedChannelIds,
 				DataTopic:        channelInfo.DataTopic,
 				CreatedAt:        channelInfo.CreatedAt,
 			})

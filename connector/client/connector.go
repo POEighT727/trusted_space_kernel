@@ -37,9 +37,7 @@ type LocalChannelInfo struct {
 	CreatorID    string
 	SenderID     string
 	ReceiverID   string
-	ChannelType  pb.ChannelType
 	Encrypted    bool
-	RelatedChannelIDs []string
 	Participants []string // 保留兼容性
 	CreatedAt    int64
 	IsEvidenceChannel bool // 是否为存证频道
@@ -218,12 +216,7 @@ func (c *Connector) addOrUpdateLocalChannel(info *LocalChannelInfo) {
 		if info.ReceiverID != "" {
 			existing.ReceiverID = info.ReceiverID
 		}
-		if info.ChannelType != pb.ChannelType_CHANNEL_TYPE_UNKNOWN {
-			existing.ChannelType = info.ChannelType
-		}
-		if len(info.RelatedChannelIDs) > 0 {
-			existing.RelatedChannelIDs = info.RelatedChannelIDs
-		}
+		// 统一频道不再需要ChannelType和RelatedChannelIDs
 		if len(info.Participants) > 0 {
 			existing.Participants = info.Participants
 		}
@@ -441,29 +434,23 @@ func (c *Connector) ReceiveData(channelID string, handler func(*pb.DataPacket) e
 
 		log.Printf("✓ Received packet #%d (%d bytes)", packet.SequenceNumber, len(packet.Payload))
 
-		// 检查数据包类型，过滤掉非数据频道应该接收的内容
-		if c.isEvidenceChannel(channelID) {
-			// 存证频道：继续使用原有逻辑
+		// 在统一频道模式下，根据payload内容判断消息类型
+		if c.isEvidenceData(packet.Payload) {
+			// 存证数据：继续使用原有逻辑
 			if err := c.processEvidencePacket(packet); err != nil {
 				log.Printf("⚠ Failed to process evidence packet: %v", err)
 			}
-		} else if c.isControlChannel(channelID) {
-			// 控制频道：处理控制消息
+		} else if c.isControlMessage(packet.Payload) {
+			// 控制消息：处理控制消息
 			if err := c.processControlPacket(packet); err != nil {
 				log.Printf("⚠ Failed to process control packet: %v", err)
 			}
 		} else {
-			// 数据频道：只处理普通数据，跳过证据数据和控制消息
-			if !c.isEvidenceData(packet.Payload) && !c.isControlMessage(packet.Payload) {
-				// 调用处理函数处理普通数据
-				if handler != nil {
-					if err := handler(packet); err != nil {
-						log.Printf("⚠ Handler error: %v", err)
-					}
+			// 业务数据：调用处理函数
+			if handler != nil {
+				if err := handler(packet); err != nil {
+					log.Printf("⚠ Handler error: %v", err)
 				}
-			} else {
-				// 跳过证据数据和控制消息，减少日志输出
-				// log.Printf("⏭️ Skipped non-data packet #%d in data channel %s", packet.SequenceNumber, channelID)
 			}
 		}
 	}
@@ -1051,24 +1038,11 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 					senderInfo := fmt.Sprintf("%v", notification.SenderIds)
 					receiverInfo := fmt.Sprintf("%v", notification.ReceiverIds)
 
-					// 检查频道类型
-					isEvidenceChannel := strings.HasSuffix(notification.DataTopic, "-evidence")
-					isControlChannel := strings.HasSuffix(notification.DataTopic, "-control")
+					// 统一频道模式
+					log.Printf("📢 统一频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
+							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
 
-					if isEvidenceChannel {
-						log.Printf("📋 存证频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
-							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
-						log.Printf("✓ 自动订阅存证频道以接收分布式存证数据")
-					} else if isControlChannel {
-						log.Printf("🎛️ 控制频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
-							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
-						log.Printf("✓ 自动订阅控制频道以接收控制消息")
-					} else {
-						log.Printf("📢 数据频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
-							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
-					}
-
-						// 自动订阅逻辑
+					// 自动订阅逻辑
 						go func(chID string, isEvidence bool, isControl bool) {
 							if isEvidence {
 								// 存证频道的特殊处理
@@ -1148,7 +1122,7 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 									log.Printf("✓ 频道 %s 已关闭", chID)
 								}
 							}
-						}(notification.ChannelId, isEvidenceChannel, isControlChannel)
+						}(notification.ChannelId, false, false)
 					} else if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_REJECTED {
 						// 频道提议已被拒绝
 						log.Printf("❌ 频道提议已被拒绝: %s (创建者: %s)",
@@ -1379,8 +1353,7 @@ func (c *Connector) ProposeChannel(senderIDs []string, receiverIDs []string, dat
 		SenderIds:      senderIDs,
 		ReceiverIds:    receiverIDs,
 		DataTopic:      dataTopic,
-		ChannelType:    pb.ChannelType_CHANNEL_TYPE_DATA,
-		Encrypted:      true, // 数据频道默认加密
+		Encrypted:      true, // 统一频道默认加密
 		ApproverId:     approverID, // 权限变更批准者
 		Reason:         reason,
 		TimeoutSeconds: 300, // 默认5分钟超时
@@ -1414,9 +1387,7 @@ func (c *Connector) ProposeChannel(senderIDs []string, receiverIDs []string, dat
 		DataTopic:    dataTopic,
 		CreatorID:    creatorID,
 		Participants: participants,
-		ChannelType:  pb.ChannelType_CHANNEL_TYPE_DATA,
 		Encrypted:    true,
-		RelatedChannelIDs: []string{},
 		CreatedAt:    time.Now().Unix(),
 	})
 
@@ -1972,18 +1943,7 @@ func (c *Connector) isEvidenceChannel(channelID string) bool {
 	return channel.IsEvidenceChannel
 }
 
-// isControlChannel 检查是否为控制频道
-func (c *Connector) isControlChannel(channelID string) bool {
-	c.channelsMu.RLock()
-	defer c.channelsMu.RUnlock()
-
-	channel, exists := c.channels[channelID]
-	if !exists {
-		return false
-	}
-
-	return channel.ChannelType == pb.ChannelType_CHANNEL_TYPE_CONTROL
-}
+// isControlChannel 函数已移除，在统一频道模式下不再需要
 
 // isEvidenceData 检查数据包是否为证据数据
 func (c *Connector) isEvidenceData(payload []byte) bool {

@@ -599,48 +599,20 @@ func (al *AuditLog) loadFromFile(filePath string) error {
 	return nil
 }
 
-// transmitEvidenceViaChannel 通过频道传输存证数据
+// transmitEvidenceViaChannel 通过统一频道传输存证数据
 func (al *AuditLog) transmitEvidenceViaChannel(record *EvidenceRecord) error {
 	if al.channelManager == nil {
 		// 如果没有频道管理器，跳过频道传输
 		return nil
 	}
 
-	// 如果存证记录关联了频道，尝试通过对应的存证频道传输
+	// 如果存证记录关联了频道，直接通过该频道传输存证数据
 	if record.ChannelID != "" {
-		cm, ok := al.channelManager.(*circulation.ChannelManager)
-		if !ok {
-			return fmt.Errorf("invalid channel manager type")
-		}
-
-		// 查找数据频道
-		dataChannel, err := cm.GetChannel(record.ChannelID)
-		if err != nil {
-			// 数据频道不存在，跳过频道传输
-			return nil
-		}
-
-		// 查找对应的存证频道
-		var evidenceChannelID string
-		for _, relatedID := range dataChannel.RelatedChannelIDs {
-			relatedChannel, err := cm.GetChannel(relatedID)
-			if err != nil {
-				continue
-			}
-			if relatedChannel.ChannelType == circulation.ChannelTypeLog &&
-			   relatedChannel.DataTopic == dataChannel.DataTopic+"-evidence" {
-				evidenceChannelID = relatedID
-				break
-			}
-		}
-
-		if evidenceChannelID != "" {
-			// 通过存证频道传输存证数据
-			return al.sendEvidenceToChannel(evidenceChannelID, record)
-		}
+		// 通过统一频道传输存证数据（使用存证消息类型）
+		return al.sendEvidenceToChannel(record.ChannelID, record)
 	}
 
-	// 没有找到对应的存证频道，跳过频道传输
+	// 没有关联频道，跳过频道传输
 	return nil
 }
 
@@ -673,6 +645,7 @@ func (al *AuditLog) sendEvidenceToChannel(channelID string, record *EvidenceReco
 		Timestamp:      record.Timestamp.Unix(),
 		SenderID:       record.ConnectorID, // 使用原始存证记录的连接器ID作为发送方
 		TargetIDs:      []string{}, // 广播给所有订阅者
+		MessageType:    circulation.MessageTypeEvidence, // 设置为存证消息类型
 	}
 
 	// 发送到频道
