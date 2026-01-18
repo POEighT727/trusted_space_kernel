@@ -4,12 +4,13 @@ package trusted_space.kernel.v1;
 
 option go_package = "github.com/trusted-space/kernel/api/v1;kernelv1";
 
-// 频道类型
+// 频道类型 - 已废弃（统一频道架构，所有频道都是相同类型）
+// 保留此枚举仅为向后兼容性
 enum ChannelType {
   CHANNEL_TYPE_UNKNOWN = 0;
-  CHANNEL_TYPE_DATA = 1;      // 真实数据频道（加密传输）
-  CHANNEL_TYPE_CONTROL = 2;   // 控制数据频道（明文传输）
-  CHANNEL_TYPE_LOG = 3;       // 日志数据频道（明文传输，用于分布式存证）
+  CHANNEL_TYPE_DATA = 1;      // 统一频道（支持所有消息类型）
+  reserved 2, 3;              // CHANNEL_TYPE_CONTROL, CHANNEL_TYPE_LOG 已移除
+  reserved "CHANNEL_TYPE_CONTROL", "CHANNEL_TYPE_LOG";
 }
 
 // ------------------------------------------------------------
@@ -62,17 +63,21 @@ message CreateChannelRequest {
   repeated string sender_ids = 2;     // 发送方ID列表（至少一个，必须指定）
   repeated string receiver_ids = 3;   // 接收方ID列表（至少一个，必须指定）
   string data_topic = 4;        // 数据主题/业务标识
-  ChannelType channel_type = 5; // 频道类型（默认为数据频道）
-  bool encrypted = 6;           // 是否加密传输（数据频道默认true，控制/日志频道默认false）
-  bool create_related_channels = 7; // 是否创建关联频道（数据频道会自动创建控制频道和存证日志频道）
+  // ChannelType channel_type = 5; // 已废弃 - 统一频道架构，所有频道都是相同类型
+  bool encrypted = 6;           // 是否加密传输
+  // bool create_related_channels = 7; // 已废弃 - 统一频道架构，不再创建关联频道
   string access_token = 8;      // 访问凭证（可选，用于额外鉴权）
+  reserved 5, 7;
+  reserved "channel_type", "create_related_channels";
 }
 
 message CreateChannelResponse {
-  string channel_id = 1;        // 全局唯一的频道ID（主频道）
-  repeated string related_channel_ids = 2; // 关联频道ID列表（控制频道、日志频道等）
+  string channel_id = 1;        // 全局唯一的频道ID
+  // repeated string related_channel_ids = 2; // 已废弃 - 统一频道架构，无关联频道
   bool authorized = 3;          // 权限检查结果
   string message = 4;
+  reserved 2;
+  reserved "related_channel_ids";
 }
 
 message DataPacket {
@@ -129,13 +134,16 @@ message ChannelNotification {
   string creator_id = 2;   // 创建者ID
   repeated string sender_ids = 3;    // 发送方ID列表
   repeated string receiver_ids = 4;   // 接收方ID列表
-  ChannelType channel_type = 5; // 频道类型
+  // ChannelType channel_type = 5; // 已废弃 - 统一频道架构
   bool encrypted = 6;      // 是否加密
-  repeated string related_channel_ids = 7; // 关联频道ID列表
+  // repeated string related_channel_ids = 7; // 已废弃 - 无关联频道
   string data_topic = 8;    // 数据主题
   int64 created_at = 9;     // 创建时间
   ChannelNegotiationStatus negotiation_status = 10; // 协商状态
   string proposal_id = 11;  // 提议ID（协商中时）
+  EvidenceConfig evidence_config = 12; // 存证配置（可选）
+  reserved 5, 7;
+  reserved "channel_type", "related_channel_ids";
 }
 
 // 获取频道信息请求
@@ -152,16 +160,19 @@ message GetChannelInfoResponse {
   string approver_id = 16;           // 权限变更批准者ID
   repeated string sender_ids = 4;          // 发送方ID列表
   repeated string receiver_ids = 5;        // 接收方ID列表
-  ChannelType channel_type = 6;     // 频道类型
+  // ChannelType channel_type = 6;     // 已废弃 - 统一频道架构
   bool encrypted = 7;               // 是否加密传输
-  repeated string related_channel_ids = 8; // 关联频道ID列表
+  // repeated string related_channel_ids = 8; // 已废弃 - 无关联频道
   string data_topic = 9;             // 数据主题
   string status = 10;                 // 频道状态 (active, closed)
   int64 created_at = 11;              // 创建时间
   int64 last_activity = 12;           // 最后活动时间
   ChannelNegotiationStatus negotiation_status = 14; // 协商状态
   string proposal_id = 15;            // 提议ID（如果处于协商中）
+  EvidenceConfig evidence_config = 17; // 存证配置（可选）
   string message = 13;                // 消息
+  reserved 6, 8;
+  reserved "channel_type", "related_channel_ids";
 }
 
 // ------------------------------------------------------------
@@ -180,13 +191,15 @@ message ProposeChannelRequest {
   repeated string sender_ids = 2;     // 发送方ID列表（至少一个，必须指定）
   repeated string receiver_ids = 3;   // 接收方ID列表（至少一个，必须指定）
   string data_topic = 4;        // 数据主题/业务标识
-  ChannelType channel_type = 5; // 频道类型（默认为数据频道）
+  // ChannelType channel_type = 5; // 已废弃 - 统一频道架构
   bool encrypted = 6;           // 是否加密传输
   string approver_id = 9;       // 权限变更批准者ID（默认是创建者，可选）
   string reason = 7;            // 创建理由说明
   int32 timeout_seconds = 8;    // 提议超时时间（秒，默认300秒）
   string config_file_path = 10; // 配置文件路径（可选，由创建者指定）
   EvidenceConfig evidence_config = 11; // 存证配置（可选）
+  reserved 5;
+  reserved "channel_type";
 }
 
 message EvidenceConfig {

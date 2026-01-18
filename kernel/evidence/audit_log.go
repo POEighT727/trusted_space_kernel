@@ -290,7 +290,9 @@ func (al *AuditLog) SubmitEvidenceWithFlowID(flowID, connectorID string, eventTy
 	}
 	}
 
-	// 通过频道传输存证数据（分布式存储）
+	// 通过频道传输存证数据
+	// 外部存证模式：只发送给指定外部存证连接器
+	// 内部存证模式：广播给所有订阅者（分布式存储）
 	if err := al.transmitEvidenceViaChannel(record); err != nil {
 		log.Printf("⚠️ Failed to transmit evidence via channel: %v", err)
 		// 不返回错误，因为证据已经存储，只是分发失败
@@ -637,6 +639,32 @@ func (al *AuditLog) sendEvidenceToChannel(channelID string, record *EvidenceReco
 	// 创建数据包
 	sequenceNumber := int64(len(al.records)) // 使用记录总数作为序列号
 
+	// 根据存证配置确定发送目标
+	var targetIDs []string
+	if channel.EvidenceConfig != nil {
+		switch channel.EvidenceConfig.Mode {
+		case circulation.EvidenceModeExternal:
+			// 外部存证：只发送给外部存证连接器
+			if channel.EvidenceConfig.ConnectorID != "" {
+				targetIDs = []string{channel.EvidenceConfig.ConnectorID}
+			} else {
+				return fmt.Errorf("external evidence mode requires connector ID")
+			}
+		case circulation.EvidenceModeInternal:
+			// 内部存证：广播给所有订阅者（用于分布式存储）
+			targetIDs = []string{}
+		case circulation.EvidenceModeHybrid:
+			// 混合存证：发送给所有订阅者（包括外部存证连接器）
+			targetIDs = []string{}
+		default:
+			// 默认广播
+			targetIDs = []string{}
+		}
+	} else {
+		// 没有存证配置，广播给所有订阅者
+		targetIDs = []string{}
+	}
+
 	packet := &circulation.DataPacket{
 		ChannelID:      channelID,
 		SequenceNumber: sequenceNumber,
@@ -644,7 +672,7 @@ func (al *AuditLog) sendEvidenceToChannel(channelID string, record *EvidenceReco
 		Signature:      "", // 存证数据由系统生成，暂时不需要签名
 		Timestamp:      record.Timestamp.Unix(),
 		SenderID:       record.ConnectorID, // 使用原始存证记录的连接器ID作为发送方
-		TargetIDs:      []string{}, // 广播给所有订阅者
+		TargetIDs:      targetIDs, // 根据存证模式确定发送目标
 		MessageType:    circulation.MessageTypeEvidence, // 设置为存证消息类型
 	}
 

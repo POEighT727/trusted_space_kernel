@@ -141,12 +141,25 @@ func (s *IdentityServiceServer) sendChannelRecoveryNotifications(connectorID str
 						CreatorId:         channel.CreatorID,
 						SenderIds:         channel.SenderIDs,
 						ReceiverIds:       channel.ReceiverIDs,
-						ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
+						// ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 已废弃
 						Encrypted:         channel.Encrypted,
-						RelatedChannelIds: []string{}, // 统一频道无关联频道
+						// RelatedChannelIds: []string{}, // 已废弃
 						DataTopic:         channel.DataTopic,
 						CreatedAt:         channel.CreatedAt.Unix(),
 						NegotiationStatus: negotiationStatus,
+					}
+
+					// 添加存证配置（如果有）
+					if channel.EvidenceConfig != nil {
+						notification.EvidenceConfig = &pb.EvidenceConfig{
+							Mode:           string(channel.EvidenceConfig.Mode),
+							Strategy:       string(channel.EvidenceConfig.Strategy),
+							ConnectorId:    channel.EvidenceConfig.ConnectorID,
+							BackupEnabled:  channel.EvidenceConfig.BackupEnabled,
+							RetentionDays:  int32(channel.EvidenceConfig.RetentionDays),
+							CompressData:   channel.EvidenceConfig.CompressData,
+							CustomSettings: channel.EvidenceConfig.CustomSettings,
+						}
 					}
 
 					// 发送通知

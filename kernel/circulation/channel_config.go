@@ -9,11 +9,13 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ChannelConfigFile 频道配置文件结构
 type ChannelConfigFile struct {
-	ChannelID       string          `json:"channel_id"`
+	ChannelName     string          `json:"channel_name"`
 	Name            string          `json:"name"`
 	Description     string          `json:"description"`
 	CreatorID       string          `json:"creator_id"`
@@ -23,8 +25,8 @@ type ChannelConfigFile struct {
 	DataTopic       string          `json:"data_topic"`
 	Encrypted       bool            `json:"encrypted"`
 	EvidenceConfig  *EvidenceConfig `json:"evidence_config"`
-	CreatedAt       time.Time       `json:"created_at"`
-	UpdatedAt       time.Time       `json:"updated_at"`
+	CreatedAt       *time.Time      `json:"created_at,omitempty"`
+	UpdatedAt       *time.Time      `json:"updated_at,omitempty"`
 	Version         int             `json:"version"`
 }
 
@@ -73,15 +75,16 @@ func (cm *ChannelConfigManager) SaveConfig(config *ChannelConfigFile) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	if config.ChannelID == "" {
-		return fmt.Errorf("channel ID cannot be empty")
+	if config.ChannelName == "" {
+		return fmt.Errorf("channel name cannot be empty")
 	}
 
 	// 更新时间戳和版本
-	config.UpdatedAt = time.Now()
+	now := time.Now()
+	config.UpdatedAt = &now
 	if config.Version == 0 {
 		config.Version = 1
-		config.CreatedAt = time.Now()
+		config.CreatedAt = &now
 	} else {
 		config.Version++
 	}
@@ -93,7 +96,7 @@ func (cm *ChannelConfigManager) SaveConfig(config *ChannelConfigFile) error {
 	}
 
 	// 写入文件
-	filename := fmt.Sprintf("%s.json", config.ChannelID)
+	filename := fmt.Sprintf("%s.json", config.ChannelName)
 	filepath := filepath.Join(cm.configDir, filename)
 
 	if err := ioutil.WriteFile(filepath, data, 0644); err != nil {
@@ -101,9 +104,9 @@ func (cm *ChannelConfigManager) SaveConfig(config *ChannelConfigFile) error {
 	}
 
 	// 更新内存缓存
-	cm.configs[config.ChannelID] = config
+	cm.configs[config.ChannelName] = config
 
-	log.Printf("✓ Channel config saved: %s", config.ChannelID)
+	log.Printf("✓ Channel config saved: %s", config.ChannelName)
 	return nil
 }
 
@@ -174,8 +177,9 @@ func (cm *ChannelConfigManager) ListConfigs() []*ChannelConfigFile {
 
 // CreateConfigFromChannel 从Channel创建配置文件
 func (cm *ChannelConfigManager) CreateConfigFromChannel(channel *Channel, name, description string) *ChannelConfigFile {
+	now := time.Now()
 	config := &ChannelConfigFile{
-		ChannelID:      channel.ChannelID,
+		ChannelName:    channel.ChannelName,
 		Name:           name,
 		Description:    description,
 		CreatorID:      channel.CreatorID,
@@ -185,8 +189,8 @@ func (cm *ChannelConfigManager) CreateConfigFromChannel(channel *Channel, name, 
 		DataTopic:      channel.DataTopic,
 		Encrypted:      channel.Encrypted,
 		EvidenceConfig: channel.EvidenceConfig,
-		CreatedAt:      channel.CreatedAt,
-		UpdatedAt:      time.Now(),
+		CreatedAt:      &channel.CreatedAt,
+		UpdatedAt:      &now,
 		Version:        1,
 	}
 
@@ -199,8 +203,15 @@ func (cm *ChannelConfigManager) CreateConfigFromChannel(channel *Channel, name, 
 
 // CreateChannelFromConfig 从配置文件创建Channel
 func (cm *ChannelConfigManager) CreateChannelFromConfig(config *ChannelConfigFile) *Channel {
+	// 处理创建时间
+	createdAt := time.Now()
+	if config.CreatedAt != nil {
+		createdAt = *config.CreatedAt
+	}
+
 	channel := &Channel{
-		ChannelID:      config.ChannelID,
+		ChannelID:      uuid.New().String(),
+		ChannelName:    config.ChannelName,
 		CreatorID:      config.CreatorID,
 		ApproverID:     config.ApproverID,
 		SenderIDs:      make([]string, len(config.SenderIDs)),
@@ -208,7 +219,7 @@ func (cm *ChannelConfigManager) CreateChannelFromConfig(config *ChannelConfigFil
 		Encrypted:      config.Encrypted,
 		DataTopic:      config.DataTopic,
 		Status:         ChannelStatusActive,
-		CreatedAt:      config.CreatedAt,
+		CreatedAt:      createdAt,
 		LastActivity:   time.Now(),
 		EvidenceConfig: config.EvidenceConfig,
 		dataQueue:      make(chan *DataPacket, 1000),

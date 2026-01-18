@@ -675,6 +675,7 @@ func (c *Connector) initializeEvidenceStorage() error {
 		evidenceDir = "./evidence" // 默认路径
 	}
 
+	// 确保存证目录存在
 	if err := os.MkdirAll(evidenceDir, 0755); err != nil {
 		return fmt.Errorf("failed to create evidence directory: %w", err)
 	}
@@ -1326,7 +1327,7 @@ func (c *Connector) GetPermissionRequests(channelID string) (*pb.GetPermissionRe
 
 // ChannelConfigFile 频道配置文件结构（与kernel中的定义保持一致）
 type ChannelConfigFile struct {
-	ChannelID       string          `json:"channel_id"`
+	ChannelName     string          `json:"channel_name"`
 	Name            string          `json:"name"`
 	Description     string          `json:"description"`
 	CreatorID       string          `json:"creator_id"`
@@ -1336,8 +1337,8 @@ type ChannelConfigFile struct {
 	DataTopic       string          `json:"data_topic"`
 	Encrypted       bool            `json:"encrypted"`
 	EvidenceConfig  *EvidenceConfig `json:"evidence_config"`
-	CreatedAt       time.Time       `json:"created_at"`
-	UpdatedAt       time.Time       `json:"updated_at"`
+	CreatedAt       *time.Time      `json:"created_at,omitempty"`
+	UpdatedAt       *time.Time      `json:"updated_at,omitempty"`
 	Version         int             `json:"version"`
 }
 
@@ -1367,8 +1368,8 @@ func (c *Connector) CreateChannelFromConfig(configFilePath string) (*ChannelConf
 	}
 
 	// 验证配置
-	if config.ChannelID == "" {
-		return nil, fmt.Errorf("channel_id is required in config file")
+	if config.ChannelName == "" {
+		return nil, fmt.Errorf("channel_name is required in config file")
 	}
 	if config.CreatorID == "" {
 		return nil, fmt.Errorf("creator_id is required in config file")
@@ -1386,6 +1387,23 @@ func (c *Connector) CreateChannelFromConfig(configFilePath string) (*ChannelConf
 	// 验证当前连接器是否是创建者
 	if config.CreatorID != c.connectorID {
 		return nil, fmt.Errorf("current connector (%s) is not the creator (%s) specified in config file", c.connectorID, config.CreatorID)
+	}
+
+	// 如果配置了外部存证，自动将外部存证连接器添加到接收方列表
+	if config.EvidenceConfig != nil && config.EvidenceConfig.Mode == "external" && config.EvidenceConfig.ConnectorID != "" {
+		externalConnectorID := config.EvidenceConfig.ConnectorID
+		// 检查是否已经在接收方列表中
+		alreadyInReceivers := false
+		for _, receiverID := range config.ReceiverIDs {
+			if receiverID == externalConnectorID {
+				alreadyInReceivers = true
+				break
+			}
+		}
+		if !alreadyInReceivers {
+			config.ReceiverIDs = append(config.ReceiverIDs, externalConnectorID)
+			log.Printf("✓ 外部存证连接器 %s 已自动添加到接收方列表", externalConnectorID)
+		}
 	}
 
 	// 转换存证配置（如果有）
@@ -1424,7 +1442,7 @@ func (c *Connector) CreateChannelFromConfig(configFilePath string) (*ChannelConf
 		return nil, fmt.Errorf("failed to propose channel: %s", resp.Message)
 	}
 
-	log.Printf("✓ Channel created from config file: %s (%s)", config.ChannelID, configFilePath)
+	log.Printf("✓ Channel created from config file: %s (%s)", config.ChannelName, configFilePath)
 	return &config, nil
 }
 
@@ -1886,6 +1904,22 @@ func (fr *FileReceiver) handleFileEnd(jsonData []byte) error {
 	fr.transfersMu.Lock()
 	transfer, exists := fr.transfers[end.TransferID]
 	if !exists {
+		// 检查是否能找到对应的文件（通过文件名模式匹配）
+		// 由于FileEnd中没有文件名，我们需要查找可能的已完成文件
+		files, err := os.ReadDir(fr.outputPath)
+		if err == nil {
+			for _, file := range files {
+				if !file.IsDir() {
+					// 检查文件是否刚刚创建（在最近几秒内）
+					info, err := file.Info()
+					if err == nil && time.Since(info.ModTime()) < 30*time.Second {
+						fr.transfersMu.Unlock()
+						log.Printf("✓ 检测到最近完成的文件传输，忽略重复的FileEnd包 (传输ID: %s, 文件: %s)", end.TransferID, file.Name())
+						return nil
+					}
+				}
+			}
+		}
 		fr.transfersMu.Unlock()
 		return fmt.Errorf("file header not received for transfer ID: %s", end.TransferID)
 	}

@@ -1,7 +1,7 @@
 {
-  "channel_name": "channel-A-to-B-with-evidence",
-  "name": "带存证的数据传输频道",
-  "description": "connector-A 向 connector-B 的数据传输频道（包含存证）",
+  "channel_name": "channel-A-to-B-external-evidence",
+  "name": "外部存证数据传输频道",
+  "description": "connector-A 向 connector-B 的数据传输频道（使用外部存证connector-C）",
   "creator_id": "connector-A",
   "approver_id": "connector-A",
   "sender_ids": ["connector-A"],

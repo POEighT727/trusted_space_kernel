@@ -1,7 +1,7 @@
 {
-  "channel_name": "channel-A-to-B-with-evidence",
-  "name": "带存证的数据传输频道",
-  "description": "connector-A 向 connector-B 的数据传输频道（包含存证）",
+  "channel_name": "channel-A-to-B-external-evidence",
+  "name": "外部存证数据传输频道",
+  "description": "connector-A 向 connector-B 的数据传输频道（使用外部存证ubuntu）",
   "creator_id": "connector-A",
   "approver_id": "connector-A",
   "sender_ids": ["connector-A"],
@@ -11,7 +11,7 @@
   "evidence_config": {
     "mode": "external",
     "strategy": "all",
-    "connector_id": "connector-C",
+    "connector_id": "connector-X",
     "backup_enabled": false,
     "retention_days": 30,
     "compress_data": true,

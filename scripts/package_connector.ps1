@@ -38,6 +38,12 @@ New-Item -ItemType Directory -Path "$OutputDir\$PackageName\certs" -Force | Out-
 # 创建接收文件目录
 New-Item -ItemType Directory -Path "$OutputDir\$PackageName\received" -Force | Out-Null
 
+# 创建存证目录结构和初始文件
+New-Item -ItemType Directory -Path "$OutputDir\$PackageName\evidence" -Force | Out-Null
+"# 存证数据目录`n# 连接器运行时会自动创建和更新 evidence.log 文件" | Out-File -FilePath "$OutputDir\$PackageName\evidence\.gitkeep" -Encoding UTF8
+# 创建空的evidence.log文件
+New-Item -ItemType File -Path "$OutputDir\$PackageName\evidence\evidence.log" -Force | Out-Null
+
 # 创建 README
 $ReadmeContent = @"
 # 连接器独立部署包
@@ -99,6 +105,8 @@ connector-{version}/
 │   └── connector-template.yaml  # 配置模板
 ├── certs/             # 证书目录（首次运行后自动生成）
 ├── received/          # 接收文件目录
+├── evidence/          # 存证数据目录
+│   └── evidence.log   # 存证日志文件（运行时自动更新）
 └── README.md          # 本文件
 ```
 
@@ -116,6 +124,12 @@ connector-{version}/
 - `status <active|inactive|closed>` - 设置连接器状态
 - `discover` - 发现其他连接器
 - `info <connector-id>` - 查看连接器信息
+- `propose <receivers> <data-topic> <approver>` - 提议创建频道
+- `accept <channel-id> <proposal-id>` - 接受频道提议
+- `reject <channel-id> <proposal-id> <reason>` - 拒绝频道提议
+- `request <channel-id> <change-type> <target-id> <reason>` - 请求权限变更
+- `approve <channel-id> <request-id>` - 批准权限变更
+- `deny <channel-id> <request-id> <reason>` - 拒绝权限变更
 - `exit` 或 `quit` - 退出
 
 ## 故障排查

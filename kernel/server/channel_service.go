@@ -160,13 +160,24 @@ func (s *ChannelServiceServer) notifyChannelCreated(channel *circulation.Channel
 		CreatorId:         channel.CreatorID,
 		SenderIds:         channel.SenderIDs,
 		ReceiverIds:       channel.ReceiverIDs,
-		ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道都作为数据频道处理
 		Encrypted:         channel.Encrypted,
-		RelatedChannelIds: []string{}, // 统一频道不再有关联频道
 		DataTopic:         channel.DataTopic,
 		CreatedAt:         channel.CreatedAt.Unix(),
 		NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED, // 异步创建的频道直接激活
 		ProposalId:        "", // 异步创建的频道没有提议ID
+	}
+
+	// 添加存证配置（如果有）
+	if channel.EvidenceConfig != nil {
+		notification.EvidenceConfig = &pb.EvidenceConfig{
+			Mode:           string(channel.EvidenceConfig.Mode),
+			Strategy:       string(channel.EvidenceConfig.Strategy),
+			ConnectorId:    channel.EvidenceConfig.ConnectorID,
+			BackupEnabled:  channel.EvidenceConfig.BackupEnabled,
+			RetentionDays:  int32(channel.EvidenceConfig.RetentionDays),
+			CompressData:   channel.EvidenceConfig.CompressData,
+			CustomSettings: channel.EvidenceConfig.CustomSettings,
+		}
 	}
 
 	// 异步发送通知
@@ -391,7 +402,7 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 			"senders":     fmt.Sprintf("%v", req.SenderIds),
 			"receivers":   fmt.Sprintf("%v", req.ReceiverIds),
 			"data_topic":  req.DataTopic,
-			"channel_type": req.ChannelType.String(),
+			"channel_type": "unified", // 统一频道架构
 			"encrypted":   fmt.Sprintf("%v", encrypted),
 			"reason":      req.Reason,
 			"context":     "channel_proposal",
@@ -405,12 +416,17 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 			CreatorId:         creatorID,
 			SenderIds:         req.SenderIds,
 			ReceiverIds:       req.ReceiverIds,
-			ChannelType:       req.ChannelType,
+			// ChannelType:       req.ChannelType, // 已废弃 - 统一频道架构
 			Encrypted:         encrypted,
 			DataTopic:         req.DataTopic,
 			CreatedAt:         channel.CreatedAt.Unix(),
 			NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_PROPOSED,
 			ProposalId:        channel.ChannelProposal.ProposalID,
+		}
+
+		// 添加存证配置（如果有）
+		if req.EvidenceConfig != nil {
+			notification.EvidenceConfig = req.EvidenceConfig
 		}
 
 		// 通知所有接收方需要接受提议（创建者除外，因为已自动接受）
@@ -517,13 +533,24 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 				CreatorId:         channel.CreatorID,
 				SenderIds:         channel.SenderIDs,
 				ReceiverIds:       channel.ReceiverIDs,
-				ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA,
 				Encrypted:         channel.Encrypted,
-				RelatedChannelIds: []string{},
 				DataTopic:         channel.DataTopic,
 				CreatedAt:         channel.CreatedAt.Unix(),
 				NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED,
 				ProposalId:        channel.ChannelProposal.ProposalID,
+			}
+
+			// 添加存证配置（如果有）
+			if channel.EvidenceConfig != nil {
+				notification.EvidenceConfig = &pb.EvidenceConfig{
+					Mode:           string(channel.EvidenceConfig.Mode),
+					Strategy:       string(channel.EvidenceConfig.Strategy),
+					ConnectorId:    channel.EvidenceConfig.ConnectorID,
+					BackupEnabled:  channel.EvidenceConfig.BackupEnabled,
+					RetentionDays:  int32(channel.EvidenceConfig.RetentionDays),
+					CompressData:   channel.EvidenceConfig.CompressData,
+					CustomSettings: channel.EvidenceConfig.CustomSettings,
+				}
 			}
 
 			// 通知所有发送方
@@ -618,7 +645,6 @@ func (s *ChannelServiceServer) RejectChannelProposal(ctx context.Context, req *p
 			CreatorId:         channel.CreatorID,
 			SenderIds:         channel.SenderIDs,
 			ReceiverIds:       channel.ReceiverIDs,
-			ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
 			Encrypted:         channel.Encrypted,
 			DataTopic:         channel.DataTopic,
 			CreatedAt:         channel.CreatedAt.Unix(),
@@ -824,12 +850,23 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 				CreatorId:         channel.CreatorID,
 				SenderIds:         channel.SenderIDs,
 				ReceiverIds:       channel.ReceiverIDs,
-				ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
 				Encrypted:         channel.Encrypted,
-				RelatedChannelIds: []string{},
 				DataTopic:         channel.DataTopic,
 				CreatedAt:         channel.CreatedAt.Unix(),
 				NegotiationStatus: negotiationStatus,
+			}
+
+			// 添加存证配置（如果有）
+			if channel.EvidenceConfig != nil {
+				notification.EvidenceConfig = &pb.EvidenceConfig{
+					Mode:           string(channel.EvidenceConfig.Mode),
+					Strategy:       string(channel.EvidenceConfig.Strategy),
+					ConnectorId:    channel.EvidenceConfig.ConnectorID,
+					BackupEnabled:  channel.EvidenceConfig.BackupEnabled,
+					RetentionDays:  int32(channel.EvidenceConfig.RetentionDays),
+					CompressData:   channel.EvidenceConfig.CompressData,
+					CustomSettings: channel.EvidenceConfig.CustomSettings,
+				}
 			}
 
 			// 发送通知给重新连接的连接器
@@ -967,9 +1004,9 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 		CreatorId:         channel.CreatorID,
 		SenderIds:         channel.SenderIDs,
 		ReceiverIds:       channel.ReceiverIDs,
-		ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
+ // 统一频道
 		Encrypted:         channel.Encrypted,
-		RelatedChannelIds: []string{}, // 统一频道无关联频道
+ // 统一频道无关联频道
 		DataTopic:         channel.DataTopic,
 		CreatedAt:         channel.CreatedAt.Unix(),
 	}
@@ -1040,9 +1077,7 @@ func (s *ChannelServiceServer) GetChannelInfo(ctx context.Context, req *pb.GetCh
 		ApproverId:        channel.ApproverID,
 		SenderIds:         channel.SenderIDs,
 		ReceiverIds:       channel.ReceiverIDs,
-		ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
 		Encrypted:         channel.Encrypted,
-		RelatedChannelIds: []string{}, // 统一频道无关联频道
 		DataTopic:         channel.DataTopic,
 		Status:            string(channel.Status),
 		CreatedAt:         channel.CreatedAt.Unix(),
@@ -1320,9 +1355,9 @@ func (s *ChannelServiceServer) sendChannelUpdateNotification(channel *circulatio
 		CreatorId:         channel.CreatorID,
 		SenderIds:         channel.SenderIDs,
 		ReceiverIds:       channel.ReceiverIDs,
-		ChannelType:       pb.ChannelType_CHANNEL_TYPE_DATA, // 统一频道
+ // 统一频道
 		Encrypted:         channel.Encrypted,
-		RelatedChannelIds: []string{}, // 统一频道无关联频道
+ // 统一频道无关联频道
 		DataTopic:         channel.DataTopic,
 		CreatedAt:         channel.CreatedAt.Unix(),
 		NegotiationStatus: negotiationStatus,

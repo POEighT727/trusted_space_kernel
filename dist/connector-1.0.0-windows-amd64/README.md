@@ -67,7 +67,8 @@ connector-{version}/
 - create <channel-id> <data-topic> <receiver-id1,receiver-id2,...> - 鍒涘缓棰戦亾
 - sendto <channel-id> <message> - 鍙戦€佹暟鎹埌棰戦亾
 - sendto <channel-id> <file-path> - 鍙戦€佹枃浠跺埌棰戦亾
-- eceive <channel-id> - 鎺ユ敹棰戦亾鏁版嵁
+- 
+eceive <channel-id> - 鎺ユ敹棰戦亾鏁版嵁
 - subscribe <channel-id> - 璁㈤槄棰戦亾
 - channels - 鏌ョ湅褰撳墠鍙備笌鐨勯閬?
 - status - 鏌ョ湅杩炴帴鍣ㄧ姸鎬?
@@ -91,4 +92,5 @@ connector-{version}/
 
 ### 鏇村甯姪
 
-璇峰弬鑰冨畬鏁撮儴缃叉枃妗ｏ細docs\DEPLOYMENT.md
+璇峰弬鑰冨畬鏁撮儴缃叉枃妗ｏ細docs\DEPLOYMENT.md
+

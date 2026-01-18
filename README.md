@@ -155,7 +155,7 @@ go build -o bin/connector ./connector/cmd
 
 ```protobuf
 service IdentityService {
-  rpc Handshake (HandshakeRequest) returns (HandshakeResponse);
+  rpc Register (RegisterRequest) returns (RegisterResponse);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 }
 ```
@@ -168,6 +168,8 @@ service ChannelService {
   rpc StreamData (stream DataPacket) returns (stream TransferStatus);
   rpc SubscribeData (SubscribeRequest) returns (stream DataPacket);
   rpc CloseChannel (CloseChannelRequest) returns (CloseChannelResponse);
+  rpc GetChannelInfo (GetChannelInfoRequest) returns (GetChannelInfoResponse);
+  rpc ListChannels (ListChannelsRequest) returns (ListChannelsResponse);
 }
 ```
 
@@ -177,6 +179,7 @@ service ChannelService {
 service EvidenceService {
   rpc SubmitEvidence (EvidenceRequest) returns (EvidenceResponse);
   rpc QueryEvidence (QueryRequest) returns (QueryResponse);
+  rpc VerifyEvidence (VerifyEvidenceRequest) returns (VerifyEvidenceResponse);
 }
 ```
 
@@ -195,25 +198,31 @@ service EvidenceService {
 支持细粒度的访问控制：
 
 ```go
-// 示例：允许 connector-A 向 connector-B 发送特定主题的数据
+// 示例：允许 connector-A 向 connector-B 发送数据
 policyEngine.AddRule(&PolicyRule{
     SenderID:   "connector-A",
     ReceiverID: "connector-B",
-    DataTopics: []string{"data-type-1", "data-type-2"},
     Allowed:    true,
 })
 ```
 
+### 控制消息系统
+
+支持频道运行时的权限和配置管理：
+- **权限变更请求**：动态调整频道参与者权限
+- **频道提议**：多方协商创建频道
+- **状态同步**：实时同步频道状态变化
+
 ### 存证溯源
 
-所有关键操作自动记录：
-- `CHANNEL_CREATED`：频道创建
-- `TRANSFER_START`：传输开始
-- `TRANSFER_END`：传输结束
-- `AUTH_SUCCESS` / `AUTH_FAIL`：认证结果
-- `POLICY_VIOLATION`：策略违规
+所有关键操作自动记录并签名，确保不可抵赖：
+- `CHANNEL_CREATED/CLOSED`：频道生命周期
+- `TRANSFER_START/END`：数据传输过程
+- `AUTH_SUCCESS/FAIL`：认证结果
+- `PERMISSION_REQUEST/GRANTED`：权限变更
+- `CONNECTOR_REGISTERED/ONLINE/OFFLINE`：连接器状态
 
-存证记录采用链式结构，每条记录包含前一条记录的哈希，确保不可篡改。
+支持文件存储和数据库存储两种后端。
 
 ## 📂 项目结构
 
@@ -330,12 +339,24 @@ for _, record := range records {
 }
 ```
 
-## 📊 性能特性
+## 🔧 核心功能特性
 
+### 连接器功能
+- **文件传输**：支持大文件分块传输，带进度显示和完整性验证
+- **实时发送器**：支持流式数据持续发送
+- **连接器发现**：可发现和查询其他连接器信息
+- **频道管理**：完整的频道生命周期管理
+
+### 数据传输
 - **并发处理**：支持多个连接器同时连接
 - **流式传输**：基于 gRPC 双向流的高效数据传输
 - **缓冲队列**：每个频道 1000 个数据包的缓冲
 - **自动清理**：定期清理不活跃的频道和离线连接器
+
+### 配置管理
+- **频道配置**：支持通过配置文件创建和管理频道
+- **证书管理**：自动化证书注册和分发
+- **权限策略**：灵活的访问控制规则配置
 
 ## 🛡️ 生产部署建议
 

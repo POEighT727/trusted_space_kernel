@@ -165,11 +165,25 @@ func main() {
 		fmt.Printf("   创建者: %s\n", notification.CreatorId)
 		fmt.Printf("   发送方: %v\n", notification.SenderIds)
 		fmt.Printf("   接收方: %v\n", notification.ReceiverIds)
-		fmt.Printf("   频道模式: 统一频道\n")
 		fmt.Printf("   加密: %v\n", notification.Encrypted)
-		// 统一频道不再显示关联频道信息
 		fmt.Printf("   数据主题: %s\n", notification.DataTopic)
 		fmt.Printf("   创建时间: %s\n", time.Unix(notification.CreatedAt, 0).Format("2006-01-02 15:04:05"))
+
+		// 显示存证配置（如果有）
+		if notification.EvidenceConfig != nil {
+			fmt.Printf("   存证方式: %s\n", notification.EvidenceConfig.Mode)
+			fmt.Printf("   存证策略: %s\n", notification.EvidenceConfig.Strategy)
+			if notification.EvidenceConfig.ConnectorId != "" {
+				fmt.Printf("   外部存证连接器: %s\n", notification.EvidenceConfig.ConnectorId)
+			}
+			if notification.EvidenceConfig.BackupEnabled {
+				fmt.Printf("   备份存证: 启用\n")
+			}
+			fmt.Printf("   保留天数: %d天\n", notification.EvidenceConfig.RetentionDays)
+			if notification.EvidenceConfig.CompressData {
+				fmt.Printf("   数据压缩: 启用\n")
+			}
+		}
 	}); err != nil {
 		log.Printf("⚠ 启动自动通知监听失败: %v", err)
 	} else {
@@ -437,7 +451,7 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 	}
 
 	fmt.Printf("✓ 频道创建提议已提交\n")
-	fmt.Printf("  频道ID: %s\n", config.ChannelID)
+	fmt.Printf("  频道名称: %s\n", config.ChannelName)
 	fmt.Printf("  创建者: %s\n", config.CreatorID)
 	fmt.Printf("  发送方: %v\n", config.SenderIDs)
 	fmt.Printf("  接收方: %v\n", config.ReceiverIDs)
@@ -1355,11 +1369,7 @@ func handleChannels(connector *client.Connector) {
 			fmt.Printf("%-40s %-20s %-10s\n", channelInfo.ChannelId, channelInfo.DataTopic, channelInfo.CreatorId)
 			fmt.Printf("  发送方: %v\n", channelInfo.SenderIds)
 			fmt.Printf("  接收方: %v\n", channelInfo.ReceiverIds)
-			fmt.Printf("  频道类型: %s\n", channelInfo.ChannelType.String())
 			fmt.Printf("  加密: %v\n", channelInfo.Encrypted)
-			if len(channelInfo.RelatedChannelIds) > 0 {
-				fmt.Printf("  关联频道: %v\n", channelInfo.RelatedChannelIds)
-			}
 			fmt.Printf("  状态: %s\n", channelInfo.Status)
 			if channelInfo.CreatedAt > 0 {
 				fmt.Printf("  创建时间: %s\n", time.Unix(channelInfo.CreatedAt, 0).Format("2006-01-02 15:04:05"))

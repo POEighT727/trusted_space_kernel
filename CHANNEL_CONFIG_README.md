@@ -12,7 +12,7 @@
 
 ```json
 {
-  "channel_id": "channel-A-to-B-simple",
+  "channel_name": "channel-A-to-B-simple",
   "name": "简单数据传输频道",
   "description": "connector-A 向 connector-B 的简单数据传输频道",
   "creator_id": "connector-A",
@@ -21,8 +21,6 @@
   "receiver_ids": ["connector-B"],
   "data_topic": "simple.data.transfer",
   "encrypted": false,
-  "created_at": "2024-01-15T14:00:00Z",
-  "updated_at": "2024-01-15T14:00:00Z",
   "version": 1
 }
 ```
@@ -33,7 +31,7 @@
 
 ```json
 {
-  "channel_id": "channel-A-to-B-with-evidence",
+  "channel_name": "channel-A-to-B-with-evidence",
   "name": "带存证的数据传输频道",
   "description": "connector-A 向 connector-B 的数据传输频道（包含存证）",
   "creator_id": "connector-A",
@@ -50,11 +48,39 @@
     "compress_data": true,
     "custom_settings": {}
   },
-  "created_at": "2024-01-15T14:30:00Z",
-  "updated_at": "2024-01-15T14:30:00Z",
   "version": 1
 }
 ```
+
+### 3. 带外部存证配置
+
+文件：`channel-with-external-evidence-config.json`
+
+```json
+{
+  "channel_name": "channel-A-to-B-external-evidence",
+  "name": "外部存证数据传输频道",
+  "description": "connector-A 向 connector-B 的数据传输频道（使用外部存证）",
+  "creator_id": "connector-A",
+  "approver_id": "connector-A",
+  "sender_ids": ["connector-A"],
+  "receiver_ids": ["connector-B"],
+  "data_topic": "data.transfer.evidence",
+  "encrypted": true,
+  "evidence_config": {
+    "mode": "external",
+    "strategy": "all",
+    "connector_id": "connector-C",
+    "backup_enabled": false,
+    "retention_days": 30,
+    "compress_data": true,
+    "custom_settings": {}
+  },
+  "version": 1
+}
+```
+
+**说明**: `connector-C` 会自动添加到接收方列表中，并自动接收频道创建通知和存证数据。
 
 ## 目录结构
 
@@ -141,17 +167,18 @@ err := channelManager.SaveChannelConfig("channel-A-to-B-simple", "频道名称",
 ## 配置字段说明
 
 ### 必需字段
-- `channel_id`: 频道唯一标识
+- `channel_name`: 频道名称（用于标识和显示）
 - `creator_id`: 创建者ID
 - `sender_ids`: 发送方ID列表（至少一个）
 - `receiver_ids`: 接收方ID列表（至少一个）
 - `data_topic`: 数据主题
-- `created_at`: 创建时间（RFC3339格式）
 
 ### 可选字段
-- `name`: 频道名称
+- `name`: 频道显示名称
 - `description`: 频道描述
 - `approver_id`: 权限批准者ID（默认等于creator_id）
+- `created_at`: 创建时间（RFC3339格式，不设置则自动生成）
+- `updated_at`: 更新时间（RFC3339格式，不设置则自动生成）
 - `encrypted`: 是否加密传输（默认false）
 - `evidence_config`: 存证配置
 
@@ -166,6 +193,14 @@ err := channelManager.SaveChannelConfig("channel-A-to-B-simple", "频道名称",
 - `"internal"`: 使用内核内置存证
 - `"external"`: 使用外部存证连接器
 - `"hybrid"`: 同时使用内置和外部存证
+
+### connector_id（外部存证连接器ID）
+当 `mode` 为 `"external"` 或 `"hybrid"` 时，需要指定外部存证连接器的ID。例如：
+- `"connector_id": "connector-C"`
+
+**自动集成**: 配置后，外部存证连接器会自动添加到频道的接收方列表中，并自动接收频道创建通知和存证数据，无需手动订阅。
+
+**数据隔离**: 存证数据只会发送给外部存证连接器，不会发送给普通业务参与方，确保业务数据的私密性。
 
 ### strategy（存证策略）
 - `"all"`: 存证所有消息

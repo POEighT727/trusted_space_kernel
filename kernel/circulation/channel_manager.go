@@ -89,7 +89,8 @@ type EvidenceConfig struct {
 
 // Channel 数据传输频道（统一频道模式，支持多种消息类型）
 type Channel struct {
-	ChannelID     string
+	ChannelID     string        // 系统生成的唯一ID
+	ChannelName   string        // 配置文件中的频道名称
 	CreatorID     string        // 创建者ID（不一定是发送方）
 	ApproverID    string        // 权限变更批准者ID（默认是创建者）
 	SenderIDs     []string      // 发送方ID列表
@@ -540,13 +541,37 @@ func (cm *ChannelManager) CreateChannelFromConfig(configFilePath string) (*Chann
 	}
 
 	// 验证配置
-	if config.ChannelID == "" {
-		return nil, fmt.Errorf("channel ID is required in config file")
+	if config.ChannelName == "" {
+		return nil, fmt.Errorf("channel name is required in config file")
+	}
+
+	// 如果配置了外部存证，自动将外部存证连接器添加到接收方列表
+	if config.EvidenceConfig != nil && config.EvidenceConfig.Mode == EvidenceModeExternal && config.EvidenceConfig.ConnectorID != "" {
+		externalConnectorID := config.EvidenceConfig.ConnectorID
+		// 检查是否已经在接收方列表中
+		alreadyInReceivers := false
+		for _, receiverID := range config.ReceiverIDs {
+			if receiverID == externalConnectorID {
+				alreadyInReceivers = true
+				break
+			}
+		}
+		if !alreadyInReceivers {
+			config.ReceiverIDs = append(config.ReceiverIDs, externalConnectorID)
+			log.Printf("✓ 外部存证连接器 %s 已自动添加到接收方列表", externalConnectorID)
+		}
+	}
+
+	// 处理创建时间
+	createdAt := time.Now()
+	if config.CreatedAt != nil {
+		createdAt = *config.CreatedAt
 	}
 
 	// 创建频道
 	channel := &Channel{
-		ChannelID:       config.ChannelID,
+		ChannelID:       uuid.New().String(),
+		ChannelName:     config.ChannelName,
 		CreatorID:       config.CreatorID,
 		ApproverID:      config.ApproverID,
 		SenderIDs:       make([]string, len(config.SenderIDs)),
@@ -554,7 +579,7 @@ func (cm *ChannelManager) CreateChannelFromConfig(configFilePath string) (*Chann
 		Encrypted:       config.Encrypted,
 		DataTopic:       config.DataTopic,
 		Status:          ChannelStatusActive,
-		CreatedAt:       config.CreatedAt,
+		CreatedAt:       createdAt,
 		LastActivity:    time.Now(),
 		EvidenceConfig:  config.EvidenceConfig,
 		ConfigFilePath:  configFilePath, // 设置配置文件路径
@@ -572,7 +597,7 @@ func (cm *ChannelManager) CreateChannelFromConfig(configFilePath string) (*Chann
 
 	// 注册到管理器
 	cm.mu.Lock()
-	cm.channels[config.ChannelID] = channel
+	cm.channels[config.ChannelName] = channel
 	cm.mu.Unlock()
 
 	// 启动数据分发协程
@@ -589,6 +614,7 @@ func (cm *ChannelManager) CreateChannelFromConfig(configFilePath string) (*Chann
 
 // SaveChannelConfig 保存频道配置到文件
 func (cm *ChannelManager) SaveChannelConfig(channelID, name, description string) error {
+	now := time.Now()
 	cm.mu.RLock()
 	channel, exists := cm.channels[channelID]
 	cm.mu.RUnlock()
@@ -600,7 +626,7 @@ func (cm *ChannelManager) SaveChannelConfig(channelID, name, description string)
 	// 如果频道指定了配置文件路径，直接保存到该文件
 	if channel.ConfigFilePath != "" {
 		config := &ChannelConfigFile{
-			ChannelID:      channelID,
+			ChannelName:    channel.ChannelName,
 			Name:           name,
 			Description:    description,
 			CreatorID:      channel.CreatorID,
@@ -610,8 +636,8 @@ func (cm *ChannelManager) SaveChannelConfig(channelID, name, description string)
 			DataTopic:      channel.DataTopic,
 			Encrypted:      channel.Encrypted,
 			EvidenceConfig: channel.EvidenceConfig,
-			CreatedAt:      channel.CreatedAt,
-			UpdatedAt:      time.Now(),
+			CreatedAt:      &channel.CreatedAt,
+			UpdatedAt:      &now,
 			Version:        1,
 		}
 
