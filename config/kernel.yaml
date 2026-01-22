@@ -1,22 +1,51 @@
 # 可信数据空间内核配置
 
+kernel:
+  # 内核ID，全局唯一
+  id: "kernel-1"
+  # 内核类型：primary, secondary
+  type: "primary"
+  # 内核描述
+  description: "Primary Trusted Space Kernel"
+
 server:
   # 监听地址
   # "0.0.0.0" - 监听所有网络接口，允许跨主机连接（推荐用于跨主机部署）
   # "127.0.0.1" 或 "localhost" - 仅监听本地回环接口，仅允许本地连接
-  address: "0.0.0.0"
+  address: "192.168.1.8"
   port: 50051
+
+# 多内核配置（内核默认启用多内核模式）
+multi_kernel:
+  # 种子内核列表（用于初始发现其他内核）
+  seed_kernels: []
+    # - kernel_id: "kernel-2"
+    #   address: "192.168.1.100"
+    #   port: 50051
+    # - kernel_id: "kernel-3"
+    #   address: "192.168.1.101"
+    #   port: 50051
+  # 内核间通信端口（默认为主端口+2，避免与bootstrap端口冲突）
+  kernel_port: 50053
+  # 心跳间隔（秒）
+  heartbeat_interval: 30
+  # 连接超时（秒）
+  connect_timeout: 10
+  # 最大重试次数
+  max_retries: 3
 
 security:
   ca_cert_path: "certs/ca.crt"
   ca_key_path: "certs/ca.key"
   server_cert_path: "certs/kernel.crt"
   server_key_path: "certs/kernel.key"
+  # 内核间通信证书
+  kernel_cert_path: "certs/kernel.crt"
+  kernel_key_path: "certs/kernel.key"
 
 evidence:
   persistent: true
   log_file_path: "logs/audit.log"
-  use_database: true  # 是否启用数据库存储
 
 database:
   enabled: true       # 是否启用数据库

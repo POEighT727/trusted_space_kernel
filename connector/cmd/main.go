@@ -339,11 +339,20 @@ func printHelp(defaultConfigDir string) {
 // handleList 处理列出连接器命令
 func handleList(connector *client.Connector) {
 	fmt.Println("正在查询空间中的连接器...")
-	
+
 	connectors, err := connector.DiscoverConnectors("")
 	if err != nil {
 		fmt.Printf("❌ 查询失败: %v\n", err)
 		return
+	}
+
+	// 尝试查询跨内核连接器
+	crossConnectors, kernels, err := connector.DiscoverCrossKernelConnectors("", "")
+	if err == nil && len(crossConnectors) > 0 {
+		// 合并连接器列表
+		allConnectors := append(connectors, crossConnectors...)
+		connectors = allConnectors
+		fmt.Printf("✓ 包含 %d 个跨内核连接器\n", len(crossConnectors))
 	}
 
 	if len(connectors) == 0 {
@@ -352,20 +361,39 @@ func handleList(connector *client.Connector) {
 	}
 
 	fmt.Printf("\n找到 %d 个连接器:\n", len(connectors))
-	fmt.Println(strings.Repeat("-", 80))
-	fmt.Printf("%-20s %-15s %-10s %-20s\n", "连接器ID", "实体类型", "状态", "最后心跳")
-	fmt.Println(strings.Repeat("-", 80))
+	fmt.Println(strings.Repeat("-", 90))
+	fmt.Printf("%-20s %-15s %-10s %-15s %-20s\n", "连接器ID", "实体类型", "状态", "内核ID", "最后心跳")
+	fmt.Println(strings.Repeat("-", 90))
 
 	for _, c := range connectors {
 		lastHeartbeat := time.Unix(c.LastHeartbeat, 0)
 		timeStr := time.Since(lastHeartbeat).Round(time.Second).String()
-		fmt.Printf("%-20s %-15s %-10s %-20s\n", 
-			c.ConnectorId, 
-			c.EntityType, 
+		kernelID := c.KernelId
+		if kernelID == "" {
+			kernelID = "本内核"
+		}
+		fmt.Printf("%-20s %-15s %-10s %-15s %-20s\n",
+			c.ConnectorId,
+			c.EntityType,
 			c.Status,
+			kernelID,
 			timeStr+"前")
 	}
-	fmt.Println(strings.Repeat("-", 80))
+
+	if len(kernels) > 0 {
+		fmt.Printf("\n发现的内核 (%d 个):\n", len(kernels))
+		fmt.Println(strings.Repeat("-", 60))
+		fmt.Printf("%-20s %-20s %-10s\n", "内核ID", "地址", "状态")
+		fmt.Println(strings.Repeat("-", 60))
+		for _, k := range kernels {
+			fmt.Printf("%-20s %-20s %-10s\n",
+				k.KernelId,
+				fmt.Sprintf("%s:%d", k.Address, k.Port),
+				k.Status)
+		}
+	}
+
+	fmt.Println(strings.Repeat("-", 90))
 }
 
 // handleInfo 处理查看连接器信息命令

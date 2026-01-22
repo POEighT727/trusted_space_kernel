@@ -10,19 +10,22 @@ option go_package = "github.com/trusted-space/kernel/api/v1;kernelv1";
 service IdentityService {
   // 连接器上线握手，注册自身能力，交换元信息
   rpc Handshake (HandshakeRequest) returns (HandshakeResponse);
-  
+
   // 心跳保活，维持在线状态
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
-  
+
   // 目录服务：发现空间中的其他连接器
   rpc DiscoverConnectors (DiscoverRequest) returns (DiscoverResponse);
-  
+
+  // 跨内核连接器发现
+  rpc DiscoverCrossKernelConnectors (CrossKernelDiscoverRequest) returns (CrossKernelDiscoverResponse);
+
   // 获取连接器详细信息
   rpc GetConnectorInfo (GetConnectorInfoRequest) returns (GetConnectorInfoResponse);
-  
+
   // 设置连接器状态（active, inactive, closed等）
   rpc SetConnectorStatus (SetConnectorStatusRequest) returns (SetConnectorStatusResponse);
-  
+
   // 证书注册服务：首次连接时动态申请证书
   rpc RegisterConnector (RegisterConnectorRequest) returns (RegisterConnectorResponse);
 }
@@ -71,6 +74,7 @@ message ConnectorInfo {
   string status = 4;        // active, inactive, offline, closed
   int64 last_heartbeat = 5; // Unix时间戳
   int64 registered_at = 6;  // Unix时间戳
+  string kernel_id = 7;     // 所属内核ID（为空表示本内核）
 }
 
 message GetConnectorInfoRequest {
@@ -82,6 +86,33 @@ message GetConnectorInfoResponse {
   bool found = 1;
   ConnectorInfo connector = 2;
   string message = 3;
+}
+
+// ------------------------------------------------------------
+// 跨内核连接器发现消息定义
+// ------------------------------------------------------------
+message CrossKernelDiscoverRequest {
+  string requester_id = 1;      // 请求者ID
+  string requester_kernel_id = 2; // 请求者内核ID
+  string filter_type = 3;       // 可选的实体类型过滤
+  string target_kernel_id = 4;  // 目标内核ID（为空则查询所有已知内核）
+}
+
+message CrossKernelDiscoverResponse {
+  repeated ConnectorInfo connectors = 1;  // 连接器列表
+  repeated KernelInfo kernels = 2;         // 内核信息列表
+  int32 total_count = 3;         // 总连接器数量
+  string message = 4;
+}
+
+message KernelInfo {
+  string kernel_id = 1;         // 内核ID
+  string address = 2;           // 内核地址
+  int32 port = 3;               // 内核端口
+  string status = 4;            // 内核状态: active, inactive, offline
+  int64 last_heartbeat = 5;     // 最后心跳时间
+  int64 registered_at = 6;      // 注册时间
+  string public_key = 7;        // 内核公钥（用于安全通信）
 }
 
 // ------------------------------------------------------------

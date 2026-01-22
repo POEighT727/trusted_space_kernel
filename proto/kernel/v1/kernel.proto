@@ -1,0 +1,164 @@
+syntax = "proto3";
+
+package trusted_space.kernel.v1;
+
+import "identity.proto";
+import "channel.proto";
+
+option go_package = "github.com/trusted-space/kernel/api/v1;kernelv1";
+
+// ------------------------------------------------------------
+// 内核间通信服务 (Kernel Service)
+// ------------------------------------------------------------
+service KernelService {
+  // 内核注册：新内核加入网络
+  rpc RegisterKernel (RegisterKernelRequest) returns (RegisterKernelResponse);
+
+  // 内核心跳：维持内核间连接
+  rpc KernelHeartbeat (KernelHeartbeatRequest) returns (KernelHeartbeatResponse);
+
+  // 内核发现：发现其他内核
+  rpc DiscoverKernels (DiscoverKernelsRequest) returns (DiscoverKernelsResponse);
+
+  // 跨内核频道创建
+  rpc CreateCrossKernelChannel (CreateCrossKernelChannelRequest) returns (CreateCrossKernelChannelResponse);
+
+  // 跨内核数据转发
+  rpc ForwardData (ForwardDataRequest) returns (ForwardDataResponse);
+
+  // 跨内核频道信息查询
+  rpc GetCrossKernelChannelInfo (GetCrossKernelChannelInfoRequest) returns (GetCrossKernelChannelInfoResponse);
+
+  // 同步连接器信息
+  rpc SyncConnectorInfo (SyncConnectorInfoRequest) returns (SyncConnectorInfoResponse);
+}
+
+// ------------------------------------------------------------
+// 内核注册相关消息定义
+// ------------------------------------------------------------
+message RegisterKernelRequest {
+  string kernel_id = 1;          // 内核ID
+  string address = 2;            // 内核地址
+  int32 port = 3;                // 内核端口
+  string public_key = 4;         // 内核公钥
+  bytes ca_certificate = 7;      // CA证书（PEM格式）
+  map<string, string> metadata = 5; // 元数据
+  int64 timestamp = 6;
+}
+
+message RegisterKernelResponse {
+  bool success = 1;
+  string message = 2;
+  string session_token = 3;      // 会话令牌
+  bytes peer_ca_certificate = 5; // 对等内核的CA证书
+  repeated KernelInfo known_kernels = 4; // 已知内核列表
+}
+
+// ------------------------------------------------------------
+// 内核心跳相关消息定义
+// ------------------------------------------------------------
+message KernelHeartbeatRequest {
+  string kernel_id = 1;
+  int64 timestamp = 2;
+  map<string, int32> stats = 3;  // 统计信息：连接器数量、频道数量等
+}
+
+message KernelHeartbeatResponse {
+  bool acknowledged = 1;
+  int64 server_timestamp = 2;
+  repeated KernelStatusUpdate updates = 3; // 其他内核状态更新
+}
+
+message KernelStatusUpdate {
+  string kernel_id = 1;
+  string status = 2;            // 内核状态变更
+  int64 timestamp = 3;
+}
+
+// ------------------------------------------------------------
+// 内核发现相关消息定义
+// ------------------------------------------------------------
+message DiscoverKernelsRequest {
+  string requester_kernel_id = 1;
+  string filter_status = 2;      // 状态过滤
+}
+
+message DiscoverKernelsResponse {
+  repeated KernelInfo kernels = 1;
+  int32 total_count = 2;
+}
+
+// ------------------------------------------------------------
+// 跨内核频道相关消息定义
+// ------------------------------------------------------------
+message CreateCrossKernelChannelRequest {
+  string creator_kernel_id = 1;     // 创建者内核ID
+  string creator_connector_id = 2;  // 创建者连接器ID
+  repeated CrossKernelParticipant sender_ids = 3;    // 发送方列表（跨内核）
+  repeated CrossKernelParticipant receiver_ids = 4;  // 接收方列表（跨内核）
+  string data_topic = 5;            // 数据主题
+  bool encrypted = 6;               // 是否加密
+  string reason = 7;                // 创建理由
+  EvidenceConfig evidence_config = 8; // 存证配置
+}
+
+message CrossKernelParticipant {
+  string kernel_id = 1;         // 内核ID
+  string connector_id = 2;      // 连接器ID
+}
+
+message CreateCrossKernelChannelResponse {
+  bool success = 1;
+  string channel_id = 2;        // 全局唯一频道ID
+  string message = 3;
+  repeated string participant_confirmations = 4; // 需要确认的参与者列表
+}
+
+message ForwardDataRequest {
+  string source_kernel_id = 1;  // 源内核ID
+  string target_kernel_id = 2;  // 目标内核ID
+  string channel_id = 3;        // 频道ID
+  DataPacket data_packet = 4;   // 数据包
+}
+
+message ForwardDataResponse {
+  bool success = 1;
+  string message = 2;
+  int64 forwarded_sequence = 3; // 转发后的序列号
+}
+
+message GetCrossKernelChannelInfoRequest {
+  string requester_kernel_id = 1;
+  string channel_id = 2;
+}
+
+message GetCrossKernelChannelInfoResponse {
+  bool found = 1;
+  string channel_id = 2;
+  string creator_kernel_id = 3;
+  string creator_connector_id = 4;
+  repeated CrossKernelParticipant sender_ids = 5;
+  repeated CrossKernelParticipant receiver_ids = 6;
+  string data_topic = 7;
+  bool encrypted = 8;
+  string status = 9;
+  int64 created_at = 10;
+  int64 last_activity = 11;
+  ChannelNegotiationStatus negotiation_status = 12;
+  string message = 13;
+}
+
+// ------------------------------------------------------------
+// 连接器信息同步相关消息定义
+// ------------------------------------------------------------
+message SyncConnectorInfoRequest {
+  string source_kernel_id = 1;  // 源内核ID
+  repeated ConnectorInfo connectors = 2; // 要同步的连接器信息
+  string sync_type = 3;         // 同步类型: full, incremental, update
+}
+
+message SyncConnectorInfoResponse {
+  bool success = 1;
+  string message = 2;
+  int32 synced_count = 3;       // 同步的连接器数量
+}

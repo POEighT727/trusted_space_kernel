@@ -125,6 +125,7 @@ type ChannelServiceServer struct {
 	registry            *control.Registry
 	auditLog            *evidence.AuditLog
 	NotificationManager *NotificationManager
+	multiKernelManager  *MultiKernelManager
 }
 
 // NewChannelServiceServer 创建频道服务
@@ -133,6 +134,7 @@ func NewChannelServiceServer(
 	policyEngine *control.PolicyEngine,
 	registry *control.Registry,
 	auditLog *evidence.AuditLog,
+	multiKernelManager *MultiKernelManager,
 ) *ChannelServiceServer {
 	server := &ChannelServiceServer{
 		channelManager:      channelManager,
@@ -140,6 +142,7 @@ func NewChannelServiceServer(
 		registry:            registry,
 		auditLog:            auditLog,
 		NotificationManager: NewNotificationManager(channelManager, registry),
+		multiKernelManager:  multiKernelManager,
 }
 
 	// 设置evidence频道创建通知回调

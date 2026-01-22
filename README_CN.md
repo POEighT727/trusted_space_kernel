@@ -361,9 +361,119 @@ if !rateLimiter.Allow(connectorID) {
 - 连接器离线超过 5 分钟：通知管理员
 - 审计日志写入失败：紧急告警
 
-## 九、部署拓扑
+## 九、运行模式
 
-### 9.1 单节点部署（测试环境）
+### 9.1 交互模式（推荐，默认）
+
+```bash
+# 启动完整的内核管理控制台（推荐）
+./bin/kernel -config config/kernel.yaml
+
+# 端口分配：
+# 50051: 主gRPC服务器（连接器连接）
+# 50052: Bootstrap服务器（连接器证书注册）
+# 50053: 内核间通信服务器（多内核模式）
+
+# 特性：
+# ✓ 完整的gRPC服务器（端口50051）
+# ✓ 交互式管理界面
+# ✓ 支持所有管理命令
+# ✓ 多内核网络（默认启用）
+# ✓ 实时监控和状态查询
+```
+
+**管理命令示例：**
+```bash
+[kernel-1] > status          # 查看内核状态
+[kernel-1] > connectors      # 列出连接器
+[kernel-1] > channels        # 列出频道
+[kernel-1] > kernels         # 列出已知内核
+[kernel-1] > connect-kernel kernel-2 192.168.1.100 50051
+[kernel-1] > help            # 显示所有命令
+```
+
+### 9.2 守护进程模式
+
+```bash
+# 仅作为后台服务运行（生产环境）
+./bin/kernel -config config/kernel.yaml -daemon
+
+# 特性：
+# ✓ 仅gRPC服务器运行
+# ✓ 无交互界面
+# ✓ 多内核网络（后台运行）
+# ✓ 适合生产环境部署
+# ✓ 可通过systemd等服务管理
+```
+
+## 十、独立部署包
+
+### 10.1 内核部署包
+
+内核支持独立打包部署：
+
+```bash
+# Linux/Mac 内核打包
+make package-kernel-linux VERSION=1.0.0
+
+# Windows 内核打包
+make package-kernel-windows VERSION=1.0.0
+
+# 所有平台内核打包
+make package-kernel VERSION=1.0.0
+```
+
+生成的部署包包含：
+- 内核可执行文件
+- 配置模板
+- 证书目录（运行时自动生成）
+- 日志目录
+- 频道配置目录
+- 数据库目录
+- 管理脚本（启动/停止/状态检查）
+
+### 10.2 连接器部署包
+
+```bash
+# Linux/Mac 连接器打包
+make package-connector-linux VERSION=1.0.0
+
+# Windows 连接器打包
+make package-connector-windows VERSION=1.0.0
+
+# 所有平台连接器打包
+make package-connector VERSION=1.0.0
+```
+
+### 10.3 一键打包所有组件
+
+```bash
+# 打包内核和连接器（所有平台）
+make package-all VERSION=1.0.0
+
+# 或使用统一脚本（推荐）
+# Linux/Mac
+./scripts/package_all.sh 1.0.0 linux-amd64 all
+
+# Windows
+.\scripts\package_all.ps1 -Version 1.0.0 -Platform windows-amd64 -Target all
+```
+
+#### 10.4 单独打包组件
+
+```bash
+# 只打包内核
+make package-kernel VERSION=1.0.0
+./scripts/package_all.sh 1.0.0 linux-amd64 kernel
+
+# 只打包连接器
+make package-connector VERSION=1.0.0
+./scripts/package_all.sh 1.0.0 linux-amd64 connector
+```
+
+## 十一、部署拓扑
+
+### 11.1 单节点部署（测试环境）
 
 ```
 ┌─────────────────────┐
@@ -376,7 +486,7 @@ if !rateLimiter.Allow(connectorID) {
 Conn-A  Conn-B  Conn-C
 ```
 
-### 9.2 集群部署（生产环境）
+### 11.2 集群部署（生产环境）
 
 ```
               ┌─────────────┐
@@ -395,7 +505,7 @@ Conn-A  Conn-B  Conn-C
       (审计日志)          (存证锚定)
 ```
 
-## 十、总结
+## 十二、总结
 
 本架构实现了以下核心目标：
 

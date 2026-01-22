@@ -1157,6 +1157,21 @@ func (c *Connector) DiscoverConnectors(filterType string) ([]*pb.ConnectorInfo, 
 	return resp.Connectors, nil
 }
 
+// DiscoverCrossKernelConnectors 发现跨内核的连接器
+func (c *Connector) DiscoverCrossKernelConnectors(targetKernelID, filterType string) ([]*pb.ConnectorInfo, []*pb.KernelInfo, error) {
+	resp, err := c.identitySvc.DiscoverCrossKernelConnectors(c.ctx, &pb.CrossKernelDiscoverRequest{
+		RequesterId:      c.connectorID,
+		RequesterKernelId: "", // 当前连接器所在内核ID，TODO: 需要从配置或上下文获取
+		FilterType:       filterType,
+		TargetKernelId:   targetKernelID,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to discover cross-kernel connectors: %w", err)
+	}
+
+	return resp.Connectors, resp.Kernels, nil
+}
+
 // GetConnectorInfo 获取指定连接器的详细信息
 func (c *Connector) GetConnectorInfo(connectorID string) (*pb.ConnectorInfo, error) {
 	resp, err := c.identitySvc.GetConnectorInfo(c.ctx, &pb.GetConnectorInfoRequest{

@@ -47,6 +47,27 @@ func VerifySignature(data []byte, signature string, publicKey *rsa.PublicKey) er
 	return nil
 }
 
+// GenerateEvidenceSignature 生成存证记录的签名（使用内核私钥）
+func GenerateEvidenceSignature(connectorID, eventType, channelID, dataHash string, timestamp int64) (string, error) {
+	// 注意：这里我们使用内核的私钥来签名evidence，而不是连接器的私钥
+	// 这样可以证明evidence是由内核生成的
+
+	// 构建要签名的数据
+	data := fmt.Sprintf("%s|%s|%s|%s|%d", connectorID, eventType, channelID, dataHash, timestamp)
+
+	// 尝试加载内核的私钥（用于evidence签名）
+	// 这里我们使用CA的私钥，因为内核应该有CA的私钥
+	caKeyPath := "certs/ca.key"  // 假设CA私钥文件路径
+	privateKey, err := LoadRSAPrivateKey(caKeyPath)
+	if err != nil {
+		// 如果找不到CA私钥，返回空签名（不影响主要功能）
+		return "", fmt.Errorf("failed to load private key for connector %s: %w", connectorID, err)
+	}
+
+	// 对数据进行签名
+	return SignData([]byte(data), privateKey)
+}
+
 // LoadRSAPrivateKey 从PEM文件加载RSA私钥
 func LoadRSAPrivateKey(keyPath string) (*rsa.PrivateKey, error) {
 	keyData, err := os.ReadFile(keyPath)
@@ -127,25 +148,6 @@ func ExtractPublicKeyFromCert(certPath string) (*rsa.PublicKey, error) {
 	return rsaPubKey, nil
 }
 
-// GenerateEvidenceSignature 为存证记录生成签名
-func GenerateEvidenceSignature(connectorID, eventType, channelID, dataHash string, timestamp int64) (string, error) {
-	// 构造签名数据：连接器ID + 事件类型 + 频道ID + 数据哈希 + 时间戳
-	data := fmt.Sprintf("%s|%s|%s|%s|%d", connectorID, eventType, channelID, dataHash, timestamp)
-
-	// 使用连接器的私钥进行签名
-	privateKeyPath := fmt.Sprintf("certs/%s.key", connectorID)
-	privateKey, err := LoadRSAPrivateKey(privateKeyPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to load private key for connector %s: %w", connectorID, err)
-	}
-
-	signature, err := SignData([]byte(data), privateKey)
-	if err != nil {
-		return "", fmt.Errorf("failed to generate signature: %w", err)
-	}
-
-	return signature, nil
-}
 
 // VerifyEvidenceSignature 验证存证记录的签名
 func VerifyEvidenceSignature(connectorID, eventType, channelID, dataHash, signature string, timestamp int64) error {

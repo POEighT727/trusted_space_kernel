@@ -88,6 +88,7 @@ message DataPacket {
   int64 timestamp = 5;
   string sender_id = 6;         // 发送方ID
   repeated string target_ids = 7; // 目标接收者ID列表（为空则广播给所有订阅者）
+  string sender_kernel_id = 8;  // 发送方内核ID（跨内核时使用）
 }
 
 message TransferStatus {
@@ -198,6 +199,7 @@ message ProposeChannelRequest {
   int32 timeout_seconds = 8;    // 提议超时时间（秒，默认300秒）
   string config_file_path = 10; // 配置文件路径（可选，由创建者指定）
   EvidenceConfig evidence_config = 11; // 存证配置（可选）
+  string creator_kernel_id = 12; // 创建者内核ID（跨内核时使用）
   reserved 5;
   reserved "channel_type";
 }

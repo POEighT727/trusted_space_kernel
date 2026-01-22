@@ -23,9 +23,9 @@ connector:
 	@echo "Building connector..."
 	@go build -o bin/connector ./connector/cmd
 
-# 运行内核
+# 运行内核（交互模式，多内核默认启用）
 run-kernel: kernel
-	@echo "Starting kernel service..."
+	@echo "Starting kernel with interactive management console..."
 	@./bin/kernel -config config/kernel.yaml
 
 # 运行连接器
@@ -61,7 +61,31 @@ package-connector-windows:
 
 # 打包连接器（所有平台）
 package-connector: package-connector-linux package-connector-windows
-	@echo "✓ 所有平台打包完成"
+	@echo "✓ 所有平台连接器打包完成"
+
+# 打包内核（Linux/Mac）
+package-kernel-linux:
+	@bash scripts/package_kernel.sh $(VERSION) linux-amd64
+
+# 打包内核（Windows）
+package-kernel-windows:
+	@powershell -ExecutionPolicy Bypass -File scripts/package_kernel.ps1 -Version $(VERSION) -Platform windows-amd64
+
+# 打包内核（所有平台）
+package-kernel: package-kernel-linux package-kernel-windows
+	@echo "✓ 所有平台内核打包完成"
+
+# 打包所有组件（内核+连接器，所有平台）
+package-all: package-all-linux package-all-windows
+	@echo "✓ 所有组件和平台打包完成"
+
+# 打包所有组件（Linux/Mac）
+package-all-linux:
+	@bash scripts/package_all.sh $(VERSION) linux-amd64 all
+
+# 打包所有组件（Windows）
+package-all-windows:
+	@powershell -ExecutionPolicy Bypass -File scripts/package_all.ps1 -Version $(VERSION) -Platform windows-amd64 -Target all
 
 all: deps proto certs kernel connector
 

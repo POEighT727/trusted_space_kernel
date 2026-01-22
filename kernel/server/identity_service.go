@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"gopkg.in/yaml.v3"
 	"os"
 	"time"
@@ -26,16 +27,18 @@ type IdentityServiceServer struct {
 	ca                 *security.CA
 	channelManager     *circulation.ChannelManager
 	notificationManager *NotificationManager
+	multiKernelManager *MultiKernelManager
 }
 
 // NewIdentityServiceServer 创建身份服务
-func NewIdentityServiceServer(registry *control.Registry, auditLog *evidence.AuditLog, ca *security.CA, channelManager *circulation.ChannelManager, notificationManager *NotificationManager) *IdentityServiceServer {
+func NewIdentityServiceServer(registry *control.Registry, auditLog *evidence.AuditLog, ca *security.CA, channelManager *circulation.ChannelManager, notificationManager *NotificationManager, multiKernelManager *MultiKernelManager) *IdentityServiceServer {
 	return &IdentityServiceServer{
 		registry:           registry,
 		auditLog:           auditLog,
 		ca:                 ca,
 		channelManager:     channelManager,
 		notificationManager: notificationManager,
+		multiKernelManager: multiKernelManager,
 	}
 }
 
@@ -209,10 +212,19 @@ func (s *IdentityServiceServer) Heartbeat(ctx context.Context, req *pb.Heartbeat
 // DiscoverConnectors 发现空间中的其他连接器
 func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.DiscoverRequest) (*pb.DiscoverResponse, error) {
 	// 验证请求者身份
-	if err := security.VerifyConnectorID(ctx, req.RequesterId); err != nil {
-		return &pb.DiscoverResponse{
-			TotalCount: 0,
-		}, fmt.Errorf("requester authentication failed: %w", err)
+	// 对于内核间请求，RequesterId是内核ID，需要特殊处理
+	isKernelRequest := strings.HasPrefix(req.RequesterId, "kernel-")
+	if !isKernelRequest {
+		// 普通连接器请求：验证连接器ID
+		if err := security.VerifyConnectorID(ctx, req.RequesterId); err != nil {
+			return &pb.DiscoverResponse{
+				TotalCount: 0,
+			}, fmt.Errorf("requester authentication failed: %w", err)
+		}
+	} else {
+		// 内核间请求：验证内核身份（TODO: 实现内核身份验证）
+		// 目前暂时允许所有内核请求，但应该添加更严格的验证
+		log.Printf("Kernel-to-kernel request from %s", req.RequesterId)
 	}
 
 	// 获取所有连接器列表
