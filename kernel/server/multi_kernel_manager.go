@@ -17,7 +17,6 @@ import (
 	pb "github.com/trusted-space/kernel/proto/kernel/v1"
 	"github.com/trusted-space/kernel/kernel/circulation"
 	"github.com/trusted-space/kernel/kernel/control"
-	"github.com/trusted-space/kernel/kernel/security"
 )
 
 // KernelConfig 内核配置
@@ -140,6 +139,7 @@ func (m *MultiKernelManager) StartKernelServer() error {
 }
 
 // ConnectToKernel 连接到另一个内核
+// port 参数应该是目标内核的内核通信端口 (kernel_port)
 func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int) error {
 	m.kernelsMu.Lock()
 	defer m.kernelsMu.Unlock()
@@ -238,11 +238,13 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int)
 	}
 
 	// 保存内核信息
+	// port 是内核通信端口，mainPort = kernelPort - 2（假设标准配置）
+	mainPort := port - 2
 	kernelInfo := &KernelInfo{
 		KernelID:      kernelID,
 		Address:       address,
 		Port:          port,          // 内核间通信端口
-		MainPort:      m.config.Port, // 主服务器端口
+		MainPort:      mainPort,      // 主服务器端口（IdentityService等）
 		Status:        "active",
 		LastHeartbeat: time.Now().Unix(),
 		Client:        client,
@@ -297,19 +299,46 @@ func (m *MultiKernelManager) GetConnectedKernelCount() int {
 
 // connectToKernelIdentityService 连接到内核的IdentityService（主服务器端口）
 func (m *MultiKernelManager) connectToKernelIdentityService(kernel *KernelInfo) (*grpc.ClientConn, error) {
-	// 使用security包的客户端TLS配置来确保配置正确
-	creds, err := security.NewClientTransportCredentials(
-		m.config.CACertPath,
-		m.config.KernelCertPath,
-		m.config.KernelKeyPath,
-		"", // serverName 为空，因为我们使用IP地址
-	)
+	// 创建TLS配置，同时包含自己的CA和对等内核的CA
+	cert, err := tls.LoadX509KeyPair(m.config.KernelCertPath, m.config.KernelKeyPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create client credentials: %w", err)
+		return nil, fmt.Errorf("failed to load client certificates: %w", err)
 	}
 
+	caCertPool := x509.NewCertPool()
+
+	// 添加自己的CA证书
+	ownCACert, err := os.ReadFile(m.config.CACertPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read own CA certificate: %w", err)
+	}
+	if !caCertPool.AppendCertsFromPEM(ownCACert) {
+		return nil, fmt.Errorf("failed to append own CA certificate")
+	}
+
+	// 添加对等内核的CA证书（如果存在）
+	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernel.KernelID)
+	if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
+		if !caCertPool.AppendCertsFromPEM(peerCACert) {
+			log.Printf("Warning: failed to append peer CA certificate for %s", kernel.KernelID)
+		} else {
+			log.Printf("Using peer CA certificate for kernel %s", kernel.KernelID)
+		}
+	} else {
+		log.Printf("Warning: peer CA certificate not found for kernel %s: %v", kernel.KernelID, err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caCertPool,
+		ServerName:   "", // 使用IP地址，不验证服务器名称
+		MinVersion:   tls.VersionTLS13,
+	}
+
+	creds := credentials.NewTLS(tlsConfig)
+
 	// 连接到目标内核的主服务器端口（而不是kernel_port）
-	targetAddr := fmt.Sprintf("%s:%d", kernel.Address, kernel.MainPort) // kernel.MainPort是主服务器端口
+	targetAddr := fmt.Sprintf("%s:%d", kernel.Address, kernel.MainPort) // kernel.MainPort是目标内核的主服务器端口
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.config.ConnectTimeout)*time.Second)
 	defer cancel()
 

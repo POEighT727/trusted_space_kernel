@@ -216,10 +216,10 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 	isKernelRequest := strings.HasPrefix(req.RequesterId, "kernel-")
 	if !isKernelRequest {
 		// 普通连接器请求：验证连接器ID
-		if err := security.VerifyConnectorID(ctx, req.RequesterId); err != nil {
-			return &pb.DiscoverResponse{
-				TotalCount: 0,
-			}, fmt.Errorf("requester authentication failed: %w", err)
+	if err := security.VerifyConnectorID(ctx, req.RequesterId); err != nil {
+		return &pb.DiscoverResponse{
+			TotalCount: 0,
+		}, fmt.Errorf("requester authentication failed: %w", err)
 		}
 	} else {
 		// 内核间请求：验证内核身份（TODO: 实现内核身份验证）
