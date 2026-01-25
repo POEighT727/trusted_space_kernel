@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -198,6 +199,8 @@ type ChannelManager struct {
 
 	// 频道配置管理（可选，由创建者指定配置文件路径时使用）
 	configManager *ChannelConfigManager // 频道配置管理器
+	// forwardToKernel 回调，用于将 DataPacket 转发到远端内核
+	forwardToKernel func(kernelID string, packet *DataPacket) error
 }
 
 // NewChannelManager 创建新的频道管理器
@@ -225,6 +228,13 @@ func (cm *ChannelManager) SetConfigManager(configManager *ChannelConfigManager) 
 	defer cm.mu.Unlock()
 	cm.configManager = configManager
 	log.Printf("✓ Channel config manager set")
+}
+
+// SetForwardToKernel 设置将要用于跨内核转发数据的回调函数（由上层多内核管理器设置）
+func (cm *ChannelManager) SetForwardToKernel(fn func(kernelID string, packet *DataPacket) error) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.forwardToKernel = fn
 }
 
 // GetConfigManager 获取频道配置管理器
@@ -904,40 +914,37 @@ func (c *Channel) PushData(packet *DataPacket) error {
 	targetReceivers := make([]string, 0, len(c.ReceiverIDs))
 	targetReceivers = append(targetReceivers, c.ReceiverIDs...)
 
-	// 如果指定了目标列表，验证是否包含有效的接收方
-	if len(packet.TargetIDs) > 0 {
-		// 验证目标列表中的接收者是否都是频道接收方
-		validTargets := make([]string, 0)
-		for _, targetID := range packet.TargetIDs {
-			if c.CanReceive(targetID) {
-				validTargets = append(validTargets, targetID)
-			}
-		}
-		if len(validTargets) == 0 {
-			// 目标列表中没有有效的接收方，数据不会发送
-			return nil
-		}
-		targetReceivers = validTargets
-	}
-	
-	// 处理连接器重启恢复缓冲
+	// 处理目标列表，支持远端目标格式 kernelID:connectorID
+	remoteTargetsByKernel := make(map[string][]string)
+	localTargets := make([]string, 0)
+	// offline 本地 targets
 	offlineTargets := make([]string, 0)
 
-	// 检查是否有离线连接器需要缓冲
 	if len(packet.TargetIDs) > 0 {
-		// 指定了目标接收者
 		for _, targetID := range packet.TargetIDs {
-			if c.CanReceive(targetID) { // 只检查频道接收者
-				if _, subscribed := c.subscribers[targetID]; !subscribed {
-					// 检查是否离线
-					if c.manager != nil && !c.manager.IsConnectorOnline(targetID) {
-						offlineTargets = append(offlineTargets, targetID)
+			if strings.Contains(targetID, ":") {
+				parts := strings.SplitN(targetID, ":", 2)
+				kernelPart := parts[0]
+				connectorPart := parts[1]
+				remoteTargetsByKernel[kernelPart] = append(remoteTargetsByKernel[kernelPart], connectorPart)
+			} else {
+				if c.CanReceive(targetID) {
+					localTargets = append(localTargets, targetID)
+					if _, subscribed := c.subscribers[targetID]; !subscribed {
+						if c.manager != nil && !c.manager.IsConnectorOnline(targetID) {
+							offlineTargets = append(offlineTargets, targetID)
+						}
 					}
 				}
 			}
 		}
+		if len(localTargets) == 0 && len(remoteTargetsByKernel) == 0 {
+			// 没有有效目标
+			return nil
+		}
+		targetReceivers = localTargets
 	} else {
-		// 广播模式：检查所有接收者中是否有离线的
+		// 广播模式：所有本地接收者
 		for _, receiverID := range c.ReceiverIDs {
 			if _, subscribed := c.subscribers[receiverID]; !subscribed {
 				if c.manager != nil && !c.manager.IsConnectorOnline(receiverID) {
@@ -947,7 +954,7 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		}
 	}
 	
-	// 为离线连接器缓冲数据
+	// 为离线本地连接器缓冲数据
 	for _, offlineTarget := range offlineTargets {
 		if c.manager != nil {
 			c.manager.BufferDataForOfflineConnector(offlineTarget, packet)
@@ -1002,17 +1009,41 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		return nil
 	}
 
-	// 所有目标接收者都已订阅，直接发送到队列
+	// 将数据推送到本地队列（如果有本地订阅者）
 	if hasSubscribers {
 		select {
 		case c.dataQueue <- packet:
-			return nil
+			// pushed locally
 		case <-time.After(5 * time.Second):
 			return fmt.Errorf("timeout pushing data to channel")
 		}
 	}
-	
-	// 没有订阅者且没有目标接收者，数据丢失（这种情况不应该发生）
+
+	// 转发到远端内核（如果有远端目标）
+	if len(remoteTargetsByKernel) > 0 {
+		if c.manager == nil || c.manager.forwardToKernel == nil {
+			return fmt.Errorf("forwardToKernel callback not configured")
+		}
+		for rk, connectorIDs := range remoteTargetsByKernel {
+			outPacket := &DataPacket{
+				ChannelID:      packet.ChannelID,
+				SequenceNumber: packet.SequenceNumber,
+				Payload:        make([]byte, len(packet.Payload)),
+				Signature:      packet.Signature,
+				Timestamp:      packet.Timestamp,
+				SenderID:       packet.SenderID,
+				TargetIDs:      make([]string, len(connectorIDs)),
+				MessageType:    packet.MessageType,
+			}
+			copy(outPacket.Payload, packet.Payload)
+			copy(outPacket.TargetIDs, connectorIDs)
+			if err := c.manager.forwardToKernel(rk, outPacket); err != nil {
+				log.Printf("⚠ Failed to forward packet to kernel %s: %v", rk, err)
+			}
+		}
+	}
+
+	// 没有订阅者且没有目标接收者（包括远端），数据丢失（正常情况返回 nil）
 	return nil
 }
 

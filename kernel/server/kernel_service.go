@@ -256,14 +256,108 @@ func (s *KernelServiceServer) DiscoverKernels(ctx context.Context, req *pb.Disco
 
 // CreateCrossKernelChannel 创建跨内核频道
 func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req *pb.CreateCrossKernelChannelRequest) (*pb.CreateCrossKernelChannelResponse, error) {
-	// TODO: 实现跨内核频道创建逻辑
-	// 这需要协调多个内核间的频道协商
+	// 实现跨内核频道创建（协商）：
+	// - 发起端在本内核创建频道提议（ProposeChannel）
+	// - 对于涉及到的远端内核，向它们发送同样的请求作为“提议通知”（远端会返回 accept/reject）
+	// - 如果所有远端均接受，则在本内核对远端参与者标记批准（AcceptChannelProposal），激活频道
 
-	log.Printf("Cross-kernel channel creation requested by kernel %s", req.CreatorKernelId)
+	localKernelID := s.multiKernelManager.config.KernelID
+
+	// 如果这是远端内核转发过来的提议（CreatorKernelId != 本地），直接返回接受（远端提议通知）
+	if req.CreatorKernelId != localKernelID {
+		// 简单自动接受远端的提议通知（不在远端创建完整频道实例，远端只需告知是否接受）
+		return &pb.CreateCrossKernelChannelResponse{
+			Success: true,
+			Message: "proposal received and accepted",
+		}, nil
+	}
+
+	// 构建参与者 ID 列表（本地 connector 使用原 ID，远端 connector 使用 kernel:connector 格式）
+	senderIDs := make([]string, 0, len(req.SenderIds))
+	receiverIDs := make([]string, 0, len(req.ReceiverIds))
+	remoteKernels := make(map[string]bool)
+	for _, p := range req.SenderIds {
+		if p.KernelId != "" && p.KernelId != localKernelID {
+			senderIDs = append(senderIDs, fmt.Sprintf("%s:%s", p.KernelId, p.ConnectorId))
+			remoteKernels[p.KernelId] = true
+		} else {
+			senderIDs = append(senderIDs, p.ConnectorId)
+		}
+	}
+	for _, p := range req.ReceiverIds {
+		if p.KernelId != "" && p.KernelId != localKernelID {
+			receiverIDs = append(receiverIDs, fmt.Sprintf("%s:%s", p.KernelId, p.ConnectorId))
+			remoteKernels[p.KernelId] = true
+		} else {
+			receiverIDs = append(receiverIDs, p.ConnectorId)
+		}
+	}
+
+	// 将 proto EvidenceConfig 转换为内部 circulation.EvidenceConfig（如果有）
+	var evConfig *circulation.EvidenceConfig
+	if req.EvidenceConfig != nil {
+		evConfig = &circulation.EvidenceConfig{
+			Mode:           circulation.EvidenceMode(req.EvidenceConfig.Mode),
+			Strategy:       circulation.EvidenceStrategy(req.EvidenceConfig.Strategy),
+			ConnectorID:    req.EvidenceConfig.ConnectorId,
+			BackupEnabled:  req.EvidenceConfig.BackupEnabled,
+			RetentionDays:  int(req.EvidenceConfig.RetentionDays),
+			CompressData:   req.EvidenceConfig.CompressData,
+			CustomSettings: req.EvidenceConfig.CustomSettings,
+		}
+	}
+
+	// 在本内核创建频道提议（本地管理）
+	channel, err := s.channelManager.ProposeChannel(req.CreatorConnectorId, req.CreatorConnectorId, senderIDs, receiverIDs, req.DataTopic, req.Encrypted, evConfig, "", req.Reason, 300)
+	if err != nil {
+		return &pb.CreateCrossKernelChannelResponse{
+			Success: false,
+			Message: fmt.Sprintf("failed to propose channel: %v", err),
+		}, nil
+	}
+
+	// 向所有远端内核发送提议通知
+	for rk := range remoteKernels {
+		// 查找已连接的内核信息
+		s.multiKernelManager.kernelsMu.RLock()
+		kinfo, exists := s.multiKernelManager.kernels[rk]
+		s.multiKernelManager.kernelsMu.RUnlock()
+		if !exists {
+			// 目标内核未连接，拒绝提议
+			// 回退：拒绝本地提议
+			_ = s.channelManager.RejectChannelProposal(channel.ChannelID, req.CreatorConnectorId, fmt.Sprintf("remote kernel %s not connected", rk))
+			return &pb.CreateCrossKernelChannelResponse{
+				Success: false,
+				Message: fmt.Sprintf("remote kernel %s not connected", rk),
+			}, nil
+		}
+
+		// 发送提议通知到远端内核（对方会返回 success=true 表示接受）
+		// 使用同样的请求结构；远端会把 CreatorKernelId != local 做为提议通知并接受
+		_, err := kinfo.Client.CreateCrossKernelChannel(context.Background(), req)
+		if err != nil {
+			// 远端返回错误或拒绝：回退本地提议
+			_ = s.channelManager.RejectChannelProposal(channel.ChannelID, req.CreatorConnectorId, fmt.Sprintf("remote kernel %s rejected: %v", rk, err))
+			return &pb.CreateCrossKernelChannelResponse{
+				Success: false,
+				Message: fmt.Sprintf("remote kernel %s rejected: %v", rk, err),
+			}, nil
+		}
+	}
+
+	// 所有远端内核均接受，标记远端参与者为已批准（本地接受）
+	// 逐个批准参与者（包含远端标识）
+	for _, id := range senderIDs {
+		_ = s.channelManager.AcceptChannelProposal(channel.ChannelID, id)
+	}
+	for _, id := range receiverIDs {
+		_ = s.channelManager.AcceptChannelProposal(channel.ChannelID, id)
+	}
 
 	return &pb.CreateCrossKernelChannelResponse{
-		Success: false,
-		Message: "not implemented yet",
+		Success:   true,
+		ChannelId: channel.ChannelID,
+		Message:   "cross-kernel channel proposed and approved by peers",
 	}, nil
 }
 

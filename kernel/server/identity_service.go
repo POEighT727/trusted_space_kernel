@@ -216,10 +216,35 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 	isKernelRequest := strings.HasPrefix(req.RequesterId, "kernel-")
 	if !isKernelRequest {
 		// 普通连接器请求：验证连接器ID
-	if err := security.VerifyConnectorID(ctx, req.RequesterId); err != nil {
-		return &pb.DiscoverResponse{
-			TotalCount: 0,
-		}, fmt.Errorf("requester authentication failed: %w", err)
+		if err := security.VerifyConnectorID(ctx, req.RequesterId); err != nil {
+			return &pb.DiscoverResponse{
+				TotalCount: 0,
+			}, fmt.Errorf("requester authentication failed: %w", err)
+		}
+		// 如果存在已连接的内核，汇总本地 + 远端连接器供连接器查看
+		if s.multiKernelManager != nil && s.multiKernelManager.GetConnectedKernelCount() > 0 {
+			connectors, err := s.multiKernelManager.CollectAllConnectors()
+			if err != nil {
+				log.Printf("Failed to collect connectors for Discover: %v", err)
+				// 回退到仅本地列表（继续执行后续本地分支）
+			} else {
+				// 过滤掉请求者自身（本地注册的同名连接器）
+				final := make([]*pb.ConnectorInfo, 0, len(connectors))
+				for _, c := range connectors {
+					if c.ConnectorId == req.RequesterId && c.KernelId == s.multiKernelManager.config.KernelID {
+						continue
+					}
+					// 类型过滤
+					if req.FilterType == "" || c.EntityType == req.FilterType {
+						final = append(final, c)
+					}
+				}
+
+				return &pb.DiscoverResponse{
+					Connectors: final,
+					TotalCount: int32(len(final)),
+				}, nil
+			}
 		}
 	} else {
 		// 内核间请求：验证内核身份（TODO: 实现内核身份验证）
@@ -227,9 +252,39 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 		log.Printf("Kernel-to-kernel request from %s", req.RequesterId)
 	}
 
-	// 获取所有连接器列表
+	// 对于内核间请求，仅返回本地注册表中的连接器（避免递归调用到其他内核）
+	if isKernelRequest {
+		allConnectors := s.registry.ListConnectors()
+		pbConnectors := make([]*pb.ConnectorInfo, 0, len(allConnectors))
+		for _, info := range allConnectors {
+			pbConnectors = append(pbConnectors, &pb.ConnectorInfo{
+				ConnectorId:   info.ConnectorID,
+				EntityType:    info.EntityType,
+				PublicKey:     info.PublicKey,
+				Status:        string(info.Status),
+				LastHeartbeat: info.LastHeartbeat.Unix(),
+				RegisteredAt:  info.RegisteredAt.Unix(),
+				KernelId:      s.multiKernelManager.config.KernelID,
+			})
+		}
+		// 可选类型过滤
+		if req.FilterType != "" {
+			filtered := make([]*pb.ConnectorInfo, 0)
+			for _, c := range pbConnectors {
+				if c.EntityType == req.FilterType {
+					filtered = append(filtered, c)
+				}
+			}
+			pbConnectors = filtered
+		}
+		return &pb.DiscoverResponse{
+			Connectors: pbConnectors,
+			TotalCount: int32(len(pbConnectors)),
+		}, nil
+	}
+
+	// 普通连接器请求：返回本地注册表中的连接器
 	allConnectors := s.registry.ListConnectors()
-	
 	// 过滤掉请求者自己
 	filtered := make([]*control.ConnectorInfo, 0)
 	for _, info := range allConnectors {

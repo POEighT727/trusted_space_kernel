@@ -271,6 +271,21 @@ func main() {
 		log.Fatalf("Failed to initialize multi-kernel manager: %v", err)
 	}
 
+	// 将跨内核数据转发回调注入到 ChannelManager（当检测到目标为 kernel:connector 时调用）
+	channelManager.SetForwardToKernel(func(kernelID string, packet *circulation.DataPacket) error {
+		// 将 circulation.DataPacket 转为 pb.DataPacket
+		pbPacket := &pb.DataPacket{
+			ChannelId:      packet.ChannelID,
+			SequenceNumber: packet.SequenceNumber,
+			Payload:        packet.Payload,
+			Signature:      packet.Signature,
+			Timestamp:      packet.Timestamp,
+			SenderId:       packet.SenderID,
+			TargetIds:      packet.TargetIDs,
+		}
+		return multiKernelManager.ForwardData(kernelID, pbPacket)
+	})
+
 	// 连接种子内核
 	for _, seed := range config.MultiKernel.SeedKernels {
 		go func(seedConfig SeedKernelConfig) {
