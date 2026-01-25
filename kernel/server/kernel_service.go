@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -34,7 +36,11 @@ func NewKernelServiceServer(multiKernelManager *MultiKernelManager,
 
 // RegisterKernel 注册内核
 func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.RegisterKernelRequest) (*pb.RegisterKernelResponse, error) {
-	log.Printf("Kernel %s registering from %s:%d", req.KernelId, req.Address, req.Port)
+	// 避免在 interconnect 协商路径产生重复日志：当请求带有 interconnect_request 或 interconnect_approve 时，
+	// 后续分支会产生更有意义的日志，所以这里跳过初始注册日志以减少噪音。
+	if md := req.GetMetadata(); md == nil || (md["interconnect_request"] != "true" && md["interconnect_approve"] != "true") {
+		log.Printf("Kernel %s registering from %s:%d", req.KernelId, req.Address, req.Port)
+	}
 
 	// 验证内核ID不冲突
 	if req.KernelId == s.multiKernelManager.config.KernelID {
@@ -54,6 +60,92 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 			Success: false,
 			Message: "kernel already registered",
 		}, nil
+	}
+
+	// 如果这是一个互联批准（interconnect_approve），直接完成注册（由目标发起approve时调用）
+	if md := req.GetMetadata(); md != nil {
+		if v, ok := md["interconnect_approve"]; ok && (v == "true" || v == "1") {
+			// 保存对方的CA证书（如果提供）
+			if len(req.CaCertificate) > 0 {
+				peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", req.KernelId)
+				if err := os.WriteFile(peerCACertPath, req.CaCertificate, 0644); err != nil {
+					log.Printf("Warning: failed to save peer CA certificate for %s: %v", req.KernelId, err)
+				} else {
+					// suppressed detailed CA saved log
+				}
+			}
+
+			// 创建内核信息并保存（直接认为已注册）
+			kernelInfo := &KernelInfo{
+				KernelID:      req.KernelId,
+				Address:       req.Address,
+				Port:          int(req.Port),
+				MainPort:      int(req.Port),
+				Status:        "active",
+				LastHeartbeat: time.Now().Unix(),
+				PublicKey:     req.PublicKey,
+				Description:   "",
+			}
+			s.multiKernelManager.kernelsMu.Lock()
+			s.multiKernelManager.kernels[req.KernelId] = kernelInfo
+			s.multiKernelManager.kernelsMu.Unlock()
+
+			ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
+			if err != nil {
+				ownCACertData = nil
+			}
+
+			log.Printf("Kernel %s registered via approve by peer", req.KernelId)
+			return &pb.RegisterKernelResponse{
+				Success:           true,
+				Message:           "kernel registered via approve",
+				SessionToken:      fmt.Sprintf("session_%s_%d", req.KernelId, time.Now().Unix()),
+				PeerCaCertificate: ownCACertData,
+				KnownKernels:      []*pb.KernelInfo{},
+			}, nil
+		}
+	}
+
+	// 如果这是一个互联请求（由发起方主动发起），则创建一个待审批请求并返回 request id
+	if md := req.GetMetadata(); md != nil {
+		if v, ok := md["interconnect_request"]; ok && (v == "true" || v == "1") {
+			// 使用 SHA256(hash of kernelID + timestamp) 生成 request id，格式为 hex 字符串
+			raw := fmt.Sprintf("%s-%d", req.KernelId, time.Now().UnixNano())
+			sum := sha256.Sum256([]byte(raw))
+			requestID := hex.EncodeToString(sum[:])
+
+			// 记录请求方的主端口和内核通信端口（假定 kernel_port = main_port + 2）
+			mainPort := int(req.Port)
+			kernelPort := mainPort + 2
+			pending := &PendingInterconnectRequest{
+				RequestID:         requestID,
+				RequesterKernelID: req.KernelId,
+				Address:           req.Address,
+				MainPort:          mainPort,
+				KernelPort:        kernelPort,
+				CaCertificate:     req.CaCertificate,
+				Timestamp:         req.Timestamp,
+				Status:            "pending",
+			}
+			// add to pending list
+			s.multiKernelManager.AddPendingRequest(pending)
+
+			// 尝试读取自己的 CA 证书返回给对端（方便对端保存）
+			ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
+			if err != nil {
+				ownCACertData = nil
+			}
+
+			log.Printf("Saved interconnect request %s from kernel %s", requestID, req.KernelId)
+
+			return &pb.RegisterKernelResponse{
+				Success:           true,
+				Message:           fmt.Sprintf("interconnect_request_id:%s;status:pending", requestID),
+				SessionToken:      "", // not a session yet
+				PeerCaCertificate: ownCACertData,
+				KnownKernels:      []*pb.KernelInfo{}, // not registering yet
+			}, nil
+		}
 	}
 
 	// 保存对方的CA证书（如果提供）
@@ -128,8 +220,7 @@ func (s *KernelServiceServer) KernelHeartbeat(ctx context.Context, req *pb.Kerne
 	}
 	s.multiKernelManager.kernelsMu.Unlock()
 
-	log.Printf("Heartbeat from kernel %s: connectors=%d, channels=%d",
-		req.KernelId, req.Stats["connectors"], req.Stats["channels"])
+	// heartbeat logging suppressed (kept internal state updates only)
 
 	return &pb.KernelHeartbeatResponse{
 		Acknowledged: true,

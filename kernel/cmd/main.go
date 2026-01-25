@@ -447,6 +447,10 @@ func runInteractiveKernelShell(config *Config, channelManager *circulation.Chann
 			handleKernelList(multiKernelManager)
 		case "connect-kernel":
 			handleConnectKernel(multiKernelManager, args)
+		case "pending-requests":
+			handleListPendingRequests(multiKernelManager)
+		case "approve-request":
+			handleApproveRequest(multiKernelManager, args)
 		case "disconnect-kernel":
 			handleDisconnectKernel(multiKernelManager, args)
 		case "exit", "quit", "q":
@@ -461,14 +465,27 @@ func runInteractiveKernelShell(config *Config, channelManager *circulation.Chann
 // printKernelHelp 打印内核命令帮助
 func printKernelHelp() {
 	fmt.Println("Kernel Management Commands:")
-	fmt.Println("  status              - Show kernel status and statistics")
-	fmt.Println("  connectors, cs      - List all connectors (local + connected kernels)")
-	fmt.Println("  channels, ch        - List all channels in this kernel")
-	fmt.Println("  kernels, ks         - List all known kernels (multi-kernel mode)")
-	fmt.Println("  connect-kernel <kernel_id> <address> <port> - Connect to another kernel")
+	fmt.Println("  status                        - Show kernel status and statistics")
+	fmt.Println("  connectors, cs                - List all connectors (local + connected kernels)")
+	fmt.Println("  channels, ch                  - List all channels in this kernel")
+	fmt.Println("  kernels, ks                   - List all known kernels (multi-kernel mode)")
+	fmt.Println("  connect-kernel <id> <addr> <port>")
+	fmt.Println("                                - Initiate inter-kernel connection (generates request id)")
 	fmt.Println("  disconnect-kernel <kernel_id> - Disconnect from a kernel")
-	fmt.Println("  help, h             - Show this help message")
-	fmt.Println("  exit, quit, q       - Exit the kernel")
+	fmt.Println("  pending-requests              - List pending interconnect requests awaiting approval")
+	fmt.Println("  approve-request <request_id>  - Approve a pending interconnect request (establish connection)")
+	fmt.Println()
+	fmt.Println("Notes:")
+	fmt.Println("  - Typical connect example: connect-kernel kernel-2 192.168.202.136 50053")
+	fmt.Println("    This sends an interconnect request to the target; it returns a request id.")
+	fmt.Println("  - On the target kernel, run `pending-requests` to view request ids, then")
+	fmt.Println("    `approve-request <id>` to approve and establish the connection.")
+	fmt.Println()
+	fmt.Println("  - connectors/ks/cs collect information across connected kernels;")
+	fmt.Println("    after approval, run `ks` to confirm the peer kernel is known.")
+	fmt.Println()
+	fmt.Println("  help, h                       - Show this help message")
+	fmt.Println("  exit, quit, q                 - Exit the kernel")
 	fmt.Println()
 }
 
@@ -633,6 +650,12 @@ func handleConnectKernel(multiKernelManager *server.MultiKernelManager, args []s
 	fmt.Printf("Connecting to kernel %s at %s:%d...\n", kernelID, address, port)
 
 	if err := multiKernelManager.ConnectToKernel(kernelID, address, port); err != nil {
+		// 特殊处理 interconnect pending 错误
+		if strings.HasPrefix(err.Error(), "interconnect_pending:") {
+			requestID := strings.TrimPrefix(err.Error(), "interconnect_pending:")
+			fmt.Printf("Interconnect request sent (request id: %s). Waiting for approval on the target kernel.\n", requestID)
+			return
+		}
 		fmt.Printf("Failed to connect: %v\n", err)
 		return
 	}
@@ -662,6 +685,50 @@ func handleDisconnectKernel(multiKernelManager *server.MultiKernelManager, args 
 	}
 
 	fmt.Printf("Successfully disconnected from kernel %s\n", kernelID)
+}
+
+// handleListPendingRequests 列出待审批的内核互联请求
+func handleListPendingRequests(multiKernelManager *server.MultiKernelManager) {
+	if multiKernelManager == nil {
+		fmt.Println("Multi-kernel mode not enabled")
+		return
+	}
+	pending := multiKernelManager.ListPendingRequests()
+	if len(pending) == 0 {
+		fmt.Println("No pending interconnect requests")
+		return
+	}
+	fmt.Println("=== Pending Interconnect Requests ===")
+	fmt.Println(strings.Repeat("-", 80))
+	fmt.Printf("%-40s %-20s %-15s %-10s\n", "Request ID", "Requester Kernel", "Address", "Status")
+	fmt.Println(strings.Repeat("-", 80))
+	for _, r := range pending {
+		kp := r.KernelPort
+		if kp == 0 {
+			kp = r.MainPort + 2
+		}
+		fmt.Printf("%-40s %-20s %-15s %-10s\n", r.RequestID, r.RequesterKernelID, fmt.Sprintf("%s:%d", r.Address, kp), r.Status)
+	}
+	fmt.Println()
+}
+
+// handleApproveRequest 批准指定的互联请求
+func handleApproveRequest(multiKernelManager *server.MultiKernelManager, args []string) {
+	if multiKernelManager == nil {
+		fmt.Println("Multi-kernel mode not enabled")
+		return
+	}
+	if len(args) != 1 {
+		fmt.Println("Usage: approve-request <request_id>")
+		return
+	}
+	requestID := args[0]
+	fmt.Printf("Approving interconnect request %s...\n", requestID)
+	if err := multiKernelManager.ApprovePendingRequest(requestID); err != nil {
+		fmt.Printf("Failed to approve request: %v\n", err)
+		return
+	}
+	fmt.Printf("Approved and connected for request %s\n", requestID)
 }
 
 // handleSyncConnectors 处理同步连接器命令
