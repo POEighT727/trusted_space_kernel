@@ -2,13 +2,13 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	pb "github.com/trusted-space/kernel/proto/kernel/v1"
 	"github.com/trusted-space/kernel/kernel/circulation"
 	"github.com/trusted-space/kernel/kernel/control"
@@ -21,16 +21,18 @@ type KernelServiceServer struct {
 	multiKernelManager *MultiKernelManager
 	channelManager     *circulation.ChannelManager
 	registry           *control.Registry
+	notificationManager *NotificationManager
 }
 
 // NewKernelServiceServer 创建内核服务服务器
 func NewKernelServiceServer(multiKernelManager *MultiKernelManager,
-	channelManager *circulation.ChannelManager, registry *control.Registry) *KernelServiceServer {
+	channelManager *circulation.ChannelManager, registry *control.Registry, notificationManager *NotificationManager) *KernelServiceServer {
 
 	return &KernelServiceServer{
-		multiKernelManager: multiKernelManager,
-		channelManager:     channelManager,
-		registry:           registry,
+		multiKernelManager:  multiKernelManager,
+		channelManager:      channelManager,
+		registry:            registry,
+		notificationManager: notificationManager,
 	}
 }
 
@@ -88,7 +90,17 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 			}
 			s.multiKernelManager.kernelsMu.Lock()
 			s.multiKernelManager.kernels[req.KernelId] = kernelInfo
+			log.Printf("✓ Saved kernel %s to kernels map (via approve)", req.KernelId)
 			s.multiKernelManager.kernelsMu.Unlock()
+
+			// 重要：同步创建到新注册内核的客户端连接（用于后续 ForwardData 和通知转发）
+			targetPort := int(req.Port) + 2 // kernel-to-kernel 端口 = 主端口 + 2
+			log.Printf("🔧 Creating client for approved kernel %s at %s:%d", req.KernelId, req.Address, targetPort)
+			if err := s.multiKernelManager.createKernelClient(req.KernelId, req.Address, targetPort); err != nil {
+				log.Printf("⚠ Failed to create client for approved kernel %s: %v", req.KernelId, err)
+			} else {
+				log.Printf("✓ Client connection established for approved kernel %s", req.KernelId)
+			}
 
 			ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
 			if err != nil {
@@ -109,10 +121,8 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 	// 如果这是一个互联请求（由发起方主动发起），则创建一个待审批请求并返回 request id
 	if md := req.GetMetadata(); md != nil {
 		if v, ok := md["interconnect_request"]; ok && (v == "true" || v == "1") {
-			// 使用 SHA256(hash of kernelID + timestamp) 生成 request id，格式为 hex 字符串
-			raw := fmt.Sprintf("%s-%d", req.KernelId, time.Now().UnixNano())
-			sum := sha256.Sum256([]byte(raw))
-			requestID := hex.EncodeToString(sum[:])
+			// 使用 UUID 生成 request id
+			requestID := uuid.New().String()
 
 			// 记录请求方的主端口和内核通信端口（假定 kernel_port = main_port + 2）
 			mainPort := int(req.Port)
@@ -173,7 +183,20 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 	// 保存到已知内核列表
 	s.multiKernelManager.kernelsMu.Lock()
 	s.multiKernelManager.kernels[req.KernelId] = kernelInfo
+	log.Printf("✓ Saved kernel %s to kernels map, conn=%v", req.KernelId, kernelInfo.conn)
 	s.multiKernelManager.kernelsMu.Unlock()
+
+	// 创建到新注册内核的客户端连接（用于后续 ForwardData 等调用）
+	// kernel_port 为主端口+2
+	targetPort := int(req.Port) + 2
+	log.Printf("🔧 About to create client for kernel %s at %s:%d", req.KernelId, req.Address, targetPort)
+	
+	// 同步创建客户端连接（重要：确保连接在发送任何通知前已建立）
+	if err := s.multiKernelManager.createKernelClient(req.KernelId, req.Address, targetPort); err != nil {
+		log.Printf("⚠ Failed to create client for registered kernel %s: %v", req.KernelId, err)
+	} else {
+		log.Printf("✓ Client connection established for kernel %s", req.KernelId)
+	}
 
 	// 读取自己的CA证书
 	ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
@@ -263,12 +286,100 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 
 	localKernelID := s.multiKernelManager.config.KernelID
 
-	// 如果这是远端内核转发过来的提议（CreatorKernelId != 本地），直接返回接受（远端提议通知）
+	// 如果请求中没有提供 CreatorKernelId，则视为来自本地（Connector 直接发起），注入本地 KernelID
+	if req.CreatorKernelId == "" {
+		req.CreatorKernelId = localKernelID
+	}
+
+	// 如果这是远端内核转发过来的提议（CreatorKernelId != 本地），在本地创建一个提议记录并通知本地参与者
 	if req.CreatorKernelId != localKernelID {
-		// 简单自动接受远端的提议通知（不在远端创建完整频道实例，远端只需告知是否接受）
+		log.Printf("Received cross-kernel proposal notification from kernel %s (creator connector %s)", req.CreatorKernelId, req.CreatorConnectorId)
+
+		// 构建参与者列表：本地使用裸 connectorID，远端使用 kernel:connector 格式
+		senderIDs := make([]string, 0, len(req.SenderIds))
+		receiverIDs := make([]string, 0, len(req.ReceiverIds))
+		for _, p := range req.SenderIds {
+			if p.KernelId != "" && p.KernelId != localKernelID {
+				senderIDs = append(senderIDs, fmt.Sprintf("%s:%s", p.KernelId, p.ConnectorId))
+			} else {
+				senderIDs = append(senderIDs, p.ConnectorId)
+			}
+		}
+		for _, p := range req.ReceiverIds {
+			if p.KernelId != "" && p.KernelId != localKernelID {
+				receiverIDs = append(receiverIDs, fmt.Sprintf("%s:%s", p.KernelId, p.ConnectorId))
+			} else {
+				receiverIDs = append(receiverIDs, p.ConnectorId)
+			}
+		}
+
+		// 转换存证配置（如果有）用于本地提议
+		var evConfig *circulation.EvidenceConfig
+		if req.EvidenceConfig != nil {
+			evConfig = &circulation.EvidenceConfig{
+				Mode:           circulation.EvidenceMode(req.EvidenceConfig.Mode),
+				Strategy:       circulation.EvidenceStrategy(req.EvidenceConfig.Strategy),
+				ConnectorID:    req.EvidenceConfig.ConnectorId,
+				BackupEnabled:  req.EvidenceConfig.BackupEnabled,
+				RetentionDays:  int(req.EvidenceConfig.RetentionDays),
+				CompressData:   req.EvidenceConfig.CompressData,
+				CustomSettings: req.EvidenceConfig.CustomSettings,
+			}
+		}
+
+		// 在本地创建频道提议（以远端创建者作为提议者）
+		channel, err := s.channelManager.ProposeChannel(req.CreatorConnectorId, req.CreatorConnectorId, senderIDs, receiverIDs, req.DataTopic, req.Encrypted, evConfig, "", req.Reason, 300)
+		if err != nil {
+			log.Printf("⚠ Failed to create local proposal for cross-kernel notification: %v", err)
+			return &pb.CreateCrossKernelChannelResponse{
+				Success: false,
+				Message: fmt.Sprintf("failed to create local proposal: %v", err),
+			}, nil
+		}
+
+		// 构建通知并发送给本地参与者（只通知本地 connector）
+		notification := &pb.ChannelNotification{
+			ChannelId:         channel.ChannelID,
+			CreatorId:         req.CreatorConnectorId,
+			SenderIds:         make([]string, 0),
+			ReceiverIds:       make([]string, 0),
+			Encrypted:         req.Encrypted,
+			DataTopic:         req.DataTopic,
+			CreatedAt:         channel.CreatedAt.Unix(),
+			NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_PROPOSED,
+			ProposalId:        channel.ChannelProposal.ProposalID,
+		}
+		// 填充发送方/接收方为字符串（对本地参与者使用裸ID）
+		for _, id := range senderIDs {
+			notification.SenderIds = append(notification.SenderIds, id)
+		}
+		for _, id := range receiverIDs {
+			notification.ReceiverIds = append(notification.ReceiverIds, id)
+		}
+
+		// 只通知本地参与者（如果 participant 字符串中不包含 ':'，说明是本地）
+		for _, id := range notification.ReceiverIds {
+			if !strings.Contains(id, ":") {
+				if err := s.notificationManager.Notify(id, notification); err != nil {
+					log.Printf("⚠ Failed to notify local receiver %s: %v", id, err)
+				} else {
+					log.Printf("✓ Notified local receiver %s of cross-kernel proposal %s", id, channel.ChannelID)
+				}
+			}
+		}
+		for _, id := range notification.SenderIds {
+			if !strings.Contains(id, ":") {
+				if err := s.notificationManager.Notify(id, notification); err != nil {
+					log.Printf("⚠ Failed to notify local sender %s: %v", id, err)
+				} else {
+					log.Printf("✓ Notified local sender %s of cross-kernel proposal %s", id, channel.ChannelID)
+				}
+			}
+		}
+
 		return &pb.CreateCrossKernelChannelResponse{
 			Success: true,
-			Message: "proposal received and accepted",
+			Message: "proposal received and local notifications dispatched",
 		}, nil
 	}
 
@@ -332,17 +443,67 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 			}, nil
 		}
 
-		// 发送提议通知到远端内核（对方会返回 success=true 表示接受）
-		// 使用同样的请求结构；远端会把 CreatorKernelId != local 做为提议通知并接受
-		_, err := kinfo.Client.CreateCrossKernelChannel(context.Background(), req)
+		// 通知远端内核，让远端在本地创建占位频道并通知其本地连接器。
+		// 这里使用目标内核的 IdentityService（主端口）建立连接并调用其 ChannelService.NotifyChannelCreated，
+		// 并在请求中填入本地 kernel id 作为 SenderId，以便远端能够回溯 origin 详细信息。
+		log.Printf("→ Notifying kernel %s to create local placeholder for channel %s", rk, channel.ChannelID)
+		// 为每个远端内核上的具体连接器逐个发送 NotifyChannelCreated（ReceiverId 必须是远端 connector id）
+		// 收集属于该远端内核的 connector IDs（来自原始 req 的 SenderIds/ReceiverIds）
+		targetConnectorIDs := make([]string, 0)
+		for _, p := range req.SenderIds {
+			if p.KernelId == rk && p.ConnectorId != "" {
+				targetConnectorIDs = append(targetConnectorIDs, p.ConnectorId)
+			}
+		}
+		for _, p := range req.ReceiverIds {
+			if p.KernelId == rk && p.ConnectorId != "" {
+				targetConnectorIDs = append(targetConnectorIDs, p.ConnectorId)
+			}
+		}
+
+		if len(targetConnectorIDs) == 0 {
+			// 没有具体目标连接器，跳过（理论上不会发生）
+			log.Printf("⚠ No target connectors for kernel %s, skipping notify", rk)
+			continue
+		}
+
+		identityConn, err := s.multiKernelManager.connectToKernelIdentityService(kinfo)
 		if err != nil {
-			// 远端返回错误或拒绝：回退本地提议
-			_ = s.channelManager.RejectChannelProposal(channel.ChannelID, req.CreatorConnectorId, fmt.Sprintf("remote kernel %s rejected: %v", rk, err))
+			log.Printf("⚠ Failed to connect to identity service of kernel %s: %v", rk, err)
+			_ = s.channelManager.RejectChannelProposal(channel.ChannelID, req.CreatorConnectorId, fmt.Sprintf("failed to notify remote kernel %s: %v", rk, err))
 			return &pb.CreateCrossKernelChannelResponse{
 				Success: false,
-				Message: fmt.Sprintf("remote kernel %s rejected: %v", rk, err),
+				Message: fmt.Sprintf("failed to notify remote kernel %s: %v", rk, err),
 			}, nil
 		}
+
+		chClient := pb.NewChannelServiceClient(identityConn)
+		// 对该内核的每个目标连接器分别通知
+			for _, targetCID := range targetConnectorIDs {
+				// 将 origin 的 proposal id 一并带上，格式为 "kernelID|proposalID"，
+				// 方便远端创建占位频道时使用相同的 proposal id。
+				senderWithProposal := localKernelID
+				if channel.ChannelProposal != nil && channel.ChannelProposal.ProposalID != "" {
+					senderWithProposal = fmt.Sprintf("%s|%s", localKernelID, channel.ChannelProposal.ProposalID)
+				}
+				_, err = chClient.NotifyChannelCreated(context.Background(), &pb.NotifyChannelRequest{
+					ReceiverId: targetCID,
+					ChannelId:  channel.ChannelID,
+					SenderId:   senderWithProposal,
+					DataTopic:  channel.DataTopic,
+				})
+			if err != nil {
+				log.Printf("⚠ NotifyChannelCreated RPC to kernel %s for connector %s failed: %v", rk, targetCID, err)
+				_ = s.channelManager.RejectChannelProposal(channel.ChannelID, req.CreatorConnectorId, fmt.Sprintf("remote kernel %s rejected: %v", rk, err))
+				identityConn.Close()
+				return &pb.CreateCrossKernelChannelResponse{
+					Success: false,
+					Message: fmt.Sprintf("remote kernel %s rejected: %v", rk, err),
+				}, nil
+			}
+			log.Printf("✓ Notified kernel %s to inform connector %s of channel %s", rk, targetCID, channel.ChannelID)
+		}
+		identityConn.Close()
 	}
 
 	// 所有远端内核均接受，标记远端参与者为已批准（本地接受）
@@ -409,17 +570,35 @@ func (s *KernelServiceServer) GetCrossKernelChannelInfo(ctx context.Context, req
 		}, nil
 	}
 
+	// 构建返回的参与者列表（使用 CrossKernelParticipant，local kernel -> KernelId 空）
+	senders := make([]*pb.CrossKernelParticipant, 0, len(channel.SenderIDs))
+	receivers := make([]*pb.CrossKernelParticipant, 0, len(channel.ReceiverIDs))
+	for _, sID := range channel.SenderIDs {
+		senders = append(senders, &pb.CrossKernelParticipant{
+			KernelId:    "",
+			ConnectorId: sID,
+		})
+	}
+	for _, rID := range channel.ReceiverIDs {
+		receivers = append(receivers, &pb.CrossKernelParticipant{
+			KernelId:    "",
+			ConnectorId: rID,
+		})
+	}
+
 	return &pb.GetCrossKernelChannelInfoResponse{
-		Found:             true,
-		ChannelId:         channel.ChannelID,
-		CreatorKernelId:   "", // TODO: 从频道信息中获取创建者内核ID
+		Found:              true,
+		ChannelId:          channel.ChannelID,
+		CreatorKernelId:    s.multiKernelManager.config.KernelID,
 		CreatorConnectorId: channel.CreatorID,
-		DataTopic:         channel.DataTopic,
-		Encrypted:         channel.Encrypted,
-		Status:            string(channel.Status),
-		CreatedAt:         channel.CreatedAt.Unix(),
-		LastActivity:      channel.LastActivity.Unix(),
-		Message:           "channel info retrieved successfully",
+		SenderIds:          senders,
+		ReceiverIds:        receivers,
+		DataTopic:          channel.DataTopic,
+		Encrypted:          channel.Encrypted,
+		Status:             string(channel.Status),
+		CreatedAt:          channel.CreatedAt.Unix(),
+		LastActivity:       channel.LastActivity.Unix(),
+		Message:            "channel info retrieved successfully",
 	}, nil
 }
 
@@ -429,8 +608,23 @@ func (s *KernelServiceServer) SyncConnectorInfo(ctx context.Context, req *pb.Syn
 
 	syncedCount := 0
 	for _, connectorInfo := range req.Connectors {
-		// TODO: 实现连接器信息同步逻辑
-		// 这里应该更新本地连接器注册表，处理跨内核连接器信息
+		// 更新本地注册表：将远端连接器视为已注册（KernelId 字段用于标注来源）
+		if connectorInfo.ConnectorId == "" {
+			log.Printf("⚠ Skipping connector with empty id from kernel %s", req.SourceKernelId)
+			continue
+		}
+
+		// 尝试注册（如果已存在则会更新信息）
+		if err := s.registry.Register(connectorInfo.ConnectorId, connectorInfo.EntityType, connectorInfo.PublicKey, ""); err != nil {
+			log.Printf("⚠ Failed to register connector %s from kernel %s: %v", connectorInfo.ConnectorId, req.SourceKernelId, err)
+			continue
+		}
+
+		// 同步状态（如果有提供），将字符串转换为 control.ConnectorStatus
+		if connectorInfo.Status != "" {
+			// 尝试设置状态，忽略错误（例如未知ID等）
+			_ = s.registry.SetStatus(connectorInfo.ConnectorId, control.ConnectorStatus(connectorInfo.Status))
+		}
 
 		log.Printf("Synced connector %s from kernel %s", connectorInfo.ConnectorId, req.SourceKernelId)
 		syncedCount++

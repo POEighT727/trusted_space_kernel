@@ -630,6 +630,13 @@ func (al *AuditLog) sendEvidenceToChannel(channelID string, record *EvidenceReco
 		return fmt.Errorf("evidence channel not found: %w", err)
 	}
 
+	// 检查频道是否已激活
+	if channel.Status != circulation.ChannelStatusActive {
+		// 频道未激活，跳过频道传输（证据已存储在数据库中）
+		log.Printf("ℹ️ Channel %s is not active (status: %s), skipping evidence transmission", channelID, channel.Status)
+		return nil
+	}
+
 	// 序列化存证记录
 	recordData, err := json.Marshal(record)
 	if err != nil {
@@ -665,13 +672,21 @@ func (al *AuditLog) sendEvidenceToChannel(channelID string, record *EvidenceReco
 		targetIDs = []string{}
 	}
 
+	// 确定发送者ID：优先使用原始连接器，但如果不是发送方则使用创建者
+	senderID := record.ConnectorID
+	if !channel.CanSend(senderID) {
+		// 如果原始连接器不是发送方，使用频道创建者作为发送者
+		senderID = channel.CreatorID
+		log.Printf("ℹ️ Using channel creator %s as sender for evidence (original sender %s is not authorized)", senderID, record.ConnectorID)
+	}
+
 	packet := &circulation.DataPacket{
 		ChannelID:      channelID,
 		SequenceNumber: sequenceNumber,
 		Payload:        recordData,
 		Signature:      "", // 存证数据由系统生成，暂时不需要签名
 		Timestamp:      record.Timestamp.Unix(),
-		SenderID:       record.ConnectorID, // 使用原始存证记录的连接器ID作为发送方
+		SenderID:       senderID,
 		TargetIDs:      targetIDs, // 根据存证模式确定发送目标
 		MessageType:    circulation.MessageTypeEvidence, // 设置为存证消息类型
 	}

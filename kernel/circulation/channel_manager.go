@@ -214,6 +214,74 @@ func NewChannelManager() *ChannelManager {
 	}
 }
 
+// CreateChannelWithID 创建一个频道并使用指定的 channelID（用于跨内核同步场景）
+func (cm *ChannelManager) CreateChannelWithID(channelID, creatorID, approverID string, senderIDs, receiverIDs []string, dataTopic string, encrypted bool, evidenceConfig *EvidenceConfig, configFilePath string) (*Channel, error) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if channelID == "" {
+		return nil, fmt.Errorf("channelID cannot be empty")
+	}
+	if creatorID == "" {
+		return nil, fmt.Errorf("creatorID cannot be empty")
+	}
+	if len(senderIDs) == 0 || len(receiverIDs) == 0 {
+		return nil, fmt.Errorf("senderIDs and receiverIDs must be provided")
+	}
+
+	// 如果已存在同 ID 的频道，返回错误
+	if _, exists := cm.channels[channelID]; exists {
+		return nil, fmt.Errorf("channel %s already exists", channelID)
+	}
+
+	channel := &Channel{
+		ChannelID:          channelID,
+		CreatorID:          creatorID,
+		ApproverID:         approverID,
+		SenderIDs:          make([]string, len(senderIDs)),
+		ReceiverIDs:        make([]string, len(receiverIDs)),
+		Encrypted:          encrypted,
+		DataTopic:          dataTopic,
+		Status:             ChannelStatusProposed,
+		CreatedAt:          time.Now(),
+		LastActivity:       time.Now(),
+		EvidenceConfig:     evidenceConfig,
+		ConfigFilePath:     configFilePath,
+		dataQueue:          make(chan *DataPacket, 1000),
+		subscribers:        make(map[string]chan *DataPacket),
+		buffer:             make([]*DataPacket, 0),
+		maxBufferSize:      10000,
+		permissionRequests: make([]*PermissionChangeRequest, 0),
+		manager:            cm,
+		ChannelProposal: &ChannelProposal{
+			ProposalID:        uuid.New().String(),
+			Status:            NegotiationStatusProposed,
+			Reason:            "",
+			TimeoutSeconds:    300,
+			CreatedAt:         time.Now(),
+			SenderIDs:         senderIDs,
+			ReceiverIDs:       receiverIDs,
+			ApproverID:        approverID,
+			SenderApprovals:   make(map[string]bool),
+			ReceiverApprovals: make(map[string]bool),
+		},
+	}
+
+	copy(channel.SenderIDs, senderIDs)
+	copy(channel.ReceiverIDs, receiverIDs)
+
+	for _, id := range senderIDs {
+		channel.ChannelProposal.SenderApprovals[id] = false
+	}
+	for _, id := range receiverIDs {
+		channel.ChannelProposal.ReceiverApprovals[id] = false
+	}
+
+	cm.channels[channelID] = channel
+
+	return channel, nil
+}
+
 // SetChannelCreatedCallback 设置频道创建通知回调
 func (cm *ChannelManager) SetChannelCreatedCallback(callback func(*Channel)) {
 	cm.mu.Lock()
@@ -402,24 +470,29 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 		return fmt.Errorf("channel proposal has expired")
 	}
 
-	// 根据接受者身份更新确认状态
-	isSender := false
-	for _, senderID := range channel.SenderIDs {
-		if accepterID == senderID {
-			channel.ChannelProposal.SenderApprovals[accepterID] = true
-			isSender = true
-			break
-		}
+	// 剥离 kernel 前缀，提取纯 connector ID（格式: "kernelID:connectorID" 或直接是 "connectorID"）
+	actualID := accepterID
+	if idx := strings.LastIndex(accepterID, ":"); idx != -1 {
+		actualID = accepterID[idx+1:]
 	}
 
+	// 支持带 kernel 前缀和去前缀两种格式，以适配跨内核转发的 accepterId
+	candidateIDs := []string{accepterID}
+	if actualID != accepterID {
+		candidateIDs = append(candidateIDs, actualID)
+	}
+
+	// 根据接受者身份更新确认状态
+	isSender := false
 	isReceiver := false
-	if !isSender {
-		for _, receiverID := range channel.ReceiverIDs {
-			if accepterID == receiverID {
-				channel.ChannelProposal.ReceiverApprovals[accepterID] = true
-				isReceiver = true
-				break
-			}
+	for _, cid := range candidateIDs {
+		if _, ok := channel.ChannelProposal.SenderApprovals[cid]; ok {
+			channel.ChannelProposal.SenderApprovals[cid] = true
+			isSender = true
+		}
+		if _, ok := channel.ChannelProposal.ReceiverApprovals[cid]; ok {
+			channel.ChannelProposal.ReceiverApprovals[cid] = true
+			isReceiver = true
 		}
 	}
 
@@ -444,10 +517,7 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 		}
 	}
 
-	log.Printf("🔍 Channel %s approval status - SenderApprovals: %v, ReceiverApprovals: %v", channelID, channel.ChannelProposal.SenderApprovals, channel.ChannelProposal.ReceiverApprovals)
-
 	if allApproved {
-		log.Printf("✅ All participants approved for channel %s, activating...", channelID)
 		// 所有参与方都确认了，激活频道
 		channel.Status = ChannelStatusActive
 		channel.ChannelProposal.Status = NegotiationStatusAccepted
@@ -455,9 +525,6 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 
 		// 启动数据分发协程（确保数据能够被分发到订阅者）
 		go channel.startDataDistribution()
-
-	} else {
-		log.Printf("⏳ Channel %s still waiting for approvals", channelID)
 	}
 
 	return nil
@@ -944,8 +1011,18 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		}
 		targetReceivers = localTargets
 	} else {
-		// 广播模式：所有本地接收者
+		// 广播模式：
+		// - 将远端接收者 (kernelID:connectorID) 按内核分组用于转发
+		// - 本地接收者仍按原逻辑判断是否已订阅/在线
 		for _, receiverID := range c.ReceiverIDs {
+			if strings.Contains(receiverID, ":") {
+				parts := strings.SplitN(receiverID, ":", 2)
+				kernelPart := parts[0]
+				connectorPart := parts[1]
+				remoteTargetsByKernel[kernelPart] = append(remoteTargetsByKernel[kernelPart], connectorPart)
+				continue
+			}
+			// 本地接收者
 			if _, subscribed := c.subscribers[receiverID]; !subscribed {
 				if c.manager != nil && !c.manager.IsConnectorOnline(receiverID) {
 					offlineTargets = append(offlineTargets, receiverID)
@@ -1162,6 +1239,12 @@ func (c *Channel) startDataDistribution() {
 			}
 		}
 	}
+}
+
+// StartDataDistribution exported wrapper to start the internal data distribution goroutine.
+// Provided so callers from other packages (e.g. kernel server) can trigger distribution.
+func (c *Channel) StartDataDistribution() {
+	go c.startDataDistribution()
 }
 
 // GetSubscriberCount 获取订阅者数量

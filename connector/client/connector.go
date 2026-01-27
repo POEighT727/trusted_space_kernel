@@ -50,11 +50,13 @@ type Connector struct {
 	publicKey    string
 	serverAddr   string
 	status       ConnectorStatus // 连接器状态，默认为active
-	
+	kernelID     string // 可选：连接器所在内核ID（用于跨内核发现请求）
+
 	conn         *grpc.ClientConn
 	identitySvc  pb.IdentityServiceClient
 	channelSvc   pb.ChannelServiceClient
 	evidenceSvc  pb.EvidenceServiceClient
+	kernelSvc    pb.KernelServiceClient
 	
 	sessionToken string
 	ctx          context.Context
@@ -91,6 +93,8 @@ type Config struct {
 	// 存证存储配置
 	EvidenceLocalStorage bool   // 是否启用本地存证存储
 	EvidenceStoragePath  string // 本地存证存储路径
+	// 可选：当前连接器所属的内核ID（用于跨内核发现）
+	KernelID string
 }
 
 // NewConnector 创建新的连接器
@@ -122,11 +126,13 @@ func NewConnector(config *Config) (*Connector, error) {
 		entityType:  config.EntityType,
 		publicKey:   config.PublicKey,
 		serverAddr:  config.ServerAddr,
+		kernelID:    config.KernelID,
 		status:      ConnectorStatusActive, // 默认状态为active
 		conn:        conn,
 		identitySvc: pb.NewIdentityServiceClient(conn),
 		channelSvc:  pb.NewChannelServiceClient(conn),
 		evidenceSvc: pb.NewEvidenceServiceClient(conn),
+		kernelSvc:   pb.NewKernelServiceClient(conn),
 		ctx:         ctx,
 		cancel:      cancel,
 		channels:     make(map[string]*LocalChannelInfo),
@@ -1161,7 +1167,7 @@ func (c *Connector) DiscoverConnectors(filterType string) ([]*pb.ConnectorInfo, 
 func (c *Connector) DiscoverCrossKernelConnectors(targetKernelID, filterType string) ([]*pb.ConnectorInfo, []*pb.KernelInfo, error) {
 	resp, err := c.identitySvc.DiscoverCrossKernelConnectors(c.ctx, &pb.CrossKernelDiscoverRequest{
 		RequesterId:      c.connectorID,
-		RequesterKernelId: "", // 当前连接器所在内核ID，TODO: 需要从配置或上下文获取
+		RequesterKernelId: c.kernelID, // 当前连接器所在内核ID（可为空）
 		FilterType:       filterType,
 		TargetKernelId:   targetKernelID,
 	})
@@ -1170,6 +1176,49 @@ func (c *Connector) DiscoverCrossKernelConnectors(targetKernelID, filterType str
 	}
 
 	return resp.Connectors, resp.Kernels, nil
+}
+
+// CreateCrossKernelChannel 发起跨内核频道创建（由连接器调用，代理到本地内核的 KernelService.CreateCrossKernelChannel）
+func (c *Connector) CreateCrossKernelChannel(senderIDs []string, receiverIDs []string, dataTopic string, encrypted bool, reason string, evidenceConfig *pb.EvidenceConfig) (string, error) {
+	// 构建请求中的 CrossKernelParticipant 列表
+	buildParticipants := func(ids []string) []*pb.CrossKernelParticipant {
+		out := make([]*pb.CrossKernelParticipant, 0, len(ids))
+		for _, id := range ids {
+			if strings.Contains(id, ":") {
+				parts := strings.SplitN(id, ":", 2)
+				out = append(out, &pb.CrossKernelParticipant{
+					KernelId:    parts[0],
+					ConnectorId: parts[1],
+				})
+			} else {
+				out = append(out, &pb.CrossKernelParticipant{
+					KernelId:    "",
+					ConnectorId: id,
+				})
+			}
+		}
+		return out
+	}
+
+	req := &pb.CreateCrossKernelChannelRequest{
+		CreatorKernelId:    c.kernelID,
+		CreatorConnectorId: c.connectorID,
+		SenderIds:          buildParticipants(senderIDs),
+		ReceiverIds:        buildParticipants(receiverIDs),
+		DataTopic:          dataTopic,
+		Encrypted:          encrypted,
+		Reason:             reason,
+		EvidenceConfig:     evidenceConfig,
+	}
+
+	resp, err := c.kernelSvc.CreateCrossKernelChannel(c.ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("failed to create cross-kernel channel: %w", err)
+	}
+	if !resp.Success {
+		return "", fmt.Errorf("create cross-kernel channel failed: %s", resp.Message)
+	}
+	return resp.ChannelId, nil
 }
 
 // GetConnectorInfo 获取指定连接器的详细信息
@@ -1550,7 +1599,7 @@ func (c *Connector) AcceptChannelProposal(channelID, proposalID string) error {
 		return fmt.Errorf("accept channel proposal failed: %s", resp.Message)
 	}
 
-	log.Printf("✓ Channel proposal accepted: %s", channelID)
+	log.Printf("✓ Channel proposal accepted: %s (evidence hash: %s)", channelID, proposalID)
 
 	// 注意：频道可能还没有完全激活（需要所有参与方确认）
 	// 状态更新将通过通知机制异步处理

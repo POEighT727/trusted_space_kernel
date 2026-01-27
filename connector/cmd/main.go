@@ -29,6 +29,7 @@ type Config struct {
 	} `yaml:"connector"`
 
 	Kernel struct {
+		ID      string `yaml:"id"`
 		Address string `yaml:"address"`
 		Port    int    `yaml:"port"`
 	} `yaml:"kernel"`
@@ -117,6 +118,13 @@ func main() {
 		ServerName:     config.Security.ServerName,
 		EvidenceLocalStorage: config.Evidence.LocalStorage,
 		EvidenceStoragePath:  config.Evidence.StoragePath,
+		KernelID: func() string {
+			if config.Kernel.ID != "" {
+				return config.Kernel.ID
+			}
+			// fallback to environment variable if not set in config
+			return os.Getenv("KERNEL_ID")
+		}(),
 	})
 	if err != nil {
 		log.Fatalf("Failed to create connector: %v", err)
@@ -472,6 +480,65 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 
 	fmt.Printf("正在从配置文件创建频道: %s...\n", configFile)
 
+	// 读取配置文件内容以判断是否包含跨内核参与者
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		fmt.Printf("❌ 读取配置文件失败: %v\n", err)
+		return
+	}
+
+	// 解析为简化结构
+	var cfg struct {
+		SenderIDs   []string `json:"sender_ids"`
+		ReceiverIDs []string `json:"receiver_ids"`
+		DataTopic   string   `json:"data_topic"`
+		Encrypted   bool     `json:"encrypted"`
+		ChannelName string   `json:"channel_name"`
+		CreatorID   string   `json:"creator_id"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		// 尝试用 yaml 解析（兼容）
+		if err2 := yaml.Unmarshal(data, &cfg); err2 != nil {
+			// 无法解析，回退到原有方法
+			config, err := connector.CreateChannelFromConfig(configFile)
+			if err != nil {
+				fmt.Printf("❌ 创建频道失败: %v\n", err)
+				return
+			}
+			fmt.Printf("✓ 频道创建提议已提交\n")
+			fmt.Printf("  频道名称: %s\n", config.ChannelName)
+			fmt.Printf("  创建者: %s\n", config.CreatorID)
+			fmt.Printf("  发送方: %v\n", config.SenderIDs)
+			fmt.Printf("  接收方: %v\n", config.ReceiverIDs)
+			fmt.Printf("  数据主题: %s\n", config.DataTopic)
+			fmt.Printf("  加密: %v\n", config.Encrypted)
+			fmt.Println("  创建者已自动接受，等待其他参与方确认后频道将自动激活...")
+			return
+		}
+	}
+
+	containsRemote := func(ids []string) bool {
+		for _, id := range ids {
+			if strings.Contains(id, ":") {
+				return true
+			}
+		}
+		return false
+	}
+
+	if containsRemote(cfg.SenderIDs) || containsRemote(cfg.ReceiverIDs) {
+		// 使用跨内核创建
+		fmt.Println("检测到跨内核参与者，使用跨内核协商路径创建频道...")
+		chID, err := connector.CreateCrossKernelChannel(cfg.SenderIDs, cfg.ReceiverIDs, cfg.DataTopic, cfg.Encrypted, fmt.Sprintf("Create from config: %s", configFile), nil)
+		if err != nil {
+			fmt.Printf("❌ 跨内核频道创建失败: %v\n", err)
+			return
+		}
+		fmt.Printf("✓ 跨内核频道已创建: %s\n", chID)
+		return
+	}
+
+	// 否则使用原有本地提议流程
 	config, err := connector.CreateChannelFromConfig(configFile)
 	if err != nil {
 		fmt.Printf("❌ 创建频道失败: %v\n", err)
@@ -485,24 +552,6 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 	fmt.Printf("  接收方: %v\n", config.ReceiverIDs)
 	fmt.Printf("  数据主题: %s\n", config.DataTopic)
 	fmt.Printf("  加密: %v\n", config.Encrypted)
-
-	// 显示需要哪些参与方确认（创建者自动接受，不需要确认）
-	fmt.Println("  需要以下参与方确认:")
-	connectorID := connector.GetID()
-	hasOthers := false
-	for _, senderID := range config.SenderIDs {
-		if senderID != connectorID { // 创建者自己不需要确认
-			fmt.Printf("    - 发送方 %s 需要确认\n", senderID)
-			hasOthers = true
-		}
-	}
-	for _, receiverID := range config.ReceiverIDs {
-		fmt.Printf("    - 接收方 %s 需要确认\n", receiverID)
-		hasOthers = true
-	}
-	if !hasOthers {
-		fmt.Println("    - 无（所有参与方都是创建者自己）")
-	}
 	fmt.Println("  创建者已自动接受，等待其他参与方确认后频道将自动激活...")
 }
 
@@ -586,15 +635,55 @@ func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 		fmt.Println("权限批准者: 默认(创建者)")
 	}
 
-	channelID, proposalID, err := connector.ProposeChannel(senderIDs, receiverIDs, "", approverID, reason)
-	if err != nil {
-		fmt.Printf("❌ 提议创建频道失败: %v\n", err)
-		return
+	// 检查是否包含跨内核参与者（格式 kernel_id:connector_id）
+	containsRemote := func(ids []string) bool {
+		for _, id := range ids {
+			if strings.Contains(id, ":") {
+				return true
+			}
+		}
+		return false
 	}
 
-	fmt.Printf("✓ 频道提议创建成功\n")
-	fmt.Printf("  频道ID: %s\n", channelID)
-	fmt.Printf("  提议ID: %s\n", proposalID)
+	if containsRemote(senderIDs) || containsRemote(receiverIDs) {
+		// 使用跨内核创建流程：通过 KernelService.CreateCrossKernelChannel 发起
+		fmt.Println("检测到跨内核参与者，使用跨内核协商路径创建频道...")
+		chID, err := connector.CreateCrossKernelChannel(senderIDs, receiverIDs, "", true, reason, nil)
+		if err != nil {
+			fmt.Printf("❌ 跨内核频道创建失败: %v\n", err)
+			return
+		}
+		fmt.Printf("✓ 跨内核频道已创建: %s\n", chID)
+		// 本地记录将在通知中异步完成
+	} else {
+		channelID, proposalID, err := connector.ProposeChannel(senderIDs, receiverIDs, "", approverID, reason)
+		if err != nil {
+			fmt.Printf("❌ 提议创建频道失败: %v\n", err)
+			return
+		}
+
+		fmt.Printf("✓ 频道提议创建成功\n")
+		fmt.Printf("  频道ID: %s\n", channelID)
+		fmt.Printf("  提议ID: %s\n", proposalID)
+		// 显示需要哪些参与方确认（创建者自动接受，不需要确认）
+		fmt.Println("  需要以下参与方确认:")
+		selfID := connector.GetID()
+		hasOthers := false
+		for _, senderID := range senderIDs {
+			if senderID != selfID { // 创建者自己不需要确认
+				fmt.Printf("    - 发送方 %s 需要确认\n", senderID)
+				hasOthers = true
+			}
+		}
+		for _, receiverID := range receiverIDs {
+			fmt.Printf("    - 接收方 %s 需要确认\n", receiverID)
+			hasOthers = true
+		}
+		if !hasOthers {
+			fmt.Println("    - 无（所有参与方都是创建者自己）")
+		}
+		fmt.Println("  创建者已自动接受，等待其他参与方确认后频道将自动激活...")
+	}
 
 	// 显示需要哪些参与方确认（创建者自动接受，不需要确认）
 	fmt.Println("  需要以下参与方确认:")

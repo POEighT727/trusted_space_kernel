@@ -334,8 +334,10 @@ func main() {
 	evidenceService := server.NewEvidenceServiceServer(auditLog, channelManager)
 	pb.RegisterEvidenceServiceServer(grpcServer, evidenceService)
 
+	// 将 ChannelService 的 NotificationManager 注入到 MultiKernelManager，供内核间服务使用
+	multiKernelManager.SetNotificationManager(channelService.NotificationManager)
 	// 注册内核间通信服务（多内核网络核心服务）
-	kernelService := server.NewKernelServiceServer(multiKernelManager, channelManager, registry)
+	kernelService := server.NewKernelServiceServer(multiKernelManager, channelManager, registry, channelService.NotificationManager)
 	pb.RegisterKernelServiceServer(grpcServer, kernelService)
 	log.Println("✓ Kernel-to-kernel service registered")
 

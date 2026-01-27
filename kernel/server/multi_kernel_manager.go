@@ -62,6 +62,8 @@ type MultiKernelManager struct {
 	pendingRequestsMu sync.RWMutex
 
 	running bool
+	// NotificationManager 用于内核间服务通知本地连接器（由外部注入）
+	notificationManager *NotificationManager
 }
 
 // NewMultiKernelManager 创建多内核管理器
@@ -78,6 +80,11 @@ func NewMultiKernelManager(config *KernelConfig, registry *control.Registry,
 	}
 
 	return manager, nil
+}
+
+// SetNotificationManager 注入 NotificationManager（由 main 初始化后设置）
+func (m *MultiKernelManager) SetNotificationManager(nm *NotificationManager) {
+	m.notificationManager = nm
 }
 
 // PendingInterconnectRequest 表示一个待审批的内核互联请求
@@ -255,7 +262,7 @@ func (m *MultiKernelManager) StartKernelServer() error {
 
 	server := grpc.NewServer(grpc.Creds(creds))
 
-	kernelService := NewKernelServiceServer(m, m.channelManager, m.registry)
+	kernelService := NewKernelServiceServer(m, m.channelManager, m.registry, m.notificationManager)
 	pb.RegisterKernelServiceServer(server, kernelService)
 
 	listener, err := net.Listen("tcp", address)
@@ -677,6 +684,102 @@ func (m *MultiKernelManager) connectToKernelIdentityService(kernel *KernelInfo) 
 	return conn, nil
 }
 
+// createKernelClient 为已注册的内核创建持久客户端连接（用于 ForwardData 等调用）
+func (m *MultiKernelManager) createKernelClient(kernelID, address string, port int) error {
+	log.Printf("🔧 createKernelClient called: kernelID=%s, address=%s, port=%d", kernelID, address, port)
+	
+	m.kernelsMu.Lock()
+	defer m.kernelsMu.Unlock()
+
+	// 检查是否已存在连接
+	if existing, exists := m.kernels[kernelID]; exists && existing.Client != nil {
+		log.Printf("ℹ️ Client already exists for kernel %s (conn=%v), skipping", kernelID, existing.conn)
+		return nil
+	}
+
+	log.Printf("🔧 Creating TLS config for kernel %s...", kernelID)
+	
+	// 创建TLS配置
+	cert, err := tls.LoadX509KeyPair(m.config.KernelCertPath, m.config.KernelKeyPath)
+	if err != nil {
+		log.Printf("❌ Failed to load client certificates for %s: %v", kernelID, err)
+		return fmt.Errorf("failed to load client certificates: %w", err)
+	}
+
+	caCertPool := x509.NewCertPool()
+
+	// 添加自己的CA证书
+	ownCACert, err := os.ReadFile(m.config.CACertPath)
+	if err != nil {
+		log.Printf("❌ Failed to read own CA certificate for %s: %v", kernelID, err)
+		return fmt.Errorf("failed to read own CA certificate: %w", err)
+	}
+	if !caCertPool.AppendCertsFromPEM(ownCACert) {
+		log.Printf("❌ Failed to append own CA certificate for %s", kernelID)
+		return fmt.Errorf("failed to append own CA certificate")
+	}
+
+	// 添加对等内核的CA证书
+	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
+	if peerCACert, err := os.ReadFile(peerCACertPath); err != nil {
+		log.Printf("⚠️ Peer CA certificate not found for %s: %v (trying without it)", kernelID, err)
+	} else {
+		if !caCertPool.AppendCertsFromPEM(peerCACert) {
+			log.Printf("⚠️ Failed to append peer CA certificate for %s", kernelID)
+		} else {
+			log.Printf("✓ Using peer CA certificate for kernel %s", kernelID)
+		}
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caCertPool,
+		ServerName:   "",
+		MinVersion:   tls.VersionTLS13,
+	}
+
+	creds := credentials.NewTLS(tlsConfig)
+
+	// 连接到目标内核的主服务器端口
+	targetAddr := fmt.Sprintf("%s:%d", address, port)
+	log.Printf("🔗 Connecting to kernel %s at %s...", kernelID, targetAddr)
+	
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.config.ConnectTimeout)*time.Second)
+	defer cancel()
+
+	conn, err := grpc.DialContext(ctx, targetAddr, grpc.WithTransportCredentials(creds))
+	if err != nil {
+		log.Printf("❌ Failed to connect to kernel %s: %v", kernelID, err)
+		return fmt.Errorf("failed to connect to kernel %s: %w", kernelID, err)
+	}
+	log.Printf("✓ Connected to kernel %s, creating gRPC client...", kernelID)
+
+	client := pb.NewKernelServiceClient(conn)
+
+	// 更新内核信息
+	if existing, exists := m.kernels[kernelID]; exists {
+		existing.conn = conn
+		existing.Client = client
+		existing.LastHeartbeat = time.Now().Unix()
+		log.Printf("✓ Updated client connection for kernel %s", kernelID)
+	} else {
+		// 如果内核信息不存在，创建一个新的
+		m.kernels[kernelID] = &KernelInfo{
+			KernelID:      kernelID,
+			Address:       address,
+			Port:          port,
+			MainPort:      port,
+			Status:        "active",
+			LastHeartbeat: time.Now().Unix(),
+			conn:          conn,
+			Client:        client,
+		}
+		log.Printf("✓ Created new client connection for kernel %s", kernelID)
+	}
+
+	return nil
+}
+
 // CollectAllConnectors 收集所有连接内核的连接器信息
 func (m *MultiKernelManager) CollectAllConnectors() ([]*pb.ConnectorInfo, error) {
 	var allConnectors []*pb.ConnectorInfo
@@ -806,8 +909,36 @@ func (m *MultiKernelManager) ForwardData(targetKernelID string, dataPacket *pb.D
 	kernelInfo, exists := m.kernels[targetKernelID]
 	m.kernelsMu.RUnlock()
 
-	if !exists {
+	if !exists || kernelInfo == nil {
 		return fmt.Errorf("not connected to kernel %s", targetKernelID)
+	}
+
+	// If client or conn is nil, attempt a best-effort reconnect to avoid panic.
+	if kernelInfo.Client == nil || kernelInfo.conn == nil {
+		log.Printf("⚠ Kernel %s client/conn nil, attempting reconnect", targetKernelID)
+
+		// Close and remove any stale entry before reconnecting.
+		m.kernelsMu.Lock()
+		if k, ok := m.kernels[targetKernelID]; ok {
+			if k.conn != nil {
+				_ = k.conn.Close()
+			}
+			delete(m.kernels, targetKernelID)
+		}
+		m.kernelsMu.Unlock()
+
+		// Try to reconnect using the last-known address/port from the stale kernelInfo.
+		if err := m.connectToKernelInternal(targetKernelID, kernelInfo.Address, kernelInfo.Port, false); err != nil {
+			return fmt.Errorf("failed to reconnect to kernel %s: %w", targetKernelID, err)
+		}
+
+		// Re-fetch kernel info
+		m.kernelsMu.RLock()
+		kernelInfo, exists = m.kernels[targetKernelID]
+		m.kernelsMu.RUnlock()
+		if !exists || kernelInfo == nil || kernelInfo.Client == nil {
+			return fmt.Errorf("kernel %s client not available after reconnect", targetKernelID)
+		}
 	}
 
 	req := &pb.ForwardDataRequest{
@@ -818,6 +949,9 @@ func (m *MultiKernelManager) ForwardData(targetKernelID string, dataPacket *pb.D
 	}
 
 	_, err := kernelInfo.Client.ForwardData(context.Background(), req)
+	if err != nil {
+		log.Printf("⚠ ForwardData RPC to %s failed: %v", targetKernelID, err)
+	}
 	return err
 }
 
