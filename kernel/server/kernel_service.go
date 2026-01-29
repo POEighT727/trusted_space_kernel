@@ -102,6 +102,9 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 				log.Printf("✓ Client connection established for approved kernel %s", req.KernelId)
 			}
 
+			// 广播本内核已知的其他内核给新注册的内核
+			go s.multiKernelManager.BroadcastKnownKernels(req.KernelId)
+
 			ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
 			if err != nil {
 				ownCACertData = nil
@@ -198,6 +201,9 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 		log.Printf("✓ Client connection established for kernel %s", req.KernelId)
 	}
 
+	// 广播本内核已知的其他内核给新注册的内核
+	go s.multiKernelManager.BroadcastKnownKernels(req.KernelId)
+
 	// 读取自己的CA证书
 	ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
 	if err != nil {
@@ -274,6 +280,101 @@ func (s *KernelServiceServer) DiscoverKernels(ctx context.Context, req *pb.Disco
 	return &pb.DiscoverKernelsResponse{
 		Kernels:    kernels,
 		TotalCount: int32(len(kernels)),
+	}, nil
+}
+
+// SyncKnownKernels 同步已知内核列表
+// 当收到其他内核发来的已知内核列表时，将新内核加入本地列表并返回本列表中对方不知道的内核
+func (s *KernelServiceServer) SyncKnownKernels(ctx context.Context, req *pb.SyncKnownKernelsRequest) (*pb.SyncKnownKernelsResponse, error) {
+	log.Printf("Received SyncKnownKernels from kernel %s with %d known kernels", req.SourceKernelId, len(req.KnownKernels))
+
+	newlyKnownKernels := make([]*pb.KernelInfo, 0)
+
+	// 处理收到的已知内核列表
+	for _, kernelInfo := range req.KnownKernels {
+		// 跳过自己
+		if kernelInfo.KernelId == s.multiKernelManager.config.KernelID {
+			continue
+		}
+
+		// 检查是否已经在本地列表中
+		s.multiKernelManager.kernelsMu.Lock()
+		existing, exists := s.multiKernelManager.kernels[kernelInfo.KernelId]
+		if !exists {
+			// 新内核，添加到本地列表
+			// 注意：port 在 KernelInfo 中是主端口，内核间通信端口需要 +2
+			mainPort := int(kernelInfo.Port)
+			kernelPort := mainPort + 2
+
+			s.multiKernelManager.kernels[kernelInfo.KernelId] = &KernelInfo{
+				KernelID:      kernelInfo.KernelId,
+				Address:       kernelInfo.Address,
+				Port:          kernelPort,     // 内核间通信端口
+				MainPort:      mainPort,       // 主服务器端口
+				Status:        kernelInfo.Status,
+				LastHeartbeat: kernelInfo.LastHeartbeat,
+				PublicKey:     kernelInfo.PublicKey,
+			}
+			log.Printf("✓ Added new kernel %s from sync (via %s)", kernelInfo.KernelId, req.SourceKernelId)
+
+			// 主动向新内核发起互联请求
+			go func(kid string, addr string, port int) {
+				err := s.multiKernelManager.connectToKernelInternal(kid, addr, port, false)
+				if err != nil && !strings.Contains(err.Error(), "already connected") {
+					log.Printf("⚠ Failed to connect to kernel %s: %v", kid, err)
+				}
+				// 连接后，立即向对方发送本内核已知的内核列表
+				s.multiKernelManager.SyncKnownKernelsToKernel(kid, addr, port)
+			}(kernelInfo.KernelId, kernelInfo.Address, kernelPort)
+
+			// 这是一个对方知道但我们之前不知道的内核
+			newlyKnownKernels = append(newlyKnownKernels, kernelInfo)
+		} else {
+			// 已存在，更新心跳（如果对方的心跳更新）
+			if kernelInfo.LastHeartbeat > existing.LastHeartbeat {
+				existing.LastHeartbeat = kernelInfo.LastHeartbeat
+				existing.Status = kernelInfo.Status
+			}
+		}
+		s.multiKernelManager.kernelsMu.Unlock()
+	}
+
+	// 获取本地的已知内核中对方可能不知道的（排除发送方自己）
+	s.multiKernelManager.kernelsMu.RLock()
+	for _, localKernel := range s.multiKernelManager.kernels {
+		if localKernel.KernelID == req.SourceKernelId {
+			continue
+		}
+
+		// 检查对方是否知道这个内核
+		knownByPeer := false
+		for _, remoteKernel := range req.KnownKernels {
+			if remoteKernel.KernelId == localKernel.KernelID {
+				knownByPeer = true
+				break
+			}
+		}
+
+		if !knownByPeer {
+			newlyKnownKernels = append(newlyKnownKernels, &pb.KernelInfo{
+				KernelId:      localKernel.KernelID,
+				Address:       localKernel.Address,
+				Port:          int32(localKernel.MainPort), // 使用主端口
+				Status:        localKernel.Status,
+				LastHeartbeat: localKernel.LastHeartbeat,
+				PublicKey:     localKernel.PublicKey,
+			})
+		}
+	}
+	s.multiKernelManager.kernelsMu.RUnlock()
+
+	log.Printf("SyncKnownKernels completed: %d newly known kernels for peer, %d new for us",
+		len(newlyKnownKernels), len(newlyKnownKernels))
+
+	return &pb.SyncKnownKernelsResponse{
+		Success:           true,
+		Message:           "kernels synced successfully",
+		NewlyKnownKernels: newlyKnownKernels,
 	}, nil
 }
 

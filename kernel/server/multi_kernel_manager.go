@@ -139,10 +139,12 @@ func (m *MultiKernelManager) ApprovePendingRequest(requestID string) error {
 		if err := m.connectToKernelInternal(req.RequesterKernelID, req.Address, req.KernelPort, false); err != nil {
 			return fmt.Errorf("failed to ensure connection to requester kernel %s: %w", req.RequesterKernelID, err)
 		}
+		// 广播已知内核给该内核
+		go m.BroadcastKnownKernels(req.RequesterKernelID)
 		return nil
 	}
 
-	// 先通知请求方“已批准”，调用对方的 RegisterKernel 并带上 interconnect_approve 标记，
+	// 先通知请求方"已批准"，调用对方的 RegisterKernel 并带上 interconnect_approve 标记，
 	// 让请求方在自己的服务端直接把批准方加入已知内核列表（避免再次创建 pending）。
 	if err := m.notifyRequesterApprove(req); err != nil {
 		return fmt.Errorf("failed to notify requester %s of approve: %w", req.RequesterKernelID, err)
@@ -152,6 +154,9 @@ func (m *MultiKernelManager) ApprovePendingRequest(requestID string) error {
 	if err := m.connectToKernelInternal(req.RequesterKernelID, req.Address, req.KernelPort, false); err != nil {
 		return fmt.Errorf("failed to connect to requester kernel %s: %w", req.RequesterKernelID, err)
 	}
+
+	// 广播本内核已知的其他内核给新连接的内核
+	go m.BroadcastKnownKernels(req.RequesterKernelID)
 
 	return nil
 }
@@ -214,6 +219,100 @@ func (m *MultiKernelManager) notifyRequesterApprove(req *PendingInterconnectRequ
 	if err != nil {
 		return fmt.Errorf("approve RPC failed: %w", err)
 	}
+	return nil
+}
+
+// BroadcastKnownKernels 向指定内核广播本内核已知的内核列表
+// 这用于在新内核连接后，让它了解网络中其他内核的信息
+func (m *MultiKernelManager) BroadcastKnownKernels(targetKernelID string) error {
+	m.kernelsMu.RLock()
+	kernelInfo, exists := m.kernels[targetKernelID]
+	if !exists {
+		m.kernelsMu.RUnlock()
+		return fmt.Errorf("kernel %s not found", targetKernelID)
+	}
+
+	// 检查客户端是否可用
+	if kernelInfo.Client == nil {
+		m.kernelsMu.RUnlock()
+		return fmt.Errorf("kernel %s client not available", targetKernelID)
+	}
+
+	// 构建已知内核列表
+	knownKernels := make([]*pb.KernelInfo, 0)
+	for _, k := range m.kernels {
+		if k.KernelID == targetKernelID {
+			continue // 跳过目标内核自己
+		}
+		knownKernels = append(knownKernels, &pb.KernelInfo{
+			KernelId:      k.KernelID,
+			Address:       k.Address,
+			Port:          int32(k.MainPort), // 使用主端口
+			Status:        k.Status,
+			LastHeartbeat: k.LastHeartbeat,
+			PublicKey:     k.PublicKey,
+		})
+	}
+	m.kernelsMu.RUnlock()
+
+	if len(knownKernels) == 0 {
+		log.Printf("No known kernels to broadcast to %s", targetKernelID)
+		return nil
+	}
+
+	// 发送同步请求
+	req := &pb.SyncKnownKernelsRequest{
+		SourceKernelId: m.config.KernelID,
+		KnownKernels:   knownKernels,
+		SyncType:       "full",
+	}
+
+	resp, err := kernelInfo.Client.SyncKnownKernels(context.Background(), req)
+	if err != nil {
+		return fmt.Errorf("failed to broadcast known kernels to %s: %w", targetKernelID, err)
+	}
+
+	log.Printf("✓ Broadcasted %d known kernels to %s, peer added %d new kernels",
+		len(knownKernels), targetKernelID, len(resp.NewlyKnownKernels))
+
+	// 如果对方返回了新内核，尝试连接到它们
+	for _, newKernel := range resp.NewlyKnownKernels {
+		log.Printf("  → New kernel discovered from %s: %s at %s:%d",
+			targetKernelID, newKernel.KernelId, newKernel.Address, newKernel.Port)
+
+		// 检查是否已经在本地列表中
+		m.kernelsMu.Lock()
+		existing, alreadyKnown := m.kernels[newKernel.KernelId]
+		m.kernelsMu.Unlock()
+
+		if alreadyKnown {
+			// 已经存在，尝试确保连接存在
+			if existing.conn == nil || existing.Client == nil {
+				// 没有有效连接，尝试重建
+				mainPort := int(newKernel.Port)
+				kernelPort := mainPort + 2
+				if err := m.connectToKernelInternal(newKernel.KernelId, newKernel.Address, kernelPort, false); err != nil {
+					log.Printf("⚠ Failed to reconnect to kernel %s: %v", newKernel.KernelId, err)
+				}
+			} else {
+				log.Printf("  ℹ️ Kernel %s already known locally", newKernel.KernelId)
+			}
+			continue
+		}
+
+		// 尝试建立连接
+		mainPort := int(newKernel.Port)
+		kernelPort := mainPort + 2
+		if err := m.connectToKernelInternal(newKernel.KernelId, newKernel.Address, kernelPort, false); err != nil {
+			// 如果是 already connected 错误，忽略
+			if strings.Contains(err.Error(), "already connected") {
+				log.Printf("  ℹ️ Kernel %s already connected", newKernel.KernelId)
+			} else {
+				log.Printf("⚠ Failed to connect to new kernel %s: %v", newKernel.KernelId, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -436,10 +535,17 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 	go m.kernelHeartbeat(kernelID)
 
 	log.Printf("✅ Connected to kernel %s at %s:%d", kernelID, address, port)
+
+	// 广播本内核已知的其他内核给新连接的内核
+	go m.BroadcastKnownKernels(kernelID)
+
+	// 如果对方之前不知道本内核已知的其他内核，需要反向同步
+	// 这样可以实现：当 A 通知 B 有关 C 的信息后，B 会通知 A 有关 D 的信息
+	go m.SyncPeerKernels(kernelID)
+
 	return nil
 }
 
- 
 // ConnectToKernel 连接到另一个内核
 // port 参数应该是目标内核的内核通信端口 (kernel_port)
 func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int) error {
@@ -1005,6 +1111,239 @@ func (m *MultiKernelManager) sendHeartbeat(kernelID string) {
 	for _, update := range resp.Updates {
 		log.Printf("Kernel %s status update: %s -> %s",
 			update.KernelId, update.KernelId, update.Status)
+	}
+}
+
+// SyncKnownKernelsToKernel 向指定内核发送本内核已知的内核列表
+// 这用于当本内核了解到新内核后，主动让对方了解本内核已知的其他内核
+func (m *MultiKernelManager) SyncKnownKernelsToKernel(kernelID string, address string, port int) {
+	log.Printf("🔄 Syncing known kernels to %s at %s:%d", kernelID, address, port)
+
+	// 构建已知内核列表
+	m.kernelsMu.RLock()
+	knownKernels := make([]*pb.KernelInfo, 0)
+	// 首先添加自己（让对方知道自己）
+	knownKernels = append(knownKernels, &pb.KernelInfo{
+		KernelId:      m.config.KernelID,
+		Address:       m.config.Address,
+		Port:          int32(m.config.Port),
+		Status:        "active",
+		LastHeartbeat: time.Now().Unix(),
+		PublicKey:     "",
+	})
+	// 然后添加本内核已知的其他内核
+	for _, k := range m.kernels {
+		if k.KernelID == kernelID {
+			continue // 跳过目标内核自己
+		}
+		knownKernels = append(knownKernels, &pb.KernelInfo{
+			KernelId:      k.KernelID,
+			Address:       k.Address,
+			Port:          int32(k.MainPort),
+			Status:        k.Status,
+			LastHeartbeat: k.LastHeartbeat,
+			PublicKey:     k.PublicKey,
+		})
+	}
+	m.kernelsMu.RUnlock()
+
+	if len(knownKernels) == 0 {
+		log.Printf("No known kernels to sync to %s", kernelID)
+		return
+	}
+
+	// 创建到目标内核的临时连接
+	cert, err := tls.LoadX509KeyPair(m.config.KernelCertPath, m.config.KernelKeyPath)
+	if err != nil {
+		log.Printf("⚠ Failed to load certificates for sync: %v", err)
+		return
+	}
+
+	caCertPool := x509.NewCertPool()
+	ownCACert, err := os.ReadFile(m.config.CACertPath)
+	if err != nil {
+		log.Printf("⚠ Failed to read CA certificate: %v", err)
+		return
+	}
+	if !caCertPool.AppendCertsFromPEM(ownCACert) {
+		log.Printf("⚠ Failed to append own CA certificate")
+		return
+	}
+
+	// 尝试读取对端 CA
+	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
+	if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
+		caCertPool.AppendCertsFromPEM(peerCACert)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caCertPool,
+		MinVersion:   tls.VersionTLS13,
+	}
+	creds := credentials.NewTLS(tlsConfig)
+
+	targetAddr := fmt.Sprintf("%s:%d", address, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.config.ConnectTimeout)*time.Second)
+	defer cancel()
+
+	conn, err := grpc.DialContext(ctx, targetAddr, grpc.WithTransportCredentials(creds))
+	if err != nil {
+		log.Printf("⚠ Failed to connect to %s for sync: %v", kernelID, err)
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewKernelServiceClient(conn)
+
+	req := &pb.SyncKnownKernelsRequest{
+		SourceKernelId: m.config.KernelID,
+		KnownKernels:   knownKernels,
+		SyncType:       "full",
+	}
+
+	resp, err := client.SyncKnownKernels(ctx, req)
+	if err != nil {
+		log.Printf("⚠ Failed to sync to %s: %v", kernelID, err)
+		return
+	}
+
+	log.Printf("✓ Synced %d kernels to %s, peer added %d new kernels",
+		len(knownKernels), kernelID, len(resp.NewlyKnownKernels))
+
+	// 如果对方返回了新内核，尝试连接到它们
+	for _, newKernel := range resp.NewlyKnownKernels {
+		// 跳过自己
+		if newKernel.KernelId == m.config.KernelID {
+			continue
+		}
+
+		m.kernelsMu.Lock()
+		existing, alreadyKnown := m.kernels[newKernel.KernelId]
+		m.kernelsMu.Unlock()
+
+		if alreadyKnown {
+			if existing.conn == nil || existing.Client == nil {
+				mainPort := int(newKernel.Port)
+				kernelPort := mainPort + 2
+				_ = m.connectToKernelInternal(newKernel.KernelId, newKernel.Address, kernelPort, false)
+			}
+			continue
+		}
+
+		mainPort := int(newKernel.Port)
+		kernelPort := mainPort + 2
+		if err := m.connectToKernelInternal(newKernel.KernelId, newKernel.Address, kernelPort, false); err != nil {
+			if !strings.Contains(err.Error(), "already connected") {
+				log.Printf("⚠ Failed to connect to kernel %s: %v", newKernel.KernelId, err)
+			}
+		}
+	}
+}
+
+// SyncPeerKernels 向指定内核同步本内核已知的内核信息
+// 这用于当本内核通过其他内核了解到新内核后，反向让对方了解本内核已知的其他内核
+// 例如：A 通知 B 有关 C 的信息 -> B 连接到 C -> B 通知 A 有关 D 的信息
+func (m *MultiKernelManager) SyncPeerKernels(targetKernelID string) {
+	// 首先尝试获取读锁来检查内核是否存在
+	m.kernelsMu.RLock()
+	kernelInfo, exists := m.kernels[targetKernelID]
+	if !exists || kernelInfo == nil || kernelInfo.Client == nil {
+		m.kernelsMu.RUnlock()
+		// 内核不存在或没有有效连接，尝试建立连接
+		m.kernelsMu.Lock()
+		kernelInfo, exists = m.kernels[targetKernelID]
+		if !exists {
+			m.kernelsMu.Unlock()
+			return
+		}
+		// 尝试建立连接
+		mainPort := kernelInfo.MainPort
+		kernelPort := mainPort + 2
+		m.kernelsMu.Unlock()
+
+		if err := m.connectToKernelInternal(targetKernelID, kernelInfo.Address, kernelPort, false); err != nil {
+			if !strings.Contains(err.Error(), "already connected") {
+				log.Printf("⚠ Failed to connect to %s for sync: %v", targetKernelID, err)
+			}
+		}
+		// 连接后重新获取信息
+		m.kernelsMu.RLock()
+		kernelInfo, exists = m.kernels[targetKernelID]
+		if !exists || kernelInfo == nil || kernelInfo.Client == nil {
+			m.kernelsMu.RUnlock()
+			return
+		}
+	}
+
+	// 收集本内核已知的内核中，对方可能不知道的
+	kernelsToSync := make([]*pb.KernelInfo, 0)
+	for _, k := range m.kernels {
+		if k.KernelID == targetKernelID {
+			continue
+		}
+		// 跳过那些已经有连接的内核（对方应该已经知道了）
+		if k.conn != nil && k.Client != nil {
+			continue
+		}
+		kernelsToSync = append(kernelsToSync, &pb.KernelInfo{
+			KernelId:      k.KernelID,
+			Address:       k.Address,
+			Port:          int32(k.MainPort),
+			Status:        k.Status,
+			LastHeartbeat: k.LastHeartbeat,
+			PublicKey:     k.PublicKey,
+		})
+	}
+	m.kernelsMu.RUnlock()
+
+	if len(kernelsToSync) == 0 {
+		return
+	}
+
+	log.Printf("Syncing %d peer kernels to %s", len(kernelsToSync), targetKernelID)
+
+	// 发送同步请求
+	req := &pb.SyncKnownKernelsRequest{
+		SourceKernelId: m.config.KernelID,
+		KnownKernels:   kernelsToSync,
+		SyncType:       "incremental",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.config.ConnectTimeout)*time.Second)
+	defer cancel()
+
+	resp, err := kernelInfo.Client.SyncKnownKernels(ctx, req)
+	if err != nil {
+		log.Printf("⚠ Failed to sync peer kernels to %s: %v", targetKernelID, err)
+		return
+	}
+
+	log.Printf("✓ Synced %d peer kernels to %s, peer added %d new kernels",
+		len(kernelsToSync), targetKernelID, len(resp.NewlyKnownKernels))
+
+	// 如果对方返回了新内核，尝试连接到它们
+	for _, newKernel := range resp.NewlyKnownKernels {
+		m.kernelsMu.Lock()
+		existing, alreadyKnown := m.kernels[newKernel.KernelId]
+		m.kernelsMu.Unlock()
+
+		if alreadyKnown {
+			if existing.conn == nil || existing.Client == nil {
+				mainPort := int(newKernel.Port)
+				kernelPort := mainPort + 2
+				_ = m.connectToKernelInternal(newKernel.KernelId, newKernel.Address, kernelPort, false)
+			}
+			continue
+		}
+
+		mainPort := int(newKernel.Port)
+		kernelPort := mainPort + 2
+		if err := m.connectToKernelInternal(newKernel.KernelId, newKernel.Address, kernelPort, false); err != nil {
+			if !strings.Contains(err.Error(), "already connected") {
+				log.Printf("⚠ Failed to connect to kernel %s: %v", newKernel.KernelId, err)
+			}
+		}
 	}
 }
 

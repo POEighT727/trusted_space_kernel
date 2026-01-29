@@ -5,7 +5,7 @@
   "creator_id": "connector-A",
   "approver_id": "connector-A",
   "sender_ids": ["connector-A"],
-  "receiver_ids": ["connector-B"],
+  "receiver_ids": ["kernel-2:connector-U"],
   "data_topic": "simple.data.transfer",
   "encrypted": false,
   "version": 1

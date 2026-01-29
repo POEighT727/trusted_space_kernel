@@ -20,6 +20,9 @@ service KernelService {
   // 内核发现：发现其他内核
   rpc DiscoverKernels (DiscoverKernelsRequest) returns (DiscoverKernelsResponse);
 
+  // 同步已知内核列表：让新连接的内核了解网络中其他内核
+  rpc SyncKnownKernels (SyncKnownKernelsRequest) returns (SyncKnownKernelsResponse);
+
   // 跨内核频道创建
   rpc CreateCrossKernelChannel (CreateCrossKernelChannelRequest) returns (CreateCrossKernelChannelResponse);
 
@@ -86,6 +89,21 @@ message DiscoverKernelsRequest {
 message DiscoverKernelsResponse {
   repeated KernelInfo kernels = 1;
   int32 total_count = 2;
+}
+
+// ------------------------------------------------------------
+// 同步已知内核相关消息定义
+// ------------------------------------------------------------
+message SyncKnownKernelsRequest {
+  string source_kernel_id = 1;   // 源内核ID
+  repeated KernelInfo known_kernels = 2; // 源内核已知的内核列表
+  string sync_type = 3;          // 同步类型: full, incremental
+}
+
+message SyncKnownKernelsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated KernelInfo newly_known_kernels = 3; // 对方之前不知道的内核
 }
 
 // ------------------------------------------------------------
