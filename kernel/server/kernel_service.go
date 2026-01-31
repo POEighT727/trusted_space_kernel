@@ -484,24 +484,33 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 		}, nil
 	}
 
-	// 构建参与者 ID 列表（本地 connector 使用原 ID，远端 connector 使用 kernel:connector 格式）
+	// 构建参与者 ID 列表
+	// 重要：始终使用 kernelID:connectorID 格式存储，以便 GetCrossKernelChannelInfo 能正确返回 KernelId
 	senderIDs := make([]string, 0, len(req.SenderIds))
 	receiverIDs := make([]string, 0, len(req.ReceiverIds))
 	remoteKernels := make(map[string]bool)
 	for _, p := range req.SenderIds {
-		if p.KernelId != "" && p.KernelId != localKernelID {
+		if p.KernelId != "" {
+			// 远端或本地，都使用 kernel:connector 格式
 			senderIDs = append(senderIDs, fmt.Sprintf("%s:%s", p.KernelId, p.ConnectorId))
-			remoteKernels[p.KernelId] = true
+			if p.KernelId != localKernelID {
+				remoteKernels[p.KernelId] = true
+			}
 		} else {
-			senderIDs = append(senderIDs, p.ConnectorId)
+			// 如果没有 KernelId，使用本地 kernel
+			senderIDs = append(senderIDs, fmt.Sprintf("%s:%s", localKernelID, p.ConnectorId))
 		}
 	}
 	for _, p := range req.ReceiverIds {
-		if p.KernelId != "" && p.KernelId != localKernelID {
+		if p.KernelId != "" {
+			// 远端或本地，都使用 kernel:connector 格式
 			receiverIDs = append(receiverIDs, fmt.Sprintf("%s:%s", p.KernelId, p.ConnectorId))
-			remoteKernels[p.KernelId] = true
+			if p.KernelId != localKernelID {
+				remoteKernels[p.KernelId] = true
+			}
 		} else {
-			receiverIDs = append(receiverIDs, p.ConnectorId)
+			// 如果没有 KernelId，使用本地 kernel
+			receiverIDs = append(receiverIDs, fmt.Sprintf("%s:%s", localKernelID, p.ConnectorId))
 		}
 	}
 
@@ -527,6 +536,39 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 			Message: fmt.Sprintf("failed to propose channel: %v", err),
 		}, nil
 	}
+
+	// 设置远端接收者映射（用于跨内核数据转发）
+	for _, receiverID := range receiverIDs {
+		if strings.Contains(receiverID, ":") {
+			parts := strings.SplitN(receiverID, ":", 2)
+			kernelID := parts[0]
+			connectorID := parts[1]
+			channel.SetRemoteReceiver(connectorID, kernelID)
+		}
+	}
+	// 同样处理发送方（如果有远端发送方）
+	for _, senderID := range senderIDs {
+		if strings.Contains(senderID, ":") {
+			parts := strings.SplitN(senderID, ":", 2)
+			kernelID := parts[0]
+			connectorID := parts[1]
+			channel.SetRemoteReceiver(connectorID, kernelID)
+		}
+	}
+
+	// 自动接受创建者和所有远端参与者（在发送通知之前）
+	log.Printf("✓ Auto-accepting creator and remote participants for channel %s", channel.ChannelID)
+	_ = s.channelManager.AcceptChannelProposal(channel.ChannelID, req.CreatorConnectorId)
+	for _, id := range senderIDs {
+		_ = s.channelManager.AcceptChannelProposal(channel.ChannelID, id)
+	}
+	for _, id := range receiverIDs {
+		_ = s.channelManager.AcceptChannelProposal(channel.ChannelID, id)
+	}
+
+	// 重新获取频道状态（确认已激活）
+	channel, _ = s.channelManager.GetChannel(channel.ChannelID)
+	log.Printf("✓ Channel %s status after auto-accept: %s", channel.ChannelID, channel.Status)
 
 	// 向所有远端内核发送提议通知
 	for rk := range remoteKernels {
@@ -581,16 +623,18 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 		chClient := pb.NewChannelServiceClient(identityConn)
 		// 对该内核的每个目标连接器分别通知
 			for _, targetCID := range targetConnectorIDs {
-				// 将 origin 的 proposal id 一并带上，格式为 "kernelID|proposalID"，
-				// 方便远端创建占位频道时使用相同的 proposal id。
-				senderWithProposal := localKernelID
+				// 将 origin 的 proposal id 和状态一并带上，格式为 "kernelID|proposalID|STATUS"，
+				// 方便远端创建占位频道时使用相同的 proposal id 并正确设置远端接收者映射。
+				senderWithMeta := localKernelID
 				if channel.ChannelProposal != nil && channel.ChannelProposal.ProposalID != "" {
-					senderWithProposal = fmt.Sprintf("%s|%s", localKernelID, channel.ChannelProposal.ProposalID)
+					senderWithMeta = fmt.Sprintf("%s|%s|%s", localKernelID, channel.ChannelProposal.ProposalID, "ACCEPTED")
+				} else {
+					senderWithMeta = fmt.Sprintf("%s|%s", localKernelID, "ACCEPTED")
 				}
 				_, err = chClient.NotifyChannelCreated(context.Background(), &pb.NotifyChannelRequest{
 					ReceiverId: targetCID,
 					ChannelId:  channel.ChannelID,
-					SenderId:   senderWithProposal,
+					SenderId:   senderWithMeta,
 					DataTopic:  channel.DataTopic,
 				})
 			if err != nil {
@@ -607,15 +651,6 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 		identityConn.Close()
 	}
 
-	// 所有远端内核均接受，标记远端参与者为已批准（本地接受）
-	// 逐个批准参与者（包含远端标识）
-	for _, id := range senderIDs {
-		_ = s.channelManager.AcceptChannelProposal(channel.ChannelID, id)
-	}
-	for _, id := range receiverIDs {
-		_ = s.channelManager.AcceptChannelProposal(channel.ChannelID, id)
-	}
-
 	return &pb.CreateCrossKernelChannelResponse{
 		Success:   true,
 		ChannelId: channel.ChannelID,
@@ -625,14 +660,20 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 
 // ForwardData 转发数据
 func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDataRequest) (*pb.ForwardDataResponse, error) {
+	log.Printf("🔍 DEBUG ForwardData: received from kernel %s, channel=%s, sender=%s, targets=%v",
+		req.SourceKernelId, req.ChannelId, req.DataPacket.SenderId, req.DataPacket.TargetIds)
+
 	// 检查频道是否存在
 	channel, err := s.channelManager.GetChannel(req.ChannelId)
 	if err != nil {
+		log.Printf("⚠ DEBUG ForwardData: channel not found: %v", err)
 		return &pb.ForwardDataResponse{
 			Success: false,
 			Message: fmt.Sprintf("channel not found: %v", err),
 		}, nil
 	}
+
+	log.Printf("🔍 DEBUG ForwardData: channel found, ReceiverIDs=%v", channel.ReceiverIDs)
 
 	// 转发数据到频道
 	dataPacket := &circulation.DataPacket{
@@ -644,8 +685,10 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 		SenderID:       req.DataPacket.SenderId,
 		TargetIDs:      req.DataPacket.TargetIds,
 	}
+	log.Printf("🔍 DEBUG ForwardData: calling PushData with targets=%v", dataPacket.TargetIDs)
 	err = channel.PushData(dataPacket)
 	if err != nil {
+		log.Printf("⚠ DEBUG ForwardData: PushData failed: %v", err)
 		return &pb.ForwardDataResponse{
 			Success: false,
 			Message: fmt.Sprintf("failed to forward data: %v", err),
@@ -671,19 +714,38 @@ func (s *KernelServiceServer) GetCrossKernelChannelInfo(ctx context.Context, req
 		}, nil
 	}
 
-	// 构建返回的参与者列表（使用 CrossKernelParticipant，local kernel -> KernelId 空）
+	// 构建返回的参与者列表
+	// 对于远端连接器（有 kernel:connector 格式），KernelId 设置为对应内核 ID，ConnectorId 为裸 ID
 	senders := make([]*pb.CrossKernelParticipant, 0, len(channel.SenderIDs))
 	receivers := make([]*pb.CrossKernelParticipant, 0, len(channel.ReceiverIDs))
 	for _, sID := range channel.SenderIDs {
+		var kernelId, connectorId string
+		if strings.Contains(sID, ":") {
+			parts := strings.SplitN(sID, ":", 2)
+			kernelId = parts[0]
+			connectorId = parts[1]
+		} else {
+			kernelId = ""
+			connectorId = sID
+		}
 		senders = append(senders, &pb.CrossKernelParticipant{
-			KernelId:    "",
-			ConnectorId: sID,
+			KernelId:    kernelId,
+			ConnectorId: connectorId,
 		})
 	}
 	for _, rID := range channel.ReceiverIDs {
+		var kernelId, connectorId string
+		if strings.Contains(rID, ":") {
+			parts := strings.SplitN(rID, ":", 2)
+			kernelId = parts[0]
+			connectorId = parts[1]
+		} else {
+			kernelId = ""
+			connectorId = rID
+		}
 		receivers = append(receivers, &pb.CrossKernelParticipant{
-			KernelId:    "",
-			ConnectorId: rID,
+			KernelId:    kernelId,
+			ConnectorId: connectorId,
 		})
 	}
 

@@ -471,9 +471,279 @@ make package-connector VERSION=1.0.0
 ./scripts/package_all.sh 1.0.0 linux-amd64 connector
 ```
 
-## 十一、部署拓扑
+## 十一、多内核互联网络
 
-### 11.1 单节点部署（测试环境）
+### 11.1 概述
+
+可信数据空间内核支持多内核组网模式，多个内核可以互相发现、互联互通，形成一个分布式的内核网络。这种模式适用于：
+- 跨组织的数据空间互联
+- 多数据中心部署
+- 高可用容灾架构
+
+### 11.2 架构设计
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    多内核互联网络                             │
+│                                                             │
+│    ┌──────────┐         ┌──────────┐         ┌──────────┐ │
+│    │ kernel-1 │◄───────►│ kernel-2 │◄───────►│ kernel-3 │ │
+│    │192.168.1.4:50053│   │192.168.202.136:50053│   │192.168.202.140:50053│ │
+│    └────┬─────┘         └────┬─────┘         └────┬─────┘ │
+│         │                    │                    │       │
+│         │  ┌─────────────────┼──────────────────┐ │       │
+│         └─►│   内核发现与同步  │◄─────────────────┘ │       │
+│            │  (SyncKnownKernels)│                  │       │
+│            └─────────────────┬──────────────────┘ │       │
+│                              │                      │       │
+└──────────────────────────────┼──────────────────────┼───────┘
+                               │                      │
+                    ┌──────────┴──────────┐          │
+                    ↓                      ↓          │
+              连接器-A                 连接器-B       │
+```
+
+### 11.3 端口配置
+
+每个内核使用三个端口进行通信：
+
+| 端口 | 用途 | 说明 |
+|------|------|------|
+| 50051 | 主服务端口 | 提供 IdentityService、ChannelService 等核心服务 |
+| 50052 | 引导服务端口 | 用于证书注册（Bootstrap Server） |
+| 50053 | 内核间通信端口 | 用于内核之间的互联（Kernel-to-Kernel Server） |
+
+### 11.4 互联流程
+
+#### 11.4.1 手动互联模式
+
+```
+内核-A                      内核-B
+   │                          │
+   │  1. connect-kernel <id> <addr> 50053
+   ├─────────────────────────────────>
+   │                          │
+   │  2. 保存待审批请求
+   │  ◄────────────────────────────────
+   │                          │
+   │                          │  3. approve-request <request-id>
+   │                          ├─
+   │                          │  4. 批准请求并建立双向连接
+   │◄────────────────────────────────
+   │                          │
+   │  5. 广播已知内核列表
+   ├─────────────────────────────────>
+   │                          │
+```
+
+#### 11.4.2 详细步骤
+
+**步骤1：发起互联请求**
+
+在内核-A上执行：
+```
+connect-kernel kernel-B 192.168.202.136 50053
+```
+
+内核-A会：
+1. 读取或创建对端CA证书
+2. 发起TLS连接到内核-B的50053端口
+3. 发送 `RegisterKernelRequest`（带 `interconnect_request: true` 元数据）
+4. 如果内核-B返回 `interconnect_request_id`，保存为待审批请求
+
+**步骤2：审批互联请求**
+
+在内核-B上执行：
+```
+approve-request <request-id>
+```
+
+内核-B会：
+1. 调用 `ApprovePendingRequest` 批准请求
+2. 通过 `notifyRequesterApprove` 通知内核-A已批准
+3. 建立到内核-A的持久连接
+4. 调用 `BroadcastKnownKernels` 广播已知的内核列表
+
+**步骤3：内核发现与同步**
+
+当内核-A收到广播后：
+1. 调用 `SyncKnownKernels` 同步内核列表
+2. 将新内核添加到本地 `kernels` map
+3. 尝试连接到新内核
+4. 连接成功后，调用 `SyncKnownKernelsToKernel` 主动向新内核同步
+
+### 11.5 内核发现机制
+
+#### 11.5.1 同步协议
+
+内核间使用 `SyncKnownKernels` RPC 进行信息同步：
+
+```protobuf
+// 同步已知内核请求
+message SyncKnownKernelsRequest {
+  string source_kernel_id = 1;   // 源内核ID
+  repeated KernelInfo known_kernels = 2; // 已知内核列表
+  string sync_type = 3;          // 同步类型: full, incremental
+}
+
+// 同步已知内核响应
+message SyncKnownKernelsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated KernelInfo newly_known_kernels = 3; // 对方之前不知道的内核
+}
+```
+
+#### 11.5.2 同步流程
+
+当内核-X收到来自内核-Y的 `SyncKnownKernels` 时：
+
+1. **处理收到的内核列表**
+   - 跳过自己
+   - 检查是否已在本地存在
+   - 如果不存在，添加到本地 `kernels` map
+
+2. **返回对方不知道的内核**
+   - 遍历本地内核列表
+   - 找出对方不知道的内核
+   - 返回给请求方
+
+3. **主动连接新内核**
+   - 尝试连接到新发现的内核
+   - 连接成功后立即同步信息
+
+### 11.6 核心代码结构
+
+```
+kernel/server/
+├── kernel_service.go          # 内核服务实现
+│   ├── RegisterKernel()       # 处理内核注册
+│   ├── SyncKnownKernels()     # 处理内核列表同步
+│   └── DiscoverKernels()      # 发现可用内核
+│
+└── multi_kernel_manager.go    # 多内核管理器
+    ├── ConnectToKernel()      # 连接到其他内核
+    ├── ApprovePendingRequest() # 批准互联请求
+    ├── BroadcastKnownKernels() # 广播已知内核列表
+    ├── SyncKnownKernelsToKernel() # 向指定内核同步
+    └── kernelHeartbeat()       # 内核心跳维护
+```
+
+### 11.7 交互命令
+
+内核启动后，提供以下交互命令：
+
+| 命令 | 说明 |
+|------|------|
+| `connect-kernel <id> <addr> <port>` | 连接到指定内核 |
+| `approve-request <request-id>` | 批准互联请求 |
+| `list-requests` | 列出待审批请求 |
+| `ks` 或 `kernels` | 列出已知内核 |
+| `disconnect-kernel <id>` | 断开与指定内核的连接 |
+| `help` | 显示帮助信息 |
+| `status` | 显示内核状态 |
+
+### 11.8 使用示例
+
+#### 场景：三个内核互联
+
+假设有三个内核：
+- kernel-1: 192.168.1.4
+- kernel-2: 192.168.202.136
+- kernel-3: 192.168.202.140
+
+**在 kernel-1 上执行：**
+```
+# 连接到 kernel-2
+connect-kernel kernel-2 192.168.202.136 50053
+
+# 连接到 kernel-3
+connect-kernel kernel-3 192.168.202.140 50053
+
+# 查看已知内核
+ks
+```
+
+**在 kernel-2 上执行：**
+```
+# 批准 kernel-1 的请求
+approve-request <request-id-1>
+
+# 查看已知内核
+ks  # 应该看到 kernel-1 和 kernel-3
+```
+
+**在 kernel-3 上执行：**
+```
+# 批准 kernel-1 的请求
+approve-request <request-id-2>
+
+# 查看已知内核
+ks  # 应该看到 kernel-1 和 kernel-2
+```
+
+### 11.9 证书管理
+
+内核互联需要以下证书：
+
+| 证书 | 用途 |
+|------|------|
+| `certs/ca.crt` | 自己的CA证书 |
+| `certs/kernel.crt` | 内核证书 |
+| `certs/kernel.key` | 内核私钥 |
+| `certs/peer-<kernel-id>-ca.crt` | 对端内核的CA证书 |
+
+当两个内核首次互联时：
+1. 发起方发送自己的CA证书
+2. 接收方保存对端CA证书并返回自己的CA证书
+3. 双方保存对方的CA证书，后续通信使用
+
+### 11.10 心跳机制
+
+内核间通过心跳维护连接：
+
+- **心跳间隔**：默认60秒（可在配置中修改）
+- **心跳内容**：包含连接器数量、频道数量等统计信息
+- **心跳响应**：更新最后心跳时间，返回其他内核状态更新
+
+### 11.11 故障处理
+
+#### 连接断开
+
+当心跳检测到连接断开时：
+1. 更新内核状态为 `inactive`
+2. 清理相关连接资源
+3. 保留内核信息以便重连
+
+#### 重复注册
+
+当收到重复的注册请求时：
+1. 检查内核ID是否冲突
+2. 如果冲突，返回错误
+3. 如果是已注册内核，更新连接信息
+
+### 11.12 配置说明
+
+在 `config/kernel.yaml` 中配置多内核参数：
+
+```yaml
+kernel:
+  kernel_id: "kernel-1"
+  address: "192.168.1.4"
+  port: 50051       # 主服务端口
+  kernel_port: 50053 # 内核间通信端口
+
+# 多内核配置
+multi_kernel:
+  enabled: true                    # 是否启用多内核模式
+  heartbeat_interval: 60          # 心跳间隔（秒）
+  connect_timeout: 10             # 连接超时（秒）
+  max_retries: 3                  # 最大重试次数
+```
+
+## 十二、部署拓扑
+
+### 12.1 单节点部署（测试环境）
 
 ```
 ┌─────────────────────┐

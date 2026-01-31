@@ -183,8 +183,9 @@ func (s *EvidenceServiceServer) VerifyEvidenceSignature(ctx context.Context, req
 		}, nil
 	}
 
-	// 验证签名
-	err := security.VerifyEvidenceSignature(req.ConnectorId, req.EventType, req.ChannelId, req.DataHash, req.Signature, req.Timestamp)
+	// 验证签名（默认同内核，需要验证）
+	// 注意：如果需要支持跨内核验证，调用方需要传入额外参数或通过其他方式判断
+	err := security.VerifyEvidenceSignature(false, req.ConnectorId, req.EventType, req.ChannelId, req.DataHash, req.Signature, req.Timestamp)
 
 	response := &pb.VerifySignatureResponse{
 		Valid:      err == nil,

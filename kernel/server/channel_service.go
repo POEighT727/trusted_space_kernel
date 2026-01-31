@@ -196,6 +196,7 @@ func (s *ChannelServiceServer) notifyChannelCreated(channel *circulation.Channel
 
 		// 通知所有接收方
 		for _, receiverID := range channel.ReceiverIDs {
+			log.Printf("🔍 DEBUG: about to notify receiver: %s", receiverID)
 			if err := s.notifyParticipant(receiverID, notification); err != nil {
 				log.Printf("⚠ Failed to notify receiver %s: %v", receiverID, err)
 			}
@@ -599,6 +600,11 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 		}, nil
 	}
 
+	// 如果这是本地连接器的 accept（非转发请求），需要转发到其他相关内核
+	if !isForwarded {
+		go s.forwardAcceptToRemoteKernels(req.ChannelId, req.AccepterId, req.ProposalId)
+	}
+
 	// 重新获取频道状态（AcceptChannelProposal 可能已更新状态）
 	channel, err = s.channelManager.GetChannel(req.ChannelId)
 	if err != nil {
@@ -606,6 +612,35 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 			Success: false,
 			Message: fmt.Sprintf("channel not found: %v", err),
 		}, nil
+	}
+
+	// 如果频道已经是 active 状态，且这是来自远端内核的 accept，
+	// 需要通知远端内核频道已激活（因为频道可能是在创建者自动接受时激活的）
+	if channel.Status == circulation.ChannelStatusActive && isForwarded {
+		log.Printf("✓ DEBUG: Channel %s already active, isForwarded=%v, notifying...", channel.ChannelID, isForwarded)
+		notification := &pb.ChannelNotification{
+			ChannelId:         channel.ChannelID,
+			CreatorId:         channel.CreatorID,
+			SenderIds:         channel.SenderIDs,
+			ReceiverIds:       channel.ReceiverIDs,
+			Encrypted:         channel.Encrypted,
+			DataTopic:         channel.DataTopic,
+			CreatedAt:         channel.CreatedAt.Unix(),
+			NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED,
+			ProposalId:        channel.ChannelProposal.ProposalID,
+		}
+		go s.notifyOtherKernelsChannelActivated(channel, notification)
+
+		// 同时通知本地创建者（如果创建者是本地参与者且尚未收到通知）
+		log.Printf("✓ DEBUG: CreatorID=%s, contains colon=%v", channel.CreatorID, strings.Contains(channel.CreatorID, ":"))
+		if channel.CreatorID != "" && !strings.Contains(channel.CreatorID, ":") {
+			log.Printf("✓ DEBUG: About to notify creator %s", channel.CreatorID)
+			if err := s.notifyParticipant(channel.CreatorID, notification); err != nil {
+				log.Printf("⚠ Failed to notify creator %s of channel activation: %v", channel.CreatorID, err)
+			} else {
+				log.Printf("✓ Sent ACCEPTED notification to creator %s", channel.CreatorID)
+			}
+		}
 	}
 
 	// 记录审计日志
@@ -622,18 +657,45 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 
 	// 检查是否所有参与方都已确认
 	allApproved := true
-	for _, approved := range channel.ChannelProposal.SenderApprovals {
+	for id, approved := range channel.ChannelProposal.SenderApprovals {
+		// 跳过远端参与者（带 kernel 前缀）
+		if strings.Contains(id, ":") {
+			continue
+		}
 		if !approved {
 			allApproved = false
 			break
 		}
 	}
 	if allApproved {
-		for _, approved := range channel.ChannelProposal.ReceiverApprovals {
+		for id, approved := range channel.ChannelProposal.ReceiverApprovals {
+			// 跳过远端参与者（带 kernel 前缀）
+			if strings.Contains(id, ":") {
+				continue
+			}
 			if !approved {
 				allApproved = false
 				break
 			}
+		}
+	}
+
+	// 设置远端接收者映射（用于跨内核数据转发）
+	// 在频道激活时立即设置，而不是等到所有参与方都确认
+	for _, receiverID := range channel.ReceiverIDs {
+		if strings.Contains(receiverID, ":") {
+			parts := strings.SplitN(receiverID, ":", 2)
+			kernelID := parts[0]
+			connectorID := parts[1]
+			channel.SetRemoteReceiver(connectorID, kernelID)
+		}
+	}
+	for _, senderID := range channel.SenderIDs {
+		if strings.Contains(senderID, ":") {
+			parts := strings.SplitN(senderID, ":", 2)
+			kernelID := parts[0]
+			connectorID := parts[1]
+			channel.SetRemoteReceiver(connectorID, kernelID)
 		}
 	}
 
@@ -757,6 +819,44 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 	}, nil
 }
 
+// forwardAcceptToRemoteKernels 将 accept 转发到其他相关内核
+func (s *ChannelServiceServer) forwardAcceptToRemoteKernels(channelID, accepterID, proposalID string) {
+	localKernelID := s.multiKernelManager.config.KernelID
+
+	s.multiKernelManager.kernelsMu.RLock()
+	kernels := make([]*KernelInfo, 0, len(s.multiKernelManager.kernels))
+	for _, k := range s.multiKernelManager.kernels {
+		kernels = append(kernels, k)
+	}
+	s.multiKernelManager.kernelsMu.RUnlock()
+
+	for _, k := range kernels {
+		if k.KernelID == localKernelID {
+			continue
+		}
+		// 建立到对方主服务器的临时连接（用于调用 ChannelService）
+		conn, err := s.multiKernelManager.connectToKernelIdentityService(k)
+		if err != nil {
+			log.Printf("⚠ Failed to connect to kernel %s for forwarding accept: %v", k.KernelID, err)
+			continue
+		}
+		chClient := pb.NewChannelServiceClient(conn)
+		// 格式：localKernelID:accepterID（如 kernel-2:connector-U）
+		forwardAccepter := fmt.Sprintf("%s:%s", localKernelID, accepterID)
+		_, err = chClient.AcceptChannelProposal(context.Background(), &pb.AcceptChannelProposalRequest{
+			AccepterId: forwardAccepter,
+			ChannelId:  channelID,
+			ProposalId: proposalID,
+		})
+		conn.Close()
+		if err != nil {
+			log.Printf("⚠ Failed to forward accept to kernel %s: %v", k.KernelID, err)
+		} else {
+			log.Printf("✓ Forwarded accept from %s to kernel %s", accepterID, k.KernelID)
+		}
+	}
+}
+
 // notifyOtherKernelsChannelActivated 通知其他内核频道已激活（用于跨内核场景）
 // 这样其他内核能更新其本地频道状态为 active，并启动数据分发
 func (s *ChannelServiceServer) notifyOtherKernelsChannelActivated(channel *circulation.Channel, notification *pb.ChannelNotification) {
@@ -765,6 +865,28 @@ func (s *ChannelServiceServer) notifyOtherKernelsChannelActivated(channel *circu
 	}
 
 	localKernelID := s.multiKernelManager.config.KernelID
+
+	// 设置本地远端接收者映射（用于从本内核向其他内核转发数据）
+	// 遍历 receiverIDs，识别远端接收者并设置映射
+	for _, receiverID := range channel.ReceiverIDs {
+		if strings.Contains(receiverID, ":") {
+			// 格式: kernelID:connectorID
+			parts := strings.SplitN(receiverID, ":", 2)
+			kernelID := parts[0]
+			connectorID := parts[1]
+			// 设置映射：connectorID -> kernelID（不含kernel前缀）
+			channel.SetRemoteReceiver(connectorID, kernelID)
+		}
+	}
+	// 同样处理发送方（如果有远端发送方）
+	for _, senderID := range channel.SenderIDs {
+		if strings.Contains(senderID, ":") {
+			parts := strings.SplitN(senderID, ":", 2)
+			kernelID := parts[0]
+			connectorID := parts[1]
+			channel.SetRemoteReceiver(connectorID, kernelID)
+		}
+	}
 
 	s.multiKernelManager.kernelsMu.RLock()
 	kernels := make([]*KernelInfo, 0, len(s.multiKernelManager.kernels))
@@ -789,7 +911,8 @@ func (s *ChannelServiceServer) notifyOtherKernelsChannelActivated(channel *circu
 		chClient := pb.NewChannelServiceClient(conn)
 
 		// 构建带有 ACCEPTED 状态的 SenderId
-		senderWithMeta := fmt.Sprintf("%s|%s", localKernelID, "ACCEPTED")
+		// 格式: "kernelID|proposalId|STATUS" - STATUS 必须是第3部分
+		senderWithMeta := fmt.Sprintf("%s||ACCEPTED", localKernelID)
 
 		// 获取 creator 的纯 connector ID（如果有 kernel 前缀）
 		creatorID := notification.CreatorId
@@ -885,20 +1008,22 @@ func (s *ChannelServiceServer) RejectChannelProposal(ctx context.Context, req *p
 func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataServer) error {
 	ctx := stream.Context()
 	var senderID string
+	var senderIDWithKernel string // 带有 kernel 前缀的 senderID，用于跨内核存证
 	var channelID string
 	var dataHashAccumulator []byte
 	var flowID string // 业务流程ID，用于跟踪完整的数据传输过程
+	var isCrossKernel bool // 标记是否是跨内核频道
 
 	for {
 		packet, err := stream.Recv()
 		if err == io.EOF {
 			// 流结束，记录传输完成
 			if channelID != "" && senderID != "" && flowID != "" {
-				log.Printf("🔄 Recording TRANSFER_END for channel %s, sender %s, flow: %s", channelID, senderID, flowID)
+				log.Printf("🔄 Recording TRANSFER_END for channel %s, sender %s, flow: %s", channelID, senderIDWithKernel, flowID)
 				finalHash := sha256.Sum256(dataHashAccumulator)
 				if _, err := s.auditLog.SubmitEvidenceWithFlowID(
 					flowID,
-					senderID,
+					senderIDWithKernel,  // 使用带有 kernel 前缀的 senderID
 					evidence.EventTypeTransferEnd,
 					channelID,
 					hex.EncodeToString(finalHash[:]),
@@ -939,6 +1064,31 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				return fmt.Errorf("sender %s is not a participant of this channel", senderID)
 			}
 
+			// 检查是否是跨内核频道
+			isCrossKernel = false
+			senderIDWithKernel = senderID
+			for _, receiverID := range channel.ReceiverIDs {
+				if strings.Contains(receiverID, ":") {
+					// 存在远端接收者，这是跨内核频道
+					isCrossKernel = true
+					break
+				}
+			}
+			for _, senderIDInChannel := range channel.SenderIDs {
+				if strings.Contains(senderIDInChannel, ":") {
+					// 存在远端发送者，这是跨内核频道
+					isCrossKernel = true
+					break
+				}
+			}
+
+			// 如果是跨内核频道，构建带有 kernel 前缀的 senderID
+			if isCrossKernel && s.multiKernelManager != nil && s.multiKernelManager.config != nil {
+				kernelID := s.multiKernelManager.config.KernelID
+				senderIDWithKernel = fmt.Sprintf("%s:%s", kernelID, senderID)
+				log.Printf("🔄 Cross-kernel channel detected, using senderIDWithKernel=%s", senderIDWithKernel)
+			}
+
 			// 生成业务流程ID（用于跟踪完整的数据传输过程）
 			flowID = uuid.New().String()
 
@@ -953,10 +1103,10 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 			// 生成业务流程ID
 			flowID = uuid.New().String()
 
-			log.Printf("🔄 Recording TRANSFER_START for channel %s, sender %s, flow: %s", channelID, senderID, flowID)
+			log.Printf("🔄 Recording TRANSFER_START for channel %s, sender %s, flow: %s", channelID, senderIDWithKernel, flowID)
 			if _, err := s.auditLog.SubmitEvidenceWithFlowID(
 				flowID,
-				senderID,
+				senderIDWithKernel,  // 使用带有 kernel 前缀的 senderID
 				evidence.EventTypeTransferStart,
 				channelID,
 				"",
@@ -1013,6 +1163,7 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 
 // SubscribeData 订阅频道数据
 func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb.ChannelService_SubscribeDataServer) error {
+	log.Printf("🔍 DEBUG SubscribeData: connector=%s, channel=%s", req.ConnectorId, req.ChannelId)
 	ctx := stream.Context()
 
 	// 验证订阅者身份
@@ -1023,6 +1174,7 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 	// 检测是否是重启恢复
 	isRecovery := s.channelManager.IsConnectorRestarting(req.ConnectorId)
 	s.channelManager.MarkConnectorOnline(req.ConnectorId)
+	log.Printf("🔍 DEBUG SubscribeData: %s marked as online", req.ConnectorId)
 
 	// 在连接断开时标记为离线
 	defer func() {
@@ -1220,10 +1372,7 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 
 	if err != nil {
 		// 如果本地没有该频道，尝试从请求中的 SenderId（origin kernel）获取频道详细信息并在本地创建占位频道
-		// SenderId may include the origin proposal id joined with '|' as "kernelID|proposalID"
 		originKernel := req.SenderId
-		// 支持 SenderId 带有额外元信息的格式:
-		// "originKernel" 或 "originKernel|proposalId" 或 "originKernel|proposalId|STATUS"
 		if strings.Contains(originKernel, "|") {
 			parts := strings.SplitN(originKernel, "|", 3)
 			originKernel = parts[0]
@@ -1263,27 +1412,20 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 			}, nil
 		}
 
-		// 构造参与者列表，兼容 infoResp 中两种可能格式：
-		// 1) CrossKernelParticipant.KernelId 非空/空且 ConnectorId 为裸 id
-		// 2) 有时 ConnectorId 可能已经包含 "kernelID:connectorID" 格式（来自 GetCrossKernelChannelInfo 转换），
-		//    需解析并在本地内核为本地 connector 使用裸 id，否则保留 kernel:connector 格式。
+		// 构造参与者列表
 		senderIDs := make([]string, 0, len(infoResp.SenderIds))
 		receiverIDs := make([]string, 0, len(infoResp.ReceiverIds))
 		localKID := s.multiKernelManager.config.KernelID
 		for _, p := range infoResp.SenderIds {
 			cid := p.ConnectorId
-			// 如果 ConnectorId 已经是 "kernel:connector" 格式，优先解析
 			if strings.Contains(cid, ":") {
 				parts := strings.SplitN(cid, ":", 2)
 				if parts[0] == localKID {
-					// 本地参与者，使用裸 connector id
 					cid = parts[1]
 				} else {
-					// 远端格式，保持 kernel:connector
 					cid = fmt.Sprintf("%s:%s", parts[0], parts[1])
 				}
 			} else if p.KernelId != "" && p.KernelId != localKID {
-				// 如果 KernelId 单独提供且不是本地，组合为 kernel:connector
 				cid = fmt.Sprintf("%s:%s", p.KernelId, p.ConnectorId)
 			}
 			senderIDs = append(senderIDs, cid)
@@ -1303,7 +1445,7 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 			receiverIDs = append(receiverIDs, cid)
 		}
 
-		// 在本地创建占位频道（使用 origin 的 channel id）
+		// 在本地创建占位频道
 		channel, err = s.channelManager.CreateChannelWithID(req.ChannelId, infoResp.CreatorConnectorId, infoResp.CreatorConnectorId, senderIDs, receiverIDs, infoResp.DataTopic, infoResp.Encrypted, nil, "")
 		if err != nil {
 			return &pb.NotifyChannelResponse{
@@ -1311,64 +1453,124 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 				Message: fmt.Sprintf("failed to create local placeholder channel: %v", err),
 			}, nil
 		}
-		// 如果请求中包含 origin proposal id（通过 kernel_service 注入），将本地占位的 proposal id 覆盖为 origin 的 proposal id，
-		// 这样连接器在远端可以使用与 origin 相同的 proposal id 来 accept/reject。
+
 		if originProposalId != "" && channel.ChannelProposal != nil {
 			channel.ChannelProposal.ProposalID = originProposalId
 		}
 
-		// 自动接受创建者的提议（因为创建者在 origin kernel 上已经被自动接受了）
-		// 需要使用正确的 ID 格式：如果是本地的 creator，使用裸 ID；如果是远端的，使用 kernel:connector 格式
-		var creatorAccepterID string
-		if infoResp.CreatorKernelId == localKID {
-			creatorAccepterID = infoResp.CreatorConnectorId // 本地创建者，使用裸 ID
-		} else {
-			creatorAccepterID = fmt.Sprintf("%s:%s", infoResp.CreatorKernelId, infoResp.CreatorConnectorId) // 远端创建者
+		// 如果 SenderId 带来了 ACCEPTED 状态，说明创建者已接受
+		// 但本地参与者仍需 accept 才能激活频道（必须先 accept 规则）
+		if originStatus == "ACCEPTED" {
+			// 设置为 PROPOSED 状态，等待本地参与者 accept
+			channel.ChannelProposal.Status = circulation.NegotiationStatusProposed
+			channel.Status = circulation.ChannelStatusProposed
+			channel.LastActivity = time.Now()
+
+			log.Printf("✓ Channel %s received from kernel %s (creator accepted), waiting for local accept",
+				channel.ChannelID, originKernel)
+
+			// 通知所有本地参与者有新的频道提议（需要 accept）
+			notification := &pb.ChannelNotification{
+				ChannelId:         channel.ChannelID,
+				CreatorId:         channel.CreatorID,
+				SenderIds:         channel.SenderIDs,
+				ReceiverIds:       channel.ReceiverIDs,
+				Encrypted:         channel.Encrypted,
+				DataTopic:         channel.DataTopic,
+				CreatedAt:         channel.CreatedAt.Unix(),
+				NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_PROPOSED,
+			}
+			if channel.ChannelProposal != nil {
+				notification.ProposalId = channel.ChannelProposal.ProposalID
+			}
+
+			// 通知所有本地参与者
+			for _, senderID := range channel.SenderIDs {
+				if !strings.Contains(senderID, ":") {
+					if err := s.notifyParticipant(senderID, notification); err != nil {
+						log.Printf("⚠ Failed to notify sender %s: %v", senderID, err)
+					} else {
+						log.Printf("✓ Sent PROPOSED notification to sender %s", senderID)
+					}
+				}
+			}
+			for _, receiverID := range channel.ReceiverIDs {
+				if !strings.Contains(receiverID, ":") {
+					log.Printf("🔍 DEBUG: about to notify receiver: %s", receiverID)
+					if err := s.notifyParticipant(receiverID, notification); err != nil {
+						log.Printf("⚠ Failed to notify receiver %s: %v", receiverID, err)
+					} else {
+						log.Printf("✓ Sent PROPOSED notification to receiver %s", receiverID)
+					}
+				}
+			}
+		} else if originStatus == "REJECTED" {
+			channel.ChannelProposal.Status = circulation.NegotiationStatusRejected
+			channel.Status = circulation.ChannelStatusClosed
 		}
-		if err := s.channelManager.AcceptChannelProposal(channel.ChannelID, creatorAccepterID); err != nil {
-			log.Printf("⚠ Failed to auto-accept creator proposal on kernel %s: %v", localKID, err)
+	}
+
+	// 如果频道已存在但收到远端的 ACCEPTED 通知
+	// 说明创建者已接受，但本地仍需 accept 才能激活
+	if channel.Status == circulation.ChannelStatusProposed && originStatus == "ACCEPTED" {
+		log.Printf("✓ Channel %s: creator (kernel %s) has accepted, waiting for local accept",
+			channel.ChannelID, originKernel)
+
+		// 更新协商状态为 proposed（如果之前不是）
+		if channel.ChannelProposal != nil && channel.ChannelProposal.Status != circulation.NegotiationStatusProposed {
+			channel.ChannelProposal.Status = circulation.NegotiationStatusProposed
 		}
 
-		// 如果 SenderId 带来了协商状态（例如 ACCEPTED/REJECTED），直接在本地将占位频道应用相应状态并触发通知
-		if originStatus != "" {
-			if originStatus == "ACCEPTED" {
-				// 标记为已接受并激活频道
-				channel.ChannelProposal.Status = circulation.NegotiationStatusAccepted
-				channel.Status = circulation.ChannelStatusActive
-				channel.LastActivity = time.Now()
-				
-				// 标记所有远端参与者为已接受（因为远端已确认）
-				// 远端参与者的格式是 "kernelID:connectorID"
-				for senderID := range channel.ChannelProposal.SenderApprovals {
-					if strings.Contains(senderID, ":") {
-						channel.ChannelProposal.SenderApprovals[senderID] = true
-					}
+		// 通知所有本地参与者
+		notification := &pb.ChannelNotification{
+			ChannelId:         channel.ChannelID,
+			CreatorId:         channel.CreatorID,
+			SenderIds:         channel.SenderIDs,
+			ReceiverIds:       channel.ReceiverIDs,
+			Encrypted:         channel.Encrypted,
+			DataTopic:         channel.DataTopic,
+			CreatedAt:         channel.CreatedAt.Unix(),
+			NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_PROPOSED,
+		}
+		if channel.ChannelProposal != nil {
+			notification.ProposalId = channel.ChannelProposal.ProposalID
+		}
+
+		// 通知所有本地参与者
+		for _, senderID := range channel.SenderIDs {
+			if !strings.Contains(senderID, ":") {
+				log.Printf("🔍 DEBUG: about to notify sender (existing channel): %s", senderID)
+				if err := s.notifyParticipant(senderID, notification); err != nil {
+					log.Printf("⚠ Failed to notify sender %s: %v", senderID, err)
 				}
-				for receiverID := range channel.ChannelProposal.ReceiverApprovals {
-					if strings.Contains(receiverID, ":") {
-						channel.ChannelProposal.ReceiverApprovals[receiverID] = true
-					}
+			}
+		}
+		for _, receiverID := range channel.ReceiverIDs {
+			if !strings.Contains(receiverID, ":") {
+				log.Printf("🔍 DEBUG: about to notify receiver (existing channel): %s", receiverID)
+				if err := s.notifyParticipant(receiverID, notification); err != nil {
+					log.Printf("⚠ Failed to notify receiver %s: %v", receiverID, err)
 				}
-				
-				// 启动分发协程
-				channel.StartDataDistribution()
-				log.Printf("✓ Channel %s activated on kernel %s after remote acceptance", channel.ChannelID, s.multiKernelManager.config.KernelID)
-			} else if originStatus == "REJECTED" {
-				channel.ChannelProposal.Status = circulation.NegotiationStatusRejected
-				channel.Status = circulation.ChannelStatusClosed
 			}
 		}
 	}
 
-	// 如果频道已存在但 originStatus 是 ACCEPTED，需要更新频道状态
-	// 这处理的是：当 origin kernel 上的频道激活后，发送 ACCEPTED 通知给本内核上的占位频道
-	if channel.Status == circulation.ChannelStatusProposed && originStatus == "ACCEPTED" {
-		channel.ChannelProposal.Status = circulation.NegotiationStatusAccepted
-		channel.Status = circulation.ChannelStatusActive
-		channel.LastActivity = time.Now()
-		// 启动分发协程
-		channel.StartDataDistribution()
-		log.Printf("✓ Channel %s activated on kernel %s after receiving ACCEPTED notification", channel.ChannelID, s.multiKernelManager.config.KernelID)
+	// 设置远端接收者映射（用于跨内核数据转发）
+	for _, senderID := range channel.SenderIDs {
+		if strings.Contains(senderID, ":") {
+			parts := strings.SplitN(senderID, ":", 2)
+			kernelID := parts[0]
+			connectorID := parts[1]
+			channel.SetRemoteReceiver(connectorID, kernelID)
+		}
+	}
+	for _, receiverID := range channel.ReceiverIDs {
+		if strings.Contains(receiverID, ":") {
+			parts := strings.SplitN(receiverID, ":", 2)
+			kernelID := parts[0]
+			connectorID := parts[1]
+			channel.SetRemoteReceiver(connectorID, kernelID)
+		}
 	}
 
 	// 构造通知并发送

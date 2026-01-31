@@ -129,6 +129,10 @@ type Channel struct {
 
 	// 连接器状态管理（重启恢复）
 	manager *ChannelManager // 指向ChannelManager的引用，用于访问连接器状态
+
+	// 远端接收者映射：记录每个远端接收者ID（不含kernel前缀）所属的内核ID
+	// 例如: connector-A -> kernel-2
+	remoteReceivers map[string]string
 }
 
 // DataPacket 数据包
@@ -265,6 +269,7 @@ func (cm *ChannelManager) CreateChannelWithID(channelID, creatorID, approverID s
 			SenderApprovals:   make(map[string]bool),
 			ReceiverApprovals: make(map[string]bool),
 		},
+		remoteReceivers:    make(map[string]string), // 初始化远端接收者映射
 	}
 
 	copy(channel.SenderIDs, senderIDs)
@@ -303,6 +308,19 @@ func (cm *ChannelManager) SetForwardToKernel(fn func(kernelID string, packet *Da
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.forwardToKernel = fn
+}
+
+// SetRemoteReceiver 设置远端接收者所属的内核（用于跨内核数据转发）
+// connectorID: 连接器ID（不含kernel前缀）
+// kernelID: 连接器所属的内核ID
+func (c *Channel) SetRemoteReceiver(connectorID, kernelID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.remoteReceivers == nil {
+		c.remoteReceivers = make(map[string]string)
+	}
+	c.remoteReceivers[connectorID] = kernelID
+	log.Printf("✓ Set remote receiver %s -> kernel %s in channel %s", connectorID, kernelID, c.ChannelID)
 }
 
 // GetConfigManager 获取频道配置管理器
@@ -438,6 +456,7 @@ func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs
 		buffer:              make([]*DataPacket, 0),
 		maxBufferSize:       10000, // 最多暂存10000个数据包
 		permissionRequests:  make([]*PermissionChangeRequest, 0),
+		remoteReceivers:     make(map[string]string), // 初始化远端接收者映射
 	}
 
 	cm.channels[channelID] = channel
@@ -455,9 +474,11 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 		return fmt.Errorf("channel not found")
 	}
 
-	// 检查频道状态
-	if channel.Status != ChannelStatusProposed {
-		return fmt.Errorf("channel is not in proposed state")
+	// 检查频道状态 - 如果已经是 active 状态，直接返回成功
+	// 注意：虽然返回成功，但如果是从远端转发来的 accept，可能需要重新通知本地参与者
+	if channel.Status == ChannelStatusActive {
+		log.Printf("✓ Channel %s is already active, accept request processed", channelID)
+		return nil
 	}
 
 	// 检查提议是否存在
@@ -502,20 +523,31 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 
 	// 检查是否所有参与方都已确认
 	allApproved := true
-	for _, approved := range channel.ChannelProposal.SenderApprovals {
+	for id, approved := range channel.ChannelProposal.SenderApprovals {
+		log.Printf("🔍 DEBUG AcceptChannelProposal: SenderApprovals[%s] = %v", id, approved)
+		// 跳过远端参与者（带 kernel 前缀）
+		if strings.Contains(id, ":") {
+			log.Printf("🔍 DEBUG AcceptChannelProposal: skipping remote sender %s", id)
+			continue
+		}
 		if !approved {
 			allApproved = false
-			break
 		}
 	}
 	if allApproved {
-		for _, approved := range channel.ChannelProposal.ReceiverApprovals {
+		for id, approved := range channel.ChannelProposal.ReceiverApprovals {
+			log.Printf("🔍 DEBUG AcceptChannelProposal: ReceiverApprovals[%s] = %v", id, approved)
+			// 跳过远端参与者（带 kernel 前缀）
+			if strings.Contains(id, ":") {
+				log.Printf("🔍 DEBUG AcceptChannelProposal: skipping remote receiver %s", id)
+				continue
+			}
 			if !approved {
 				allApproved = false
-				break
 			}
 		}
 	}
+	log.Printf("🔍 DEBUG AcceptChannelProposal: allApproved = %v, channel.Status = %s", allApproved, channel.Status)
 
 	if allApproved {
 		// 所有参与方都确认了，激活频道
@@ -666,6 +698,7 @@ func (cm *ChannelManager) CreateChannelFromConfig(configFilePath string) (*Chann
 		maxBufferSize:   10000,
 		permissionRequests: make([]*PermissionChangeRequest, 0),
 		manager:         cm, // 设置ChannelManager引用
+		remoteReceivers: make(map[string]string), // 初始化远端接收者映射
 	}
 
 	// 复制切片
@@ -810,6 +843,7 @@ func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, se
 		maxBufferSize:      10000, // 最多暂存10000个数据包
 		permissionRequests: make([]*PermissionChangeRequest, 0),
 		manager:            cm, // 设置ChannelManager引用
+		remoteReceivers:    make(map[string]string), // 初始化远端接收者映射
 	}
 
 	cm.channels[channelID] = channel
@@ -832,12 +866,22 @@ func (c *Channel) AddParticipant(connectorID string) error {
 // IsParticipant 检查连接器是否是频道参与者（发送方或接收方）
 func (c *Channel) IsParticipant(connectorID string) bool {
 	for _, senderID := range c.SenderIDs {
-		if connectorID == senderID {
+		// 去掉 kernel 前缀再比较
+		actualID := senderID
+		if idx := strings.LastIndex(senderID, ":"); idx != -1 {
+			actualID = senderID[idx+1:]
+		}
+		if connectorID == actualID {
 			return true
 		}
 	}
 	for _, receiverID := range c.ReceiverIDs {
-		if connectorID == receiverID {
+		// 去掉 kernel 前缀再比较
+		actualID := receiverID
+		if idx := strings.LastIndex(receiverID, ":"); idx != -1 {
+			actualID = receiverID[idx+1:]
+		}
+		if connectorID == actualID {
 			return true
 		}
 	}
@@ -854,9 +898,23 @@ func (c *Channel) GetParticipants() []string {
 
 // CanSend 检查连接器是否可以在此频道发送数据
 func (c *Channel) CanSend(connectorID string) bool {
+	// 提取裸 connectorID（去掉 kernel 前缀）
+	rawConnectorID := connectorID
+	if idx := strings.LastIndex(connectorID, ":"); idx != -1 {
+		rawConnectorID = connectorID[idx+1:]
+	}
+
 	for _, senderID := range c.SenderIDs {
+		// 精确匹配或裸 ID 匹配
 		if connectorID == senderID {
 			return true
+		}
+		// 检查 senderID 是否是 "kernel:connector" 格式
+		if senderIdx := strings.LastIndex(senderID, ":"); senderIdx != -1 {
+			senderRaw := senderID[senderIdx+1:]
+			if rawConnectorID == senderRaw {
+				return true
+			}
 		}
 	}
 	return false
@@ -864,9 +922,23 @@ func (c *Channel) CanSend(connectorID string) bool {
 
 // CanReceive 检查连接器是否可以在此频道接收数据
 func (c *Channel) CanReceive(connectorID string) bool {
+	// 提取裸 connectorID（去掉 kernel 前缀）
+	rawConnectorID := connectorID
+	if idx := strings.LastIndex(connectorID, ":"); idx != -1 {
+		rawConnectorID = connectorID[idx+1:]
+	}
+
 	for _, receiverID := range c.ReceiverIDs {
+		// 精确匹配或裸 ID 匹配
 		if connectorID == receiverID {
 			return true
+		}
+		// 检查 receiverID 是否是 "kernel:connector" 格式
+		if receiverIdx := strings.LastIndex(receiverID, ":"); receiverIdx != -1 {
+			receiverRaw := receiverID[receiverIdx+1:]
+			if rawConnectorID == receiverRaw {
+				return true
+			}
 		}
 	}
 	return false
@@ -1014,23 +1086,40 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		// 广播模式：
 		// - 将远端接收者 (kernelID:connectorID) 按内核分组用于转发
 		// - 本地接收者仍按原逻辑判断是否已订阅/在线
+		// - 使用 remoteReceivers 映射来识别实际属于远端的接收者
+		log.Printf("🔍 DEBUG PushData broadcast mode: ReceiverIDs=%v, remoteReceivers=%v", c.ReceiverIDs, c.remoteReceivers)
 		for _, receiverID := range c.ReceiverIDs {
+			log.Printf("🔍 DEBUG processing receiverID=%s", receiverID)
 			if strings.Contains(receiverID, ":") {
+				// 远端格式 kernelID:connectorID
 				parts := strings.SplitN(receiverID, ":", 2)
 				kernelPart := parts[0]
 				connectorPart := parts[1]
+				log.Printf("🔍 DEBUG remote receiver format: kernel=%s, connector=%s", kernelPart, connectorPart)
 				remoteTargetsByKernel[kernelPart] = append(remoteTargetsByKernel[kernelPart], connectorPart)
 				continue
 			}
+
+			// 检查 remoteReceivers 映射，看是否这个接收者实际上是远端的
+			if kernelID, isRemote := c.remoteReceivers[receiverID]; isRemote {
+				// 这是远端接收者，使用映射中的 kernelID
+				remoteTargetsByKernel[kernelID] = append(remoteTargetsByKernel[kernelID], receiverID)
+				log.Printf("🔄 Broadcasting to remote receiver %s via kernel %s", receiverID, kernelID)
+				continue
+			}
+
 			// 本地接收者
+			log.Printf("🔍 DEBUG local receiver: %s", receiverID)
 			if _, subscribed := c.subscribers[receiverID]; !subscribed {
+				log.Printf("🔍 DEBUG %s not subscribed, IsConnectorOnline=%v", receiverID, c.manager != nil && c.manager.IsConnectorOnline(receiverID))
 				if c.manager != nil && !c.manager.IsConnectorOnline(receiverID) {
 					offlineTargets = append(offlineTargets, receiverID)
 				}
 			}
 		}
+		log.Printf("🔍 DEBUG remoteTargetsByKernel=%v", remoteTargetsByKernel)
 	}
-	
+
 	// 为离线本地连接器缓冲数据
 	for _, offlineTarget := range offlineTargets {
 		if c.manager != nil {
@@ -1049,14 +1138,14 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		// 检查指定的目标接收者是否有未订阅但在线的
 		for _, targetID := range packet.TargetIDs {
 			if c.CanReceive(targetID) {
-			if _, subscribed := c.subscribers[targetID]; !subscribed {
+				if _, subscribed := c.subscribers[targetID]; !subscribed {
 					// 只有在线但未订阅的才需要频道级别缓冲
 					if c.manager == nil || c.manager.IsConnectorOnline(targetID) {
 						shouldBuffer = true
-				break
+						break
+					}
+				}
 			}
-		}
-	}
 		}
 	}
 
@@ -1098,10 +1187,12 @@ func (c *Channel) PushData(packet *DataPacket) error {
 
 	// 转发到远端内核（如果有远端目标）
 	if len(remoteTargetsByKernel) > 0 {
+		log.Printf("🔍 DEBUG: forwarding to %d remote kernels: %v", len(remoteTargetsByKernel), remoteTargetsByKernel)
 		if c.manager == nil || c.manager.forwardToKernel == nil {
 			return fmt.Errorf("forwardToKernel callback not configured")
 		}
 		for rk, connectorIDs := range remoteTargetsByKernel {
+			log.Printf("🔍 DEBUG: forwarding to kernel %s, targets=%v", rk, connectorIDs)
 			outPacket := &DataPacket{
 				ChannelID:      packet.ChannelID,
 				SequenceNumber: packet.SequenceNumber,
@@ -1116,8 +1207,12 @@ func (c *Channel) PushData(packet *DataPacket) error {
 			copy(outPacket.TargetIDs, connectorIDs)
 			if err := c.manager.forwardToKernel(rk, outPacket); err != nil {
 				log.Printf("⚠ Failed to forward packet to kernel %s: %v", rk, err)
+			} else {
+				log.Printf("✓ Successfully forwarded packet to kernel %s", rk)
 			}
 		}
+	} else {
+		log.Printf("🔍 DEBUG: no remote targets, skipping forwarding")
 	}
 
 	// 没有订阅者且没有目标接收者（包括远端），数据丢失（正常情况返回 nil）

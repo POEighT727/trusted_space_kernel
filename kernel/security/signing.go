@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"os"
 )
 
@@ -150,7 +151,10 @@ func ExtractPublicKeyFromCert(certPath string) (*rsa.PublicKey, error) {
 
 
 // VerifyEvidenceSignature 验证存证记录的签名
-func VerifyEvidenceSignature(connectorID, eventType, channelID, dataHash, signature string, timestamp int64) error {
+// 参数说明：
+// - isCrossKernel: true 表示跨内核场景，接收内核信任源内核的验证结果，跳过签名验证
+// - isCrossKernel: false 表示同内核场景，需要验证签名，证书不存在则返回错误
+func VerifyEvidenceSignature(isCrossKernel bool, connectorID, eventType, channelID, dataHash, signature string, timestamp int64) error {
 	// 构造原始签名数据
 	data := fmt.Sprintf("%s|%s|%s|%s|%d", connectorID, eventType, channelID, dataHash, timestamp)
 
@@ -158,7 +162,14 @@ func VerifyEvidenceSignature(connectorID, eventType, channelID, dataHash, signat
 	certPath := fmt.Sprintf("certs/%s.crt", connectorID)
 	publicKey, err := ExtractPublicKeyFromCert(certPath)
 	if err != nil {
-		return fmt.Errorf("failed to load public key for connector %s: %w", connectorID, err)
+		if isCrossKernel {
+			// 跨内核场景：本地没有远端连接器的证书是正常的
+			// 源内核已通过mTLS验证连接器身份，接收内核信任源内核的验证结果
+			log.Printf("⚠️ Certificate not found for connector %s (%s) - cross-kernel, skipping signature verification", connectorID, certPath)
+			return nil
+		}
+		// 同内核场景：证书不存在是错误，必须返回错误
+		return fmt.Errorf("certificate not found for connector %s (%s) - this is an error for same-kernel data", connectorID, certPath)
 	}
 
 	return VerifySignature([]byte(data), signature, publicKey)

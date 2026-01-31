@@ -719,7 +719,10 @@ func (c *Connector) storeEvidenceRecord(record *struct {
 	}
 
 	// 验证存证记录的数字签名（可选，但推荐）
-	if record.Signature != "" {
+	// 注意：如果连接器ID带有kernel前缀（跨内核场景），跳过签名验证
+	// 源内核已通过mTLS验证连接器身份，接收内核信任源内核的验证结果
+	if record.Signature != "" && !strings.Contains(record.ConnectorID, ":") {
+		// 同内核场景：验证签名
 		timestamp, err := time.Parse(time.RFC3339Nano, record.Timestamp)
 		if err != nil {
 			log.Printf("⚠️  无法解析存证时间戳: %v", err)
@@ -736,6 +739,9 @@ func (c *Connector) storeEvidenceRecord(record *struct {
 				// 减少签名验证成功的详细日志
 			}
 		}
+	} else if strings.Contains(record.ConnectorID, ":") {
+		// 跨内核场景：跳过签名验证（源内核已验证）
+		log.Printf("⚠️  Skipping signature verification for cross-kernel evidence record (connector: %s)", record.ConnectorID)
 	}
 
 	// 确定存储目录
@@ -947,6 +953,13 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 						isSender = true
 						break
 					}
+					// 支持 kernel:connector 格式
+					if idx := strings.LastIndex(senderID, ":"); idx != -1 {
+						if senderID[idx+1:] == c.connectorID {
+							isSender = true
+							break
+						}
+					}
 				}
 
 				// 检查是否是接收方
@@ -954,6 +967,13 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 					if receiverID == c.connectorID {
 						isReceiver = true
 						break
+					}
+					// 支持 kernel:connector 格式
+					if idx := strings.LastIndex(receiverID, ":"); idx != -1 {
+						if receiverID[idx+1:] == c.connectorID {
+							isReceiver = true
+							break
+						}
 					}
 				}
 

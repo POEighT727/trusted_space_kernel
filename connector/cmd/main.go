@@ -816,7 +816,12 @@ func handleSendTo(connector *client.Connector, args []string) {
 	connectorID := connector.GetID()
 	isSender := false
 	for _, senderID := range channelInfo.SenderIds {
-		if senderID == connectorID {
+		// 去掉 kernel 前缀再比较（格式: "kernelID:connectorID" 或直接是 "connectorID"）
+		actualID := senderID
+		if idx := strings.LastIndex(senderID, ":"); idx != -1 {
+			actualID = senderID[idx+1:]
+		}
+		if actualID == connectorID {
 			isSender = true
 			break
 		}
