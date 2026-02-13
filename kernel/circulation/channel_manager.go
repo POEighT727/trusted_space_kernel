@@ -524,10 +524,8 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 	// 检查是否所有参与方都已确认
 	allApproved := true
 	for id, approved := range channel.ChannelProposal.SenderApprovals {
-		log.Printf("🔍 DEBUG AcceptChannelProposal: SenderApprovals[%s] = %v", id, approved)
 		// 跳过远端参与者（带 kernel 前缀）
 		if strings.Contains(id, ":") {
-			log.Printf("🔍 DEBUG AcceptChannelProposal: skipping remote sender %s", id)
 			continue
 		}
 		if !approved {
@@ -536,10 +534,8 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 	}
 	if allApproved {
 		for id, approved := range channel.ChannelProposal.ReceiverApprovals {
-			log.Printf("🔍 DEBUG AcceptChannelProposal: ReceiverApprovals[%s] = %v", id, approved)
 			// 跳过远端参与者（带 kernel 前缀）
 			if strings.Contains(id, ":") {
-				log.Printf("🔍 DEBUG AcceptChannelProposal: skipping remote receiver %s", id)
 				continue
 			}
 			if !approved {
@@ -547,7 +543,6 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 			}
 		}
 	}
-	log.Printf("🔍 DEBUG AcceptChannelProposal: allApproved = %v, channel.Status = %s", allApproved, channel.Status)
 
 	if allApproved {
 		// 所有参与方都确认了，激活频道
@@ -1087,15 +1082,12 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		// - 将远端接收者 (kernelID:connectorID) 按内核分组用于转发
 		// - 本地接收者仍按原逻辑判断是否已订阅/在线
 		// - 使用 remoteReceivers 映射来识别实际属于远端的接收者
-		log.Printf("🔍 DEBUG PushData broadcast mode: ReceiverIDs=%v, remoteReceivers=%v", c.ReceiverIDs, c.remoteReceivers)
 		for _, receiverID := range c.ReceiverIDs {
-			log.Printf("🔍 DEBUG processing receiverID=%s", receiverID)
 			if strings.Contains(receiverID, ":") {
 				// 远端格式 kernelID:connectorID
 				parts := strings.SplitN(receiverID, ":", 2)
 				kernelPart := parts[0]
 				connectorPart := parts[1]
-				log.Printf("🔍 DEBUG remote receiver format: kernel=%s, connector=%s", kernelPart, connectorPart)
 				remoteTargetsByKernel[kernelPart] = append(remoteTargetsByKernel[kernelPart], connectorPart)
 				continue
 			}
@@ -1104,20 +1096,16 @@ func (c *Channel) PushData(packet *DataPacket) error {
 			if kernelID, isRemote := c.remoteReceivers[receiverID]; isRemote {
 				// 这是远端接收者，使用映射中的 kernelID
 				remoteTargetsByKernel[kernelID] = append(remoteTargetsByKernel[kernelID], receiverID)
-				log.Printf("🔄 Broadcasting to remote receiver %s via kernel %s", receiverID, kernelID)
 				continue
 			}
 
 			// 本地接收者
-			log.Printf("🔍 DEBUG local receiver: %s", receiverID)
 			if _, subscribed := c.subscribers[receiverID]; !subscribed {
-				log.Printf("🔍 DEBUG %s not subscribed, IsConnectorOnline=%v", receiverID, c.manager != nil && c.manager.IsConnectorOnline(receiverID))
 				if c.manager != nil && !c.manager.IsConnectorOnline(receiverID) {
 					offlineTargets = append(offlineTargets, receiverID)
 				}
 			}
 		}
-		log.Printf("🔍 DEBUG remoteTargetsByKernel=%v", remoteTargetsByKernel)
 	}
 
 	// 为离线本地连接器缓冲数据
@@ -1129,7 +1117,7 @@ func (c *Channel) PushData(packet *DataPacket) error {
 	}
 
 	if len(offlineTargets) > 0 {
-		log.Printf("🔍 Found %d offline targets for packet in channel %s", len(offlineTargets), c.ChannelID)
+		log.Printf("📦 Found %d offline targets for packet in channel %s", len(offlineTargets), c.ChannelID)
 	}
 
 	// 决定是否需要频道级别的缓冲
@@ -1187,12 +1175,10 @@ func (c *Channel) PushData(packet *DataPacket) error {
 
 	// 转发到远端内核（如果有远端目标）
 	if len(remoteTargetsByKernel) > 0 {
-		log.Printf("🔍 DEBUG: forwarding to %d remote kernels: %v", len(remoteTargetsByKernel), remoteTargetsByKernel)
 		if c.manager == nil || c.manager.forwardToKernel == nil {
 			return fmt.Errorf("forwardToKernel callback not configured")
 		}
 		for rk, connectorIDs := range remoteTargetsByKernel {
-			log.Printf("🔍 DEBUG: forwarding to kernel %s, targets=%v", rk, connectorIDs)
 			outPacket := &DataPacket{
 				ChannelID:      packet.ChannelID,
 				SequenceNumber: packet.SequenceNumber,
@@ -1211,8 +1197,6 @@ func (c *Channel) PushData(packet *DataPacket) error {
 				log.Printf("✓ Successfully forwarded packet to kernel %s", rk)
 			}
 		}
-	} else {
-		log.Printf("🔍 DEBUG: no remote targets, skipping forwarding")
 	}
 
 	// 没有订阅者且没有目标接收者（包括远端），数据丢失（正常情况返回 nil）

@@ -660,20 +660,15 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 
 // ForwardData 转发数据
 func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDataRequest) (*pb.ForwardDataResponse, error) {
-	log.Printf("🔍 DEBUG ForwardData: received from kernel %s, channel=%s, sender=%s, targets=%v",
-		req.SourceKernelId, req.ChannelId, req.DataPacket.SenderId, req.DataPacket.TargetIds)
-
 	// 检查频道是否存在
 	channel, err := s.channelManager.GetChannel(req.ChannelId)
 	if err != nil {
-		log.Printf("⚠ DEBUG ForwardData: channel not found: %v", err)
+		log.Printf("⚠ ForwardData: channel not found: %v", err)
 		return &pb.ForwardDataResponse{
 			Success: false,
 			Message: fmt.Sprintf("channel not found: %v", err),
 		}, nil
 	}
-
-	log.Printf("🔍 DEBUG ForwardData: channel found, ReceiverIDs=%v", channel.ReceiverIDs)
 
 	// 转发数据到频道
 	dataPacket := &circulation.DataPacket{
@@ -685,10 +680,9 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 		SenderID:       req.DataPacket.SenderId,
 		TargetIDs:      req.DataPacket.TargetIds,
 	}
-	log.Printf("🔍 DEBUG ForwardData: calling PushData with targets=%v", dataPacket.TargetIDs)
 	err = channel.PushData(dataPacket)
 	if err != nil {
-		log.Printf("⚠ DEBUG ForwardData: PushData failed: %v", err)
+		log.Printf("⚠ ForwardData: PushData failed: %v", err)
 		return &pb.ForwardDataResponse{
 			Success: false,
 			Message: fmt.Sprintf("failed to forward data: %v", err),
@@ -706,8 +700,13 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 
 // GetCrossKernelChannelInfo 获取跨内核频道信息
 func (s *KernelServiceServer) GetCrossKernelChannelInfo(ctx context.Context, req *pb.GetCrossKernelChannelInfoRequest) (*pb.GetCrossKernelChannelInfoResponse, error) {
+	log.Printf("📌 GetCrossKernelChannelInfo called: channel=%s, requester=%s", req.ChannelId, req.RequesterKernelId)
+	
 	channel, err := s.channelManager.GetChannel(req.ChannelId)
+	log.Printf("📌 GetCrossKernelChannelInfo: channel found=%v, err=%v", channel != nil, err)
+	
 	if err != nil {
+		log.Printf("⚠️ GetCrossKernelChannelInfo: channel not found: %v", err)
 		return &pb.GetCrossKernelChannelInfoResponse{
 			Found:  false,
 			Message: fmt.Sprintf("channel not found: %v", err),
@@ -748,6 +747,9 @@ func (s *KernelServiceServer) GetCrossKernelChannelInfo(ctx context.Context, req
 			ConnectorId: connectorId,
 		})
 	}
+
+	log.Printf("📌 GetCrossKernelChannelInfo: returning channel info: id=%s, creator=%s, senders=%v, receivers=%v",
+		channel.ChannelID, channel.CreatorID, len(senders), len(receivers))
 
 	return &pb.GetCrossKernelChannelInfoResponse{
 		Found:              true,

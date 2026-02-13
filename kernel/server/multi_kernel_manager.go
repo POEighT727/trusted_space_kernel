@@ -717,6 +717,99 @@ func (m *MultiKernelManager) DisconnectFromKernel(kernelID string) error {
 	return nil
 }
 
+// EnsureKernelConnected 确保与指定内核的连接已建立
+// 如果内核已存在于 kernels map 中但没有有效的 Client/conn，则尝试建立连接
+func (m *MultiKernelManager) EnsureKernelConnected(kernelID string) error {
+	m.kernelsMu.Lock()
+	defer m.kernelsMu.Unlock()
+
+	kernelInfo, exists := m.kernels[kernelID]
+	if !exists {
+		return fmt.Errorf("kernel %s not found in known kernels", kernelID)
+	}
+
+	// 如果已经有有效的连接，直接返回
+	if kernelInfo.Client != nil && kernelInfo.conn != nil {
+		log.Printf("✓ Kernel %s already connected", kernelID)
+		return nil
+	}
+
+	// 需要建立连接
+	log.Printf("⚠️ Kernel %s has no active connection (Client=%v, conn=%v), attempting to connect...",
+		kernelID, kernelInfo.Client != nil, kernelInfo.conn != nil)
+
+	// 检查是否有必要的地址信息
+	if kernelInfo.Address == "" {
+		return fmt.Errorf("kernel %s has no address information", kernelID)
+	}
+
+	// 计算内核间通信端口 (mainPort + 2)
+	kernelPort := kernelInfo.MainPort + 2
+	if kernelInfo.Port > 0 {
+		kernelPort = kernelInfo.Port
+	}
+
+	// 创建TLS配置
+	cert, err := tls.LoadX509KeyPair(m.config.KernelCertPath, m.config.KernelKeyPath)
+	if err != nil {
+		return fmt.Errorf("failed to load certificates: %w", err)
+	}
+
+	// 创建证书池，包含自己的CA和可能的对等CA
+	caCertPool := x509.NewCertPool()
+
+	// 添加自己的CA证书
+	ownCACert, err := os.ReadFile(m.config.CACertPath)
+	if err != nil {
+		return fmt.Errorf("failed to read own CA certificate: %w", err)
+	}
+	if !caCertPool.AppendCertsFromPEM(ownCACert) {
+		return fmt.Errorf("failed to append own CA certificate")
+	}
+
+	// 检查是否已经有对等内核的CA证书，如果有也添加
+	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
+	if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
+		if !caCertPool.AppendCertsFromPEM(peerCACert) {
+			log.Printf("Warning: failed to append peer CA certificate for %s", kernelID)
+		} else {
+			log.Printf("Using existing peer CA certificate for %s", kernelID)
+		}
+	} else {
+		log.Printf("No peer CA certificate for %s, will attempt insecure connection", kernelID)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caCertPool,
+		ClientAuth:    tls.RequireAndVerifyClientCert,
+		ClientCAs:    caCertPool,
+	}
+
+	creds := credentials.NewTLS(tlsConfig)
+
+	// 连接到目标内核
+	targetAddr := fmt.Sprintf("%s:%d", kernelInfo.Address, kernelPort)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.config.ConnectTimeout)*time.Second)
+	defer cancel()
+
+	conn, err := grpc.DialContext(ctx, targetAddr, grpc.WithTransportCredentials(creds))
+	if err != nil {
+		return fmt.Errorf("failed to connect to kernel %s at %s: %w", kernelID, targetAddr, err)
+	}
+
+	client := pb.NewKernelServiceClient(conn)
+
+	// 更新 kernelInfo
+	kernelInfo.Client = client
+	kernelInfo.conn = conn
+	kernelInfo.Status = "active"
+	kernelInfo.LastHeartbeat = time.Now().Unix()
+
+	log.Printf("✅ Successfully connected to kernel %s at %s", kernelID, targetAddr)
+	return nil
+}
+
 // ListKnownKernels 列出已知内核
 func (m *MultiKernelManager) ListKnownKernels() []*KernelInfo {
 	m.kernelsMu.RLock()
@@ -758,21 +851,39 @@ func (m *MultiKernelManager) connectToKernelIdentityService(kernel *KernelInfo) 
 
 	// 添加对等内核的CA证书（如果存在）
 	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernel.KernelID)
+	peerCACertExists := false
 	if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
 		if !caCertPool.AppendCertsFromPEM(peerCACert) {
 			log.Printf("Warning: failed to append peer CA certificate for %s", kernel.KernelID)
 		} else {
 			log.Printf("Using peer CA certificate for kernel %s", kernel.KernelID)
+			peerCACertExists = true
 		}
 	} else {
 		log.Printf("Warning: peer CA certificate not found for kernel %s: %v", kernel.KernelID, err)
 	}
 
+	// 构建TLS配置
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      caCertPool,
 		ServerName:   "", // 使用IP地址，不验证服务器名称
 		MinVersion:   tls.VersionTLS13,
+	}
+
+	// 如果没有对端CA证书，尝试不使用服务器证书验证的方式连接
+	// 这是为了支持动态发现的内核之间的通信
+	if !peerCACertExists {
+		log.Printf("Attempting insecure connection to kernel %s (no peer CA available)", kernel.KernelID)
+		// 使用 InsecureSkipVerify 允许连接到没有预共享CA的内核
+		// 注意：这仍然要求客户端提供证书进行双向认证
+		insecureCertPool := x509.NewCertPool()
+		if !insecureCertPool.AppendCertsFromPEM(ownCACert) {
+			return nil, fmt.Errorf("failed to append own CA certificate")
+		}
+		tlsConfig.RootCAs = insecureCertPool
+		// 设置 ServerName 以匹配服务器证书的CN
+		tlsConfig.ServerName = "trusted-data-space-kernel"
 	}
 
 	creds := credentials.NewTLS(tlsConfig)
