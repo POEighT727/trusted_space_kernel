@@ -383,9 +383,13 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 	m.kernelsMu.Lock()
 	defer m.kernelsMu.Unlock()
 
-	// 检查是否已经连接
-	if _, exists := m.kernels[kernelID]; exists {
-		return fmt.Errorf("already connected to kernel %s", kernelID)
+	// 检查是否已经有有效的连接（Client 和 conn 都存在）
+	if existingInfo, exists := m.kernels[kernelID]; exists {
+		if existingInfo.Client != nil && existingInfo.conn != nil {
+			return fmt.Errorf("already connected to kernel %s", kernelID)
+		}
+		// 内核存在但连接无效，删除后重新建立
+		delete(m.kernels, kernelID)
 	}
 
 	// 创建TLS配置
@@ -499,13 +503,21 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 		// 如果目标已经把我们注册过（可能是并发或之前已注册），当作成功继续建立连接
 		if strings.Contains(strings.ToLower(resp.Message), "kernel already registered") {
 			log.Printf("Warning: target kernel %s reports already registered: %s — proceeding to establish connection", kernelID, resp.Message)
+			// 即使对方返回已注册，也要保存对方返回的CA证书
+			if len(resp.PeerCaCertificate) > 0 {
+				peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
+				if err := os.WriteFile(peerCACertPath, resp.PeerCaCertificate, 0644); err != nil {
+					log.Printf("Warning: failed to save peer CA certificate for %s: %v", kernelID, err)
+				} else {
+					log.Printf("✓ Saved peer CA certificate for %s (from already registered response)", kernelID)
+				}
+			}
 		} else {
 			conn.Close()
 			return fmt.Errorf("registration rejected by kernel %s: %s", kernelID, resp.Message)
 		}
-	}
-
-	// 保存对方的CA证书
+	} else {
+		// 保存对方的CA证书
 		if len(resp.PeerCaCertificate) > 0 {
 			peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
 			if err := os.WriteFile(peerCACertPath, resp.PeerCaCertificate, 0644); err != nil {
@@ -514,6 +526,7 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 				// suppressed detailed CA saved log
 			}
 		}
+	}
 
 	// 保存内核信息
 	// port 是内核间通信端口，mainPort = kernelPort - 2（假设标准配置）

@@ -46,9 +46,15 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 
 	// 验证内核ID不冲突
 	if req.KernelId == s.multiKernelManager.config.KernelID {
+		// 即使ID冲突，也返回本端CA证书以便对方保存
+		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
+		if err != nil {
+			ownCACertData = nil
+		}
 		return &pb.RegisterKernelResponse{
-			Success: false,
-			Message: "kernel ID conflict",
+			Success:           false,
+			Message:           "kernel ID conflict",
+			PeerCaCertificate: ownCACertData,
 		}, nil
 	}
 
@@ -58,9 +64,15 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 	s.multiKernelManager.kernelsMu.RUnlock()
 
 	if exists {
+		// 即使内核已注册，也需要返回本端CA证书以便对方保存
+		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
+		if err != nil {
+			ownCACertData = nil
+		}
 		return &pb.RegisterKernelResponse{
-			Success: false,
-			Message: "kernel already registered",
+			Success:           false,
+			Message:           "kernel already registered",
+			PeerCaCertificate: ownCACertData,
 		}, nil
 	}
 
@@ -538,12 +550,16 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 	}
 
 	// 设置远端接收者映射（用于跨内核数据转发）
+	// 注意：即使接收者是本地的，也需要设置映射以便通知时能正确识别
 	for _, receiverID := range receiverIDs {
 		if strings.Contains(receiverID, ":") {
 			parts := strings.SplitN(receiverID, ":", 2)
 			kernelID := parts[0]
 			connectorID := parts[1]
 			channel.SetRemoteReceiver(connectorID, kernelID)
+		} else {
+			// 本地接收者也需要设置映射，指向本地内核
+			channel.SetRemoteReceiver(receiverID, localKernelID)
 		}
 	}
 	// 同样处理发送方（如果有远端发送方）

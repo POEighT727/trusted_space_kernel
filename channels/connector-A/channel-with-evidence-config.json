@@ -5,7 +5,7 @@
   "creator_id": "connector-A",
   "approver_id": "connector-A",
   "sender_ids": ["connector-A"],
-  "receiver_ids": ["connector-B"],
+  "receiver_ids": ["kernel-3:connector-X"],
   "data_topic": "data.transfer.evidence",
   "encrypted": true,
   "evidence_config": {

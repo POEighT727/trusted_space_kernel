@@ -323,6 +323,18 @@ func (c *Channel) SetRemoteReceiver(connectorID, kernelID string) {
 	log.Printf("✓ Set remote receiver %s -> kernel %s in channel %s", connectorID, kernelID, c.ChannelID)
 }
 
+// GetRemoteKernelID 获取指定 connector 对应的远端内核 ID
+// 返回值 ok 为 true 表示找到了映射
+func (c *Channel) GetRemoteKernelID(connectorID string) (kernelID string, ok bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.remoteReceivers == nil {
+		return "", false
+	}
+	kernelID, ok = c.remoteReceivers[connectorID]
+	return kernelID, ok
+}
+
 // GetConfigManager 获取频道配置管理器
 func (cm *ChannelManager) GetConfigManager() *ChannelConfigManager {
 	cm.mu.RLock()
@@ -501,6 +513,16 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 	candidateIDs := []string{accepterID}
 	if actualID != accepterID {
 		candidateIDs = append(candidateIDs, actualID)
+	}
+
+	// 还需要检查 remoteReceivers 映射，尝试添加 kernel 前缀进行匹配
+	// 这样可以处理 "connector-U" 尝试匹配 "kernel-2:connector-U" 的情况
+	if channel.remoteReceivers != nil {
+		if kernelID, exists := channel.remoteReceivers[actualID]; exists {
+			// 添加带 kernel 前缀的 ID 到候选列表
+			idWithKernel := fmt.Sprintf("%s:%s", kernelID, actualID)
+			candidateIDs = append(candidateIDs, idWithKernel)
+		}
 	}
 
 	// 根据接受者身份更新确认状态
@@ -899,15 +921,37 @@ func (c *Channel) CanSend(connectorID string) bool {
 		rawConnectorID = connectorID[idx+1:]
 	}
 
+	// 提取 kernelID（如果存在）
+	kernelID := ""
+	if idx := strings.LastIndex(connectorID, ":"); idx != -1 {
+		kernelID = connectorID[:idx]
+	}
+
 	for _, senderID := range c.SenderIDs {
-		// 精确匹配或裸 ID 匹配
+		// 精确匹配
 		if connectorID == senderID {
 			return true
 		}
 		// 检查 senderID 是否是 "kernel:connector" 格式
 		if senderIdx := strings.LastIndex(senderID, ":"); senderIdx != -1 {
+			senderKernelID := senderID[:senderIdx]
 			senderRaw := senderID[senderIdx+1:]
+			// 匹配：完整格式匹配 (kernelID:connector) 或裸 ID 匹配 (connector)
+			// 也支持本地 connector 与远端 kernel:connector 格式匹配（当 kernelID 相同时）
 			if rawConnectorID == senderRaw {
+				return true
+			}
+			// 支持 kernel:connector 完整格式匹配
+			if connectorID == senderID {
+				return true
+			}
+			// 支持跨内核场景：本地 kernel 的 connector 与远端 kernel:connector 匹配
+			if kernelID != "" && kernelID == senderKernelID && rawConnectorID == senderRaw {
+				return true
+			}
+		} else {
+			// senderID 是裸 ID，直接比较裸 ID
+			if rawConnectorID == senderID {
 				return true
 			}
 		}

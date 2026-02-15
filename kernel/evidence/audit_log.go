@@ -672,6 +672,10 @@ func (al *AuditLog) sendEvidenceToChannel(channelID string, record *EvidenceReco
 		targetIDs = []string{}
 	}
 
+	// 诊断日志：追踪 ConnectorID 问题
+	log.Printf("🔍 sendEvidenceToChannel: record.ConnectorID=%s, channel.SenderIDs=%v, channel.CreatorID=%s",
+		record.ConnectorID, channel.SenderIDs, channel.CreatorID)
+
 	// 确定发送者ID：优先使用原始连接器，但如果不是发送方则使用创建者
 	senderID := record.ConnectorID
 	if !channel.CanSend(senderID) {
