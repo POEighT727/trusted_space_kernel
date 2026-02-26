@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -171,6 +172,7 @@ func main() {
 
 	// 3. 频道管理器
 	channelManager := circulation.NewChannelManager()
+	channelManager.SetKernelID(config.Kernel.ID) // 设置当前内核ID
 	channelManager.StartCleanupRoutine()
 	channelManager.StartBufferCleanupRoutine() // 启动连接器缓冲清理协程
 
@@ -271,6 +273,22 @@ func main() {
 		log.Fatalf("Failed to initialize multi-kernel manager: %v", err)
 	}
 
+	// 8. 多跳链路配置管理器
+	log.Println("正在初始化多跳链路配置管理器...")
+	multiHopConfigManager, err := server.NewMultiHopConfigManager("./kernel_configs")
+	if err != nil {
+		log.Printf("Warning: Failed to initialize multi-hop config manager: %v", err)
+		// 不致命，继续运行
+		multiHopConfigManager = nil
+	} else {
+		log.Printf("✓ Multi-hop config manager initialized with %d routes",
+			len(multiHopConfigManager.ListConfigs()))
+		// 注意：不再自动连接多跳路由，由用户通过 connect-kernel -route 命令手动指定
+
+		// 将多跳配置管理器注入到多内核管理器
+		multiKernelManager.SetMultiHopConfigManager(multiHopConfigManager)
+	}
+
 	// 将跨内核数据转发回调注入到 ChannelManager（当检测到目标为 kernel:connector 时调用）
 	channelManager.SetForwardToKernel(func(kernelID string, packet *circulation.DataPacket) error {
 		// 将 circulation.DataPacket 转为 pb.DataPacket
@@ -282,6 +300,7 @@ func main() {
 			Timestamp:      packet.Timestamp,
 			SenderId:       packet.SenderID,
 			TargetIds:      packet.TargetIDs,
+			MessageType:    string(packet.MessageType),
 		}
 		return multiKernelManager.ForwardData(kernelID, pbPacket)
 	})
@@ -405,7 +424,7 @@ func main() {
 		log.Println("✓ gRPC server is running in the background")
 		log.Println("✓ Interactive commands are enabled")
 		log.Println("✓ Ready to accept connector connections")
-		go runInteractiveKernelShell(config, channelManager, registry, multiKernelManager)
+		go runInteractiveKernelShell(config, channelManager, registry, multiKernelManager, multiHopConfigManager)
 	}
 
 	if err := grpcServer.Serve(listener); err != nil {
@@ -415,7 +434,8 @@ func main() {
 
 // runInteractiveKernelShell 运行交互式内核命令行
 func runInteractiveKernelShell(config *Config, channelManager *circulation.ChannelManager,
-	registry *control.Registry, multiKernelManager *server.MultiKernelManager) {
+	registry *control.Registry, multiKernelManager *server.MultiKernelManager,
+	multiHopConfigManager *server.MultiHopConfigManager) {
 
 	kernelID := config.Kernel.ID
 	scanner := bufio.NewScanner(os.Stdin)
@@ -470,6 +490,18 @@ func runInteractiveKernelShell(config *Config, channelManager *circulation.Chann
 			handleApproveRequest(multiKernelManager, args)
 		case "disconnect-kernel":
 			handleDisconnectKernel(multiKernelManager, args)
+		case "routes", "rt":
+			handleListRoutes(multiHopConfigManager, multiKernelManager)
+		case "connect-route":
+			handleConnectRoute(multiKernelManager, multiHopConfigManager, args)
+		case "load-route":
+			handleLoadRoute(multiHopConfigManager, args)
+		case "enable-route":
+			handleEnableRoute(multiHopConfigManager, args)
+		case "disable-route":
+			handleDisableRoute(multiHopConfigManager, args)
+		case "route-info":
+			handleRouteInfo(multiKernelManager, multiHopConfigManager, args)
 		case "exit", "quit", "q":
 			fmt.Println("Shutting down kernel...")
 			os.Exit(0)
@@ -486,20 +518,34 @@ func printKernelHelp() {
 	fmt.Println("  connectors, cs                - List all connectors (local + connected kernels)")
 	fmt.Println("  channels, ch                  - List all channels in this kernel")
 	fmt.Println("  kernels, ks                   - List all known kernels (multi-kernel mode)")
-	fmt.Println("  connect-kernel <id> <addr> <port>")
-	fmt.Println("                                - Initiate inter-kernel connection (generates request id)")
+	fmt.Println("  connect-kernel <id> <addr> <port> [-route <route_name>]")
+	fmt.Println("                                - Initiate inter-kernel connection (with optional multi-hop route)")
 	fmt.Println("  disconnect-kernel <kernel_id> - Disconnect from a kernel")
 	fmt.Println("  pending-requests              - List pending interconnect requests awaiting approval")
 	fmt.Println("  approve-request <request_id>  - Approve a pending interconnect request (establish connection)")
 	fmt.Println()
+	fmt.Println("Multi-Hop Route Commands:")
+	fmt.Println("  routes, rt                    - List all configured multi-hop routes")
+	fmt.Println("  load-route <filename>         - Load a multi-hop route from config file")
+	fmt.Println("  connect-route <route_name>    - Connect a specific multi-hop route")
+	fmt.Println("  route-info <route_name>       - Show detailed info of a route and connection status")
+	fmt.Println("  enable-route <route_name>     - Enable a route for auto-connect")
+	fmt.Println("  disable-route <route_name>    - Disable a route for auto-connect")
+	fmt.Println()
 	fmt.Println("Notes:")
 	fmt.Println("  - Typical connect example: connect-kernel kernel-2 192.168.202.136 50053")
 	fmt.Println("    This sends an interconnect request to the target; it returns a request id.")
+	fmt.Println("  - For multi-hop connection: connect-kernel kernel-3 192.168.202.140 50053 -route route-kernel-1-to-kernel-3-via-kernel-2")
+	fmt.Println("    This connects to kernel-3 through the specified multi-hop route.")
 	fmt.Println("  - On the target kernel, run `pending-requests` to view request ids, then")
 	fmt.Println("    `approve-request <id>` to approve and establish the connection.")
 	fmt.Println()
 	fmt.Println("  - connectors/ks/cs collect information across connected kernels;")
 	fmt.Println("    after approval, run `ks` to confirm the peer kernel is known.")
+	fmt.Println()
+	fmt.Println("  - Multi-hop routes enable data forwarding through intermediate kernels.")
+	fmt.Println("    Use `routes` to see configured routes, `route-info <name>` for details.")
+	fmt.Println("    Use `-route <route_name>` with `connect-kernel` to specify the route.")
 	fmt.Println()
 	fmt.Println("  help, h                       - Show this help message")
 	fmt.Println("  exit, quit, q                 - Exit the kernel")
@@ -651,16 +697,86 @@ func handleConnectKernel(multiKernelManager *server.MultiKernelManager, args []s
 		return
 	}
 
-	if len(args) != 3 {
-		fmt.Println("Usage: connect-kernel <kernel_id> <address> <port>")
+	var kernelID, address string
+	var port int
+	var routeName string
+
+	// 检查是否只使用路由参数（--route 或 -r）
+	if len(args) == 2 && (args[0] == "--route" || args[0] == "-r") {
+		routeName = args[1]
+	} else if len(args) == 3 {
+		// 直接连接模式
+		kernelID = args[0]
+		address = args[1]
+		var err error
+		port, err = strconv.Atoi(args[2])
+		if err != nil {
+			fmt.Printf("Invalid port: %s\n", args[2])
+			return
+		}
+	} else if len(args) == 4 && (args[1] == "--route" || args[1] == "-r") {
+		// 指定了目标内核和路由
+		kernelID = args[0]
+		address = args[2]
+		var err error
+		port, err = strconv.Atoi(args[3])
+		if err != nil {
+			fmt.Printf("Invalid port: %s\n", args[3])
+			return
+		}
+		routeName = args[3] // 这里会覆盖，需要重新处理
+	} else if len(args) == 5 && (args[3] == "--route" || args[3] == "-r") {
+		// 完整格式：<kernel_id> <address> <port> -route <route_name>
+		kernelID = args[0]
+		address = args[1]
+		var err error
+		port, err = strconv.Atoi(args[2])
+		if err != nil {
+			fmt.Printf("Invalid port: %s\n", args[2])
+			return
+		}
+		routeName = args[4]
+	} else {
+		fmt.Println("Usage:")
+		fmt.Println("  connect-kernel <kernel_id> <address> <port>              - Direct connection")
+		fmt.Println("  connect-kernel --route <route_name>                      - Connect via multi-hop route")
+		fmt.Println("  connect-kernel <kernel_id> <address> <port> --route <route_name> - Connect to specific target via route")
 		return
 	}
 
-	kernelID := args[0]
-	address := args[1]
-	port, err := strconv.Atoi(args[2])
-	if err != nil {
-		fmt.Printf("Invalid port: %s\n", args[2])
+	if routeName != "" {
+		fmt.Printf("Connecting via multi-hop route: %s\n", routeName)
+		if err := multiKernelManager.ConnectToKernelViaRoute(routeName); err != nil {
+			// 检查是否是待审批错误，格式: "multi-hop pending: ..."
+			if strings.Contains(err.Error(), "multi-hop pending:") {
+				errMsg := err.Error()
+				fmt.Printf("\n⚠️  Multi-hop connection requires approval(s):\n\n")
+				fmt.Printf("  %s\n\n", errMsg)
+				fmt.Printf("Required actions:\n")
+				fmt.Printf("1. Go to each target kernel and run: approve-request <request_id>\n")
+				fmt.Printf("2. After all approvals, re-run: connect-kernel --route %s\n\n", routeName)
+				return
+			}
+			// 检查是否是待审批错误，格式: "hop X/Y pending: ..."
+			if strings.Contains(err.Error(), "hop ") && strings.Contains(err.Error(), "pending") {
+				errMsg := err.Error()
+				fmt.Printf("\n⚠️  Multi-hop connection requires approval(s):\n\n")
+				fmt.Printf("  %s\n\n", errMsg)
+				fmt.Printf("Required actions:\n")
+				fmt.Printf("1. Go to the intermediate/target kernel(s) and approve the request(s)\n")
+				fmt.Printf("2. Re-run: connect-kernel --route %s\n\n", routeName)
+				return
+			}
+			// 特殊处理 interconnect pending 错误
+			if strings.HasPrefix(err.Error(), "interconnect_pending:") {
+				requestID := strings.TrimPrefix(err.Error(), "interconnect_pending:")
+				fmt.Printf("Interconnect request sent (request id: %s). Waiting for approval on the target kernel.\n", requestID)
+				return
+			}
+			fmt.Printf("Failed to connect: %v\n", err)
+			return
+		}
+		fmt.Printf("Successfully connected via route: %s\n", routeName)
 		return
 	}
 
@@ -764,3 +880,239 @@ func loadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
+// handleListRoutes 处理列出所有多跳路由命令
+func handleListRoutes(configManager *server.MultiHopConfigManager, multiKernelManager *server.MultiKernelManager) {
+	if configManager == nil {
+		fmt.Println("Multi-hop config manager not initialized")
+		return
+	}
+
+	configs := configManager.ListConfigs()
+	if len(configs) == 0 {
+		fmt.Println("No multi-hop routes configured")
+		return
+	}
+
+	fmt.Println("=== Multi-Hop Routes ===")
+	fmt.Println(strings.Repeat("-", 100))
+	fmt.Printf("%-45s %-20s %-10s %-10s\n", "Route Name", "Hops", "Enabled", "Status")
+	fmt.Println(strings.Repeat("-", 100))
+
+	for _, config := range configs {
+		// 检查连接状态
+		connectedHops := 0
+
+		// 获取已连接的内核列表
+		knownKernels := multiKernelManager.ListKnownKernels()
+		connectedKernelIDs := make(map[string]bool)
+		for _, k := range knownKernels {
+			connectedKernelIDs[k.KernelID] = true
+		}
+
+		for _, hop := range config.Hops {
+			if connectedKernelIDs[hop.ToKernel] {
+				connectedHops++
+			}
+		}
+
+		status := "inactive"
+		if connectedHops == len(config.Hops) && len(config.Hops) > 0 {
+			status = "active"
+		} else if connectedHops > 0 {
+			status = "partial"
+		}
+
+		enabledStr := "false"
+		if config.Enabled {
+			enabledStr = "true"
+		}
+
+		fmt.Printf("%-45s %-20d %-10s %-10s\n",
+			config.RouteName,
+			len(config.Hops),
+			enabledStr,
+			status)
+	}
+	fmt.Println()
+}
+
+// handleLoadRoute 处理加载多跳路由配置命令
+func handleLoadRoute(configManager *server.MultiHopConfigManager, args []string) {
+	if configManager == nil {
+		fmt.Println("Multi-hop config manager not initialized")
+		return
+	}
+
+	if len(args) != 1 {
+		fmt.Println("Usage: load-route <filename>")
+		return
+	}
+
+	filename := args[0]
+	fmt.Printf("Loading multi-hop route from %s...\n", filename)
+
+	// 读取并解析配置文件
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		fmt.Printf("Failed to read file: %v\n", err)
+		return
+	}
+
+	var config server.MultiHopConfigFile
+	if err := json.Unmarshal(data, &config); err != nil {
+		fmt.Printf("Failed to parse config: %v\n", err)
+		return
+	}
+
+	// 验证配置
+	if err := configManager.ValidateConfig(&config); err != nil {
+		fmt.Printf("Invalid config: %v\n", err)
+		return
+	}
+
+	// 保存配置
+	if err := configManager.SaveConfig(&config); err != nil {
+		fmt.Printf("Failed to save config: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✓ Multi-hop route '%s' loaded successfully\n", config.RouteName)
+	fmt.Printf("  Name: %s\n", config.Name)
+	fmt.Printf("  Description: %s\n", config.Description)
+	fmt.Printf("  Hops: %d\n", len(config.Hops))
+
+	for i, hop := range config.Hops {
+		fmt.Printf("    Hop %d: %s -> %s (%s:%d)\n",
+			i+1, hop.FromKernel, hop.ToKernel, hop.ToAddress, hop.ToPort)
+	}
+}
+
+// handleConnectRoute 处理连接指定多跳路由命令
+func handleConnectRoute(multiKernelManager *server.MultiKernelManager, configManager *server.MultiHopConfigManager, args []string) {
+	if configManager == nil {
+		fmt.Println("Multi-hop config manager not initialized")
+		return
+	}
+
+	if len(args) != 1 {
+		fmt.Println("Usage: connect-route <route_name>")
+		return
+	}
+
+	routeName := args[0]
+	fmt.Printf("Connecting multi-hop route: %s\n", routeName)
+
+	// 加载配置
+	config, err := configManager.LoadConfig(routeName)
+	if err != nil {
+		fmt.Printf("Failed to load route: %v\n", err)
+		return
+	}
+
+	// 验证配置
+	if err := multiKernelManager.ValidateMultiHopConfig(config); err != nil {
+		fmt.Printf("Route validation failed: %v\n", err)
+		return
+	}
+
+	// 建立连接
+	if err := multiKernelManager.ConnectMultiHopRoute(config); err != nil {
+		fmt.Printf("Failed to connect route: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✓ Multi-hop route '%s' connected successfully\n", routeName)
+}
+
+// handleEnableRoute 处理启用多跳路由命令
+func handleEnableRoute(configManager *server.MultiHopConfigManager, args []string) {
+	if configManager == nil {
+		fmt.Println("Multi-hop config manager not initialized")
+		return
+	}
+
+	if len(args) != 1 {
+		fmt.Println("Usage: enable-route <route_name>")
+		return
+	}
+
+	routeName := args[0]
+	config, err := configManager.LoadConfig(routeName)
+	if err != nil {
+		fmt.Printf("Failed to load route: %v\n", err)
+		return
+	}
+
+	config.Enabled = true
+	if err := configManager.SaveConfig(config); err != nil {
+		fmt.Printf("Failed to save config: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✓ Route '%s' enabled\n", routeName)
+}
+
+// handleDisableRoute 处理禁用多跳路由命令
+func handleDisableRoute(configManager *server.MultiHopConfigManager, args []string) {
+	if configManager == nil {
+		fmt.Println("Multi-hop config manager not initialized")
+		return
+	}
+
+	if len(args) != 1 {
+		fmt.Println("Usage: disable-route <route_name>")
+		return
+	}
+
+	routeName := args[0]
+	config, err := configManager.LoadConfig(routeName)
+	if err != nil {
+		fmt.Printf("Failed to load route: %v\n", err)
+		return
+	}
+
+	config.Enabled = false
+	if err := configManager.SaveConfig(config); err != nil {
+		fmt.Printf("Failed to save config: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✓ Route '%s' disabled\n", routeName)
+}
+
+// handleRouteInfo 处理显示路由详细信息命令
+func handleRouteInfo(multiKernelManager *server.MultiKernelManager, configManager *server.MultiHopConfigManager, args []string) {
+	if configManager == nil {
+		fmt.Println("Multi-hop config manager not initialized")
+		return
+	}
+
+	if len(args) != 1 {
+		fmt.Println("Usage: route-info <route_name>")
+		return
+	}
+
+	routeName := args[0]
+	config, err := configManager.LoadConfig(routeName)
+	if err != nil {
+		fmt.Printf("Failed to load route: %v\n", err)
+		return
+	}
+
+	// 显示路由详细信息
+	info := multiKernelManager.GetMultiHopRouteInfo(config)
+	fmt.Println("=== Route Information ===")
+	fmt.Print(info)
+	fmt.Println()
+
+	// 显示当前内核连接状态
+	fmt.Println("=== Current Kernel Connections ===")
+	knownKernels := multiKernelManager.ListKnownKernels()
+	if len(knownKernels) == 0 {
+		fmt.Println("No connected kernels")
+	} else {
+		for _, k := range knownKernels {
+			fmt.Printf("  %s: %s:%d (%s)\n", k.KernelID, k.Address, k.Port, k.Status)
+		}
+	}
+}

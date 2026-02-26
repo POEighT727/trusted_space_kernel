@@ -1375,7 +1375,12 @@ func (c *Connector) ApprovePermissionChange(channelID, requestID string) (*pb.Ap
 		return nil, fmt.Errorf("failed to approve permission change: %w", err)
 	}
 
-	log.Printf("✓ Permission change approved: %s", requestID)
+	// 只有在服务器返回成功时才打印成功日志
+	if resp.Success {
+		log.Printf("✓ Permission change approved: %s", requestID)
+	} else {
+		log.Printf("✗ Permission change approval failed: %s", resp.Message)
+	}
 	return resp, nil
 }
 

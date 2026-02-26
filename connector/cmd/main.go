@@ -1210,22 +1210,30 @@ func handleApprovePermission(connector *client.Connector, args []string) {
 
 	fmt.Printf("正在批准请求: %s...\n", requestID)
 
-	// 首先尝试批准订阅申请（如果适用）
-	resp, err := connector.ApproveChannelSubscription(channelID, requestID)
-	if err == nil && resp.Success {
-		fmt.Printf("✓ 订阅申请已批准: %s\n", requestID)
-		fmt.Println("  申请者现在可以订阅该频道")
-		return
-	}
-
-	// 如果订阅申请批准失败，尝试批准权限变更
+	// 首先尝试批准权限变更（这是主要的处理方式）
 	resp2, err2 := connector.ApprovePermissionChange(channelID, requestID)
 	if err2 != nil {
+		// 如果权限变更批准失败，尝试批准订阅申请（作为备用方案）
+		resp, err := connector.ApproveChannelSubscription(channelID, requestID)
+		if err == nil && resp.Success {
+			fmt.Printf("✓ 订阅申请已批准: %s\n", requestID)
+			fmt.Println("  申请者现在可以订阅该频道")
+			return
+		}
+		// 两个都失败了，显示权限变更的错误
 		fmt.Printf("❌ 批准失败: %v\n", err2)
 		return
 	}
 
 	if !resp2.Success {
+		// 权限变更批准失败，尝试订阅申请
+		resp, err := connector.ApproveChannelSubscription(channelID, requestID)
+		if err == nil && resp.Success {
+			fmt.Printf("✓ 订阅申请已批准: %s\n", requestID)
+			fmt.Println("  申请者现在可以订阅该频道")
+			return
+		}
+		// 两个都失败了，显示权限变更的错误消息
 		fmt.Printf("❌ 批准失败: %s\n", resp2.Message)
 		return
 	}

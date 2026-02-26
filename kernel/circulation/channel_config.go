@@ -15,19 +15,19 @@ import (
 
 // ChannelConfigFile 频道配置文件结构
 type ChannelConfigFile struct {
-	ChannelName     string          `json:"channel_name"`
-	Name            string          `json:"name"`
-	Description     string          `json:"description"`
-	CreatorID       string          `json:"creator_id"`
-	ApproverID      string          `json:"approver_id"`
-	SenderIDs       []string        `json:"sender_ids"`
-	ReceiverIDs     []string        `json:"receiver_ids"`
-	DataTopic       string          `json:"data_topic"`
-	Encrypted       bool            `json:"encrypted"`
-	EvidenceConfig  *EvidenceConfig `json:"evidence_config"`
-	CreatedAt       *time.Time      `json:"created_at,omitempty"`
-	UpdatedAt       *time.Time      `json:"updated_at,omitempty"`
-	Version         int             `json:"version"`
+	ChannelName    string          `json:"channel_name"`
+	Name           string          `json:"name"`
+	Description    string          `json:"description"`
+	CreatorID      string          `json:"creator_id"`
+	ApproverID     string          `json:"approver_id"`
+	SenderIDs      []string        `json:"sender_ids"`
+	ReceiverIDs    []string        `json:"receiver_ids"`
+	DataTopic      string          `json:"data_topic"`
+	Encrypted      bool            `json:"encrypted"`
+	EvidenceConfig *EvidenceConfig `json:"evidence_config"`
+	CreatedAt      *time.Time      `json:"created_at,omitempty"`
+	UpdatedAt      *time.Time      `json:"updated_at,omitempty"`
+	Version        int             `json:"version"`
 }
 
 // ChannelConfigManager 频道配置管理器

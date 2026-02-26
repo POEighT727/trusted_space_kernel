@@ -695,6 +695,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 		Timestamp:      req.DataPacket.Timestamp,
 		SenderID:       req.DataPacket.SenderId,
 		TargetIDs:      req.DataPacket.TargetIds,
+		MessageType:    circulation.MessageType(req.DataPacket.MessageType),
 	}
 	err = channel.PushData(dataPacket)
 	if err != nil {

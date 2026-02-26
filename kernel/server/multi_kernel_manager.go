@@ -56,6 +56,9 @@ type MultiKernelManager struct {
 	registry       *control.Registry
 	channelManager *circulation.ChannelManager
 
+	// multiHopConfigManager 多跳路由配置管理器（由外部注入）
+	multiHopConfigManager *MultiHopConfigManager
+
 	kernels   map[string]*KernelInfo
 	kernelsMu sync.RWMutex
 	pendingRequests   map[string]*PendingInterconnectRequest
@@ -85,6 +88,11 @@ func NewMultiKernelManager(config *KernelConfig, registry *control.Registry,
 // SetNotificationManager 注入 NotificationManager（由 main 初始化后设置）
 func (m *MultiKernelManager) SetNotificationManager(nm *NotificationManager) {
 	m.notificationManager = nm
+}
+
+// SetMultiHopConfigManager 设置多跳路由配置管理器
+func (m *MultiKernelManager) SetMultiHopConfigManager(mhcm *MultiHopConfigManager) {
+	m.multiHopConfigManager = mhcm
 }
 
 // PendingInterconnectRequest 表示一个待审批的内核互联请求
@@ -561,13 +569,44 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 
 // ConnectToKernel 连接到另一个内核
 // port 参数应该是目标内核的内核通信端口 (kernel_port)
-func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int) error {
+func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int, routeName ...string) error {
 	m.kernelsMu.Lock()
 	defer m.kernelsMu.Unlock()
 
 	// 检查是否已经连接
 	if _, exists := m.kernels[kernelID]; exists {
 		return fmt.Errorf("already connected to kernel %s", kernelID)
+	}
+
+	// 如果指定了路由名称，先建立多跳路由
+	if len(routeName) > 0 && routeName[0] != "" {
+		// 检查是否配置了多跳配置管理器
+		if m.multiHopConfigManager == nil {
+			return fmt.Errorf("multi-hop config manager not initialized, cannot use route")
+		}
+
+		routeCfg, err := m.multiHopConfigManager.LoadConfig(routeName[0])
+		if err != nil {
+			return fmt.Errorf("failed to load route config: %w", err)
+		}
+
+		// 验证路由是否包含目标内核
+		hopFound := false
+		for _, hop := range routeCfg.Hops {
+			if hop.ToKernel == kernelID {
+				hopFound = true
+				break
+			}
+		}
+		if !hopFound {
+			return fmt.Errorf("route %s does not include target kernel %s", routeName[0], kernelID)
+		}
+
+		// 连接多跳路由
+		if err := m.ConnectMultiHopRoute(routeCfg); err != nil {
+			return fmt.Errorf("failed to connect multi-hop route: %w", err)
+		}
+		log.Printf("✓ Connected using multi-hop route: %s", routeName[0])
 	}
 
 	// 创建TLS配置
@@ -710,6 +749,41 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int)
 	go m.kernelHeartbeat(kernelID)
 
 	log.Printf("✅ Connected to kernel %s at %s:%d", kernelID, address, port)
+	return nil
+}
+
+// ConnectToKernelViaRoute 通过多跳路由连接到目标内核
+// 只提供路由名称，目标内核信息从路由配置中获取
+func (m *MultiKernelManager) ConnectToKernelViaRoute(routeName string) error {
+	if m.multiHopConfigManager == nil {
+		return fmt.Errorf("multi-hop config manager not initialized")
+	}
+
+	// 加载路由配置
+	routeCfg, err := m.multiHopConfigManager.LoadConfig(routeName)
+	if err != nil {
+		return fmt.Errorf("failed to load route config: %w", err)
+	}
+
+	if len(routeCfg.Hops) == 0 {
+		return fmt.Errorf("route %s has no hops", routeName)
+	}
+
+	// 获取最后一跳的信息（目标内核）
+	lastHop := routeCfg.Hops[len(routeCfg.Hops)-1]
+	targetKernelID := lastHop.ToKernel
+	targetAddress := lastHop.ToAddress
+	targetPort := lastHop.ToPort
+
+	log.Printf("=== Connecting via route: %s ===", routeName)
+	log.Printf("Target kernel: %s (%s:%d)", targetKernelID, targetAddress, targetPort)
+
+	// 调用 ConnectMultiHopRoute 建立多跳连接
+	if err := m.ConnectMultiHopRoute(routeCfg); err != nil {
+		return fmt.Errorf("failed to connect multi-hop route: %w", err)
+	}
+
+	log.Printf("✅ Successfully connected to %s via route %s", targetKernelID, routeName)
 	return nil
 }
 
@@ -1484,4 +1558,189 @@ func (m *MultiKernelManager) Shutdown() {
 	}
 
 	m.kernels = make(map[string]*KernelInfo)
+}
+
+// ConnectMultiHopRoute 根据多跳链路配置建立连接
+// 该方法会按照配置中的每一跳依次建立连接
+func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) error {
+	if config == nil {
+		return fmt.Errorf("config cannot be nil")
+	}
+
+	if len(config.Hops) == 0 {
+		return fmt.Errorf("no hops in configuration")
+	}
+
+	log.Printf("=== Establishing multi-hop route: %s ===", config.RouteName)
+	log.Printf("Route: %s", config.Description)
+
+	// 存储所有待审批的请求
+	type pendingRequest struct {
+		hopNum    int
+		kernelID  string
+		requestID string
+	}
+	var pendingRequests []pendingRequest
+
+	// 依次建立每一跳的连接
+	for i, hop := range config.Hops {
+		hopNum := i + 1
+		log.Printf("--- Hop %d: %s -> %s (%s:%d) ---",
+			hopNum, hop.FromKernel, hop.ToKernel, hop.ToAddress, hop.ToPort)
+
+		// 检查是否需要连接（仅当未连接时）
+		m.kernelsMu.RLock()
+		existingKernel, alreadyConnected := m.kernels[hop.ToKernel]
+		m.kernelsMu.RUnlock()
+
+		if alreadyConnected && existingKernel.conn != nil && existingKernel.Client != nil {
+			log.Printf("  ✓ Already connected to %s, skipping", hop.ToKernel)
+			continue
+		}
+
+		// 尝试连接到目标内核
+		// 注意：这里使用 interconnectRequest=true，因为需要对方审批才能建立连接
+		if err := m.connectToKernelInternal(hop.ToKernel, hop.ToAddress, hop.ToPort, true); err != nil {
+			// 检查是否是"已连接"错误
+			if strings.Contains(err.Error(), "already connected") {
+				log.Printf("  ✓ Kernel %s already connected", hop.ToKernel)
+				continue
+			}
+
+			// 检查是否是待审批错误
+			if strings.HasPrefix(err.Error(), "interconnect_pending:") {
+				requestID := strings.TrimPrefix(err.Error(), "interconnect_pending:")
+				log.Printf("  ⚠ Interconnect pending for %s (request ID: %s)", hop.ToKernel, requestID)
+
+				// 收集待审批请求，不立即返回
+				pendingRequests = append(pendingRequests, pendingRequest{
+					hopNum:    hopNum,
+					kernelID:  hop.ToKernel,
+					requestID: requestID,
+				})
+				continue
+			}
+
+			log.Printf("  ✗ Failed to connect to %s: %v", hop.ToKernel, err)
+			return fmt.Errorf("hop %d: failed to connect to %s: %w", hopNum, hop.ToKernel, err)
+		}
+
+		log.Printf("  ✓ Successfully connected to %s", hop.ToKernel)
+	}
+
+	// 如果有待审批请求，返回所有待审批信息
+	if len(pendingRequests) > 0 {
+		// 构建详细的待审批信息
+		msg := "All pending approval requests:\n"
+		for _, pr := range pendingRequests {
+			msg += fmt.Sprintf("  - Hop %d -> %s: %s\n", pr.hopNum, pr.kernelID, pr.requestID)
+		}
+		msg += "\nPlease approve on each target kernel:\n"
+		for _, pr := range pendingRequests {
+			msg += fmt.Sprintf("  Kernel %s: approve-request %s\n", pr.kernelID, pr.requestID)
+		}
+		return fmt.Errorf("multi-hop pending: %d request(s) need approval", len(pendingRequests))
+	}
+
+	log.Printf("=== Multi-hop route %s established ===", config.RouteName)
+	return nil
+}
+
+// ConnectAllEnabledRoutes 连接所有已启用的多跳路由
+func (m *MultiKernelManager) ConnectAllEnabledRoutes(configManager *MultiHopConfigManager) error {
+	if configManager == nil {
+		return fmt.Errorf("config manager cannot be nil")
+	}
+
+	enabledConfigs := configManager.GetEnabledConfigs()
+
+	if len(enabledConfigs) == 0 {
+		log.Printf("No enabled multi-hop routes to connect")
+		return nil
+	}
+
+	log.Printf("=== Connecting %d enabled multi-hop routes ===", len(enabledConfigs))
+
+	successCount := 0
+	failedCount := 0
+
+	for _, config := range enabledConfigs {
+		log.Printf("Processing route: %s", config.RouteName)
+
+		if err := m.ConnectMultiHopRoute(config); err != nil {
+			log.Printf("✗ Failed to establish route %s: %v", config.RouteName, err)
+			failedCount++
+			continue
+		}
+
+		successCount++
+	}
+
+	log.Printf("=== Multi-hop route connection summary: %d succeeded, %d failed ===", successCount, failedCount)
+
+	if failedCount > 0 {
+		return fmt.Errorf("%d routes failed to establish", failedCount)
+	}
+
+	return nil
+}
+
+// GetMultiHopRouteInfo 获取多跳路由信息
+func (m *MultiKernelManager) GetMultiHopRouteInfo(config *MultiHopConfigFile) string {
+	if config == nil {
+		return "nil config"
+	}
+
+	info := fmt.Sprintf("Route: %s (%s)\n", config.RouteName, config.Name)
+	info += fmt.Sprintf("Description: %s\n", config.Description)
+	info += fmt.Sprintf("Hops: %d\n", len(config.Hops))
+	info += "Path:\n"
+
+	for i, hop := range config.Hops {
+		// 检查连接状态
+		m.kernelsMu.RLock()
+		kernelInfo, connected := m.kernels[hop.ToKernel]
+		m.kernelsMu.RUnlock()
+
+		status := "✗ Not connected"
+		if connected && kernelInfo != nil && kernelInfo.conn != nil && kernelInfo.Client != nil {
+			status = "✓ Connected"
+		}
+
+		info += fmt.Sprintf("  %d. %s -> %s [%s:%d] [%s]\n",
+			i+1, hop.FromKernel, hop.ToKernel, hop.ToAddress, hop.ToPort, status)
+	}
+
+	return info
+}
+
+// ValidateMultiHopConfig 验证多跳配置是否适用于当前内核
+func (m *MultiKernelManager) ValidateMultiHopConfig(config *MultiHopConfigFile) error {
+	if config == nil {
+		return fmt.Errorf("config cannot be nil")
+	}
+
+	if len(config.Hops) == 0 {
+		return fmt.Errorf("no hops in configuration")
+	}
+
+	// 验证第一跳的源是否是当前内核
+	firstHop := config.Hops[0]
+	if firstHop.FromKernel != m.config.KernelID {
+		return fmt.Errorf("first hop from_kernel (%s) does not match current kernel (%s)",
+			firstHop.FromKernel, m.config.KernelID)
+	}
+
+	// 验证每一跳的连续性
+	for i := 1; i < len(config.Hops); i++ {
+		prevHop := config.Hops[i-1]
+		currHop := config.Hops[i]
+
+		if prevHop.ToKernel != currHop.FromKernel {
+			return fmt.Errorf("hop %d: from_kernel (%s) does not match previous hop's to_kernel (%s)",
+				i+1, currHop.FromKernel, prevHop.ToKernel)
+		}
+	}
+
+	return nil
 }

@@ -1,0 +1,26 @@
+{
+  "route_name": "route-kernel-1-to-kernel-3-via-kernel-2",
+  "name": "从内核1到内核3的路由（经由内核2）",
+  "description": "通过内核2作为中继站，实现内核1到内核3的跨内核数据流通",
+  "creator_id": "kernel-1",
+  "hops": [
+    {
+      "hop_id": 1,
+      "from_kernel": "kernel-1",
+      "to_kernel": "kernel-2",
+      "to_address": "192.168.202.136",
+      "to_port": 50053,
+      "auto_connect": true
+    },
+    {
+      "hop_id": 2,
+      "from_kernel": "kernel-2",
+      "to_kernel": "kernel-3",
+      "to_address": "192.168.202.140",
+      "to_port": 50053,
+      "auto_connect": true
+    }
+  ],
+  "enabled": true,
+  "version": 1
+}

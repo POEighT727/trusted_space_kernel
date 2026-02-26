@@ -1937,8 +1937,8 @@ func (s *ChannelServiceServer) ApprovePermissionChange(ctx context.Context, req 
 		}, nil
 	}
 
-	// 记录审计日志
-	s.auditLog.SubmitEvidence(
+	// 异步记录审计日志，避免阻塞 gRPC 响应
+	go s.auditLog.SubmitEvidence(
 		req.ApproverId,
 		evidence.EventTypePermissionGranted,
 		req.ChannelId,
