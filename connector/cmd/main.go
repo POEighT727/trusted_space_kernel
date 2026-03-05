@@ -23,9 +23,10 @@ import (
 // Config 连接器配置
 type Config struct {
 	Connector struct {
-		ID         string `yaml:"id"`
-		EntityType string `yaml:"entity_type"`
-		PublicKey  string `yaml:"public_key"`
+		ID          string `yaml:"id"`
+		EntityType  string `yaml:"entity_type"`
+		PublicKey   string `yaml:"public_key"`
+		Exposed     bool   `yaml:"expose_to_others"` // 是否向其他内核公开自己的信息，默认为true
 	} `yaml:"connector"`
 
 	Kernel struct {
@@ -107,6 +108,16 @@ func main() {
 	// 创建连接器
 	serverAddr := fmt.Sprintf("%s:%d", config.Kernel.Address, config.Kernel.Port)
 
+	// 确定是否公开连接器信息，默认为 true（不传或传 nil 时为 true）
+	// 如果配置文件中显式设置为 false，则为 false
+	var exposed *bool
+	if !config.Connector.Exposed {
+		// 用户显式设置为 false
+		exposedVal := false
+		exposed = &exposedVal
+	}
+	// 如果 config.Connector.Exposed 为 true（或未设置默认值），则 exposed 保持为 nil，表示默认公开
+
 	connector, err := client.NewConnector(&client.Config{
 		ConnectorID:    config.Connector.ID,
 		EntityType:     config.Connector.EntityType,
@@ -125,6 +136,7 @@ func main() {
 			// fallback to environment variable if not set in config
 			return os.Getenv("KERNEL_ID")
 		}(),
+		Exposed: exposed,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create connector: %v", err)
@@ -487,14 +499,22 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 		return
 	}
 
-	// 解析为简化结构
+	// 解析为简化结构（包含 evidence_config）
 	var cfg struct {
-		SenderIDs   []string `json:"sender_ids"`
-		ReceiverIDs []string `json:"receiver_ids"`
-		DataTopic   string   `json:"data_topic"`
-		Encrypted   bool     `json:"encrypted"`
-		ChannelName string   `json:"channel_name"`
-		CreatorID   string   `json:"creator_id"`
+		SenderIDs      []string `json:"sender_ids"`
+		ReceiverIDs    []string `json:"receiver_ids"`
+		DataTopic       string   `json:"data_topic"`
+		Encrypted      bool      `json:"encrypted"`
+		ChannelName    string   `json:"channel_name"`
+		CreatorID      string   `json:"creator_id"`
+		EvidenceConfig *struct {
+			Mode           string `json:"mode"`
+			Strategy       string `json:"strategy"`
+			ConnectorID    string `json:"connector_id"`
+			BackupEnabled  bool   `json:"backup_enabled"`
+			RetentionDays  int    `json:"retention_days"`
+			CompressData   bool   `json:"compress_data"`
+		} `json:"evidence_config"`
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		// 尝试用 yaml 解析（兼容）
@@ -529,7 +549,21 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 	if containsRemote(cfg.SenderIDs) || containsRemote(cfg.ReceiverIDs) {
 		// 使用跨内核创建
 		fmt.Println("检测到跨内核参与者，使用跨内核协商路径创建频道...")
-		chID, err := connector.CreateCrossKernelChannel(cfg.SenderIDs, cfg.ReceiverIDs, cfg.DataTopic, cfg.Encrypted, fmt.Sprintf("Create from config: %s", configFile), nil)
+
+		// 转换 evidence_config 为 protobuf 格式
+		var evidenceConfig *pb.EvidenceConfig
+		if cfg.EvidenceConfig != nil {
+			evidenceConfig = &pb.EvidenceConfig{
+				Mode:          cfg.EvidenceConfig.Mode,
+				Strategy:      cfg.EvidenceConfig.Strategy,
+				ConnectorId:   cfg.EvidenceConfig.ConnectorID,
+				BackupEnabled: cfg.EvidenceConfig.BackupEnabled,
+				RetentionDays: int32(cfg.EvidenceConfig.RetentionDays),
+				CompressData:  cfg.EvidenceConfig.CompressData,
+			}
+		}
+
+		chID, err := connector.CreateCrossKernelChannel(cfg.SenderIDs, cfg.ReceiverIDs, cfg.DataTopic, cfg.Encrypted, fmt.Sprintf("Create from config: %s", configFile), evidenceConfig)
 		if err != nil {
 			fmt.Printf("❌ 跨内核频道创建失败: %v\n", err)
 			return

@@ -81,8 +81,15 @@ func (s *IdentityServiceServer) Handshake(ctx context.Context, req *pb.Handshake
 	// 生成会话令牌
 	sessionToken := uuid.New().String()
 
-	// 注册连接器
-	if err := s.registry.Register(req.ConnectorId, req.EntityType, req.PublicKey, sessionToken); err != nil {
+	// 确定连接器是否公开信息（默认为true）
+	// Exposed 是指针类型，nil 表示未设置，默认为 true
+	exposed := true
+	if req.Exposed != nil {
+		exposed = *req.Exposed
+	}
+
+	// 注册连接器（传递公开状态）
+	if err := s.registry.Register(req.ConnectorId, req.EntityType, req.PublicKey, sessionToken, exposed); err != nil {
 		return &pb.HandshakeResponse{
 			Success: false,
 			Message: fmt.Sprintf("registration failed: %v", err),
@@ -222,29 +229,54 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 			}, fmt.Errorf("requester authentication failed: %w", err)
 		}
 		// 如果存在已连接的内核，汇总本地 + 远端连接器供连接器查看
+		// 注意：本地连接器可以看到本内核的所有连接器（无论是否公开）
+		// 只有跨内核的连接器才需要过滤（只返回公开的）
 		if s.multiKernelManager != nil && s.multiKernelManager.GetConnectedKernelCount() > 0 {
-			connectors, err := s.multiKernelManager.CollectAllConnectors()
+			// 先添加本地所有连接器（无论是否公开）
+			localConnectors := s.registry.ListConnectors()
+			allConnectors := make([]*pb.ConnectorInfo, 0)
+			
+			// 添加本地连接器（全部添加，无论是否公开）
+			for _, conn := range localConnectors {
+				// 过滤掉请求者自身
+				if conn.ConnectorID == req.RequesterId {
+					continue
+				}
+				// 类型过滤
+				if req.FilterType == "" || conn.EntityType == req.FilterType {
+					allConnectors = append(allConnectors, &pb.ConnectorInfo{
+						ConnectorId:   conn.ConnectorID,
+						EntityType:    conn.EntityType,
+						PublicKey:     conn.PublicKey,
+						Status:        string(conn.Status),
+						LastHeartbeat: conn.LastHeartbeat.Unix(),
+						RegisteredAt:  conn.RegisteredAt.Unix(),
+						KernelId:      s.multiKernelManager.config.KernelID,
+					})
+				}
+			}
+			
+			// 再添加远端连接器（只添加公开的）
+			remoteConnectors, err := s.multiKernelManager.CollectAllConnectors()
 			if err != nil {
-				log.Printf("Failed to collect connectors for Discover: %v", err)
-				// 回退到仅本地列表（继续执行后续本地分支）
+				log.Printf("Failed to collect remote connectors for Discover: %v", err)
 			} else {
-				// 过滤掉请求者自身（本地注册的同名连接器）
-				final := make([]*pb.ConnectorInfo, 0, len(connectors))
-				for _, c := range connectors {
+				for _, c := range remoteConnectors {
+					// 过滤掉请求者自身
 					if c.ConnectorId == req.RequesterId && c.KernelId == s.multiKernelManager.config.KernelID {
 						continue
 					}
 					// 类型过滤
 					if req.FilterType == "" || c.EntityType == req.FilterType {
-						final = append(final, c)
+						allConnectors = append(allConnectors, c)
 					}
 				}
-
-				return &pb.DiscoverResponse{
-					Connectors: final,
-					TotalCount: int32(len(final)),
-				}, nil
 			}
+
+			return &pb.DiscoverResponse{
+				Connectors: allConnectors,
+				TotalCount: int32(len(allConnectors)),
+			}, nil
 		}
 	} else {
 		// 内核间请求：验证内核身份（TODO: 实现内核身份验证）
@@ -253,8 +285,9 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 	}
 
 	// 对于内核间请求，仅返回本地注册表中的连接器（避免递归调用到其他内核）
+	// 只返回公开的连接器 (Exposed=true)
 	if isKernelRequest {
-		allConnectors := s.registry.ListConnectors()
+		allConnectors := s.registry.ListExposedConnectors() // 只返回公开的连接器
 		pbConnectors := make([]*pb.ConnectorInfo, 0, len(allConnectors))
 		for _, info := range allConnectors {
 			pbConnectors = append(pbConnectors, &pb.ConnectorInfo{
@@ -283,8 +316,8 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 		}, nil
 	}
 
-	// 普通连接器请求：返回本地注册表中的连接器
-	allConnectors := s.registry.ListConnectors()
+	// 普通连接器请求：返回本地注册表中的连接器（只返回公开的）
+	allConnectors := s.registry.ListExposedConnectors() // 只返回公开的连接器
 	// 过滤掉请求者自己
 	filtered := make([]*control.ConnectorInfo, 0)
 	for _, info := range allConnectors {

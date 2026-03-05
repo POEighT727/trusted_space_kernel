@@ -300,7 +300,6 @@ func main() {
 			Timestamp:      packet.Timestamp,
 			SenderId:       packet.SenderID,
 			TargetIds:      packet.TargetIDs,
-			MessageType:    string(packet.MessageType),
 		}
 		return multiKernelManager.ForwardData(kernelID, pbPacket)
 	})
@@ -580,19 +579,20 @@ func handleKernelStatus(config *Config, channelManager *circulation.ChannelManag
 // handleKernelConnectors 处理连接器列表命令
 func handleKernelConnectors(registry *control.Registry, multiKernelManager *server.MultiKernelManager) {
 	var connectors []*pb.ConnectorInfo
-	var err error
 
-	// 如果有连接的其他内核，收集所有连接器的信息
-	if multiKernelManager != nil && multiKernelManager.GetConnectedKernelCount() > 0 {
-		connectors, err = multiKernelManager.CollectAllConnectors()
-		if err != nil {
-			fmt.Printf("Failed to collect connectors: %v\n", err)
-			return
-		}
-	} else {
-		// 只有本地连接器
+	// 获取本内核ID
+	localKernelID := ""
+	if multiKernelManager != nil {
+		localKernelID = multiKernelManager.GetKernelID()
+	}
+
+	// 记录本地连接器ID，用于去重
+	localConnectorIDs := make(map[string]bool)
+
+	// 始终显示本地所有连接器（无论是否公开）
 		localConnectors := registry.ListConnectors()
 		for _, conn := range localConnectors {
+		localConnectorIDs[conn.ConnectorID] = true
 			connectors = append(connectors, &pb.ConnectorInfo{
 				ConnectorId:   conn.ConnectorID,
 				EntityType:    conn.EntityType,
@@ -600,8 +600,28 @@ func handleKernelConnectors(registry *control.Registry, multiKernelManager *serv
 				Status:        string(conn.Status),
 				LastHeartbeat: conn.LastHeartbeat.Unix(),
 				RegisteredAt:  conn.RegisteredAt.Unix(),
-				KernelId:      "", // 本地连接器
-			})
+			KernelId:      "local",
+		})
+	}
+
+	// 如果有连接的其他内核，再添加远端公开的连接器（过滤掉本内核的）
+	if multiKernelManager != nil && multiKernelManager.GetConnectedKernelCount() > 0 {
+		remoteConnectors, err := multiKernelManager.CollectAllConnectors()
+		if err != nil {
+			fmt.Printf("Failed to collect remote connectors: %v\n", err)
+		} else {
+			// 过滤掉本内核的连接器和已经显示的本地连接器
+			for _, rc := range remoteConnectors {
+				// 跳过本内核的连接器
+				if rc.KernelId == localKernelID {
+					continue
+				}
+				// 跳过已经在本地显示的连接器（防止重复）
+				if localConnectorIDs[rc.ConnectorId] {
+					continue
+				}
+				connectors = append(connectors, rc)
+			}
 		}
 	}
 

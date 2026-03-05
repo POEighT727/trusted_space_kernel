@@ -35,6 +35,7 @@ message HandshakeRequest {
   string entity_type = 2;       // 实体类型 (例如: 数据源, 算法节点)
   string public_key = 3;        // 用于应用层加密的公钥
   int64 timestamp = 4;
+  optional bool exposed = 5;    // 是否向其他内核公开自己的信息，默认为true（不设置时为true）
 }
 
 message HandshakeResponse {

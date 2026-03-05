@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -394,7 +395,7 @@ func (s *KernelServiceServer) SyncKnownKernels(ctx context.Context, req *pb.Sync
 func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req *pb.CreateCrossKernelChannelRequest) (*pb.CreateCrossKernelChannelResponse, error) {
 	// 实现跨内核频道创建（协商）：
 	// - 发起端在本内核创建频道提议（ProposeChannel）
-	// - 对于涉及到的远端内核，向它们发送同样的请求作为“提议通知”（远端会返回 accept/reject）
+	// - 对于涉及到的远端内核，向它们发送同样的请求作为"提议通知"（远端会返回 accept/reject）
 	// - 如果所有远端均接受，则在本内核对远端参与者标记批准（AcceptChannelProposal），激活频道
 
 	localKernelID := s.multiKernelManager.config.KernelID
@@ -407,6 +408,34 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 	// 如果这是远端内核转发过来的提议（CreatorKernelId != 本地），在本地创建一个提议记录并通知本地参与者
 	if req.CreatorKernelId != localKernelID {
 		log.Printf("Received cross-kernel proposal notification from kernel %s (creator connector %s)", req.CreatorKernelId, req.CreatorConnectorId)
+
+		// 验证参与者中的连接器是否存在于本地注册表
+		// 注意：这里只检查"裸"connectorID（没有指定KernelId或KernelId与本内核相同的）
+		// 因为远端指定本内核的连接器时，只会传connectorId而不会带KernelId
+		for _, p := range req.SenderIds {
+			// 如果没有指定KernelId或指定的是本内核，则检查本地是否存在
+			if p.KernelId == "" || p.KernelId == localKernelID {
+				if _, err := s.registry.GetConnector(p.ConnectorId); err != nil {
+					log.Printf("⚠ Sender connector %s not found locally (kernel %s)", p.ConnectorId, p.KernelId)
+					return &pb.CreateCrossKernelChannelResponse{
+						Success: false,
+						Message: fmt.Sprintf("sender connector %s not found locally: %v. Note: If this connector is not exposed to other kernels, please negotiate offline first.", p.ConnectorId, err),
+					}, nil
+				}
+			}
+		}
+		for _, p := range req.ReceiverIds {
+			// 如果没有指定KernelId或指定的是本内核，则检查本地是否存在
+			if p.KernelId == "" || p.KernelId == localKernelID {
+				if _, err := s.registry.GetConnector(p.ConnectorId); err != nil {
+					log.Printf("⚠ Receiver connector %s not found locally (kernel %s)", p.ConnectorId, p.KernelId)
+					return &pb.CreateCrossKernelChannelResponse{
+						Success: false,
+						Message: fmt.Sprintf("receiver connector %s not found locally: %v. Note: If this connector is not exposed to other kernels, please negotiate offline first.", p.ConnectorId, err),
+					}, nil
+				}
+			}
+		}
 
 		// 构建参与者列表：本地使用裸 connectorID，远端使用 kernel:connector 格式
 		senderIDs := make([]string, 0, len(req.SenderIds))
@@ -490,6 +519,29 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 			}
 		}
 
+		// 设置远端接收者映射（用于跨内核数据转发和接受确认）
+		// 注意：在远端发来通知的分支中，也需要设置这个映射，否则 AcceptChannelProposal 无法正确匹配 ID
+		for _, receiverID := range receiverIDs {
+			if strings.Contains(receiverID, ":") {
+				parts := strings.SplitN(receiverID, ":", 2)
+				kernelID := parts[0]
+				connectorID := parts[1]
+				channel.SetRemoteReceiver(connectorID, kernelID)
+			} else {
+				// 本地接收者也需要设置映射，指向本地内核
+				channel.SetRemoteReceiver(receiverID, localKernelID)
+			}
+		}
+		// 同样处理发送方（如果有远端发送方）
+		for _, senderID := range senderIDs {
+			if strings.Contains(senderID, ":") {
+				parts := strings.SplitN(senderID, ":", 2)
+				kernelID := parts[0]
+				connectorID := parts[1]
+				channel.SetRemoteReceiver(connectorID, kernelID)
+			}
+		}
+
 		return &pb.CreateCrossKernelChannelResponse{
 			Success: true,
 			Message: "proposal received and local notifications dispatched",
@@ -526,6 +578,31 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 		}
 	}
 
+	// 验证参与者中的本地连接器是否存在于本地注册表
+	// 注意：这里只检查没有指定KernelId或指定的是本内核的连接器
+	for _, p := range req.SenderIds {
+		if p.KernelId == "" || p.KernelId == localKernelID {
+			if _, err := s.registry.GetConnector(p.ConnectorId); err != nil {
+				log.Printf("⚠ Sender connector %s not found locally (kernel %s)", p.ConnectorId, p.KernelId)
+				return &pb.CreateCrossKernelChannelResponse{
+					Success: false,
+					Message: fmt.Sprintf("sender connector %s not found locally: %v. Note: If this connector is not exposed to other kernels, please negotiate offline first.", p.ConnectorId, err),
+				}, nil
+			}
+		}
+	}
+	for _, p := range req.ReceiverIds {
+		if p.KernelId == "" || p.KernelId == localKernelID {
+			if _, err := s.registry.GetConnector(p.ConnectorId); err != nil {
+				log.Printf("⚠ Receiver connector %s not found locally (kernel %s)", p.ConnectorId, p.KernelId)
+				return &pb.CreateCrossKernelChannelResponse{
+					Success: false,
+					Message: fmt.Sprintf("receiver connector %s not found locally: %v. Note: If this connector is not exposed to other kernels, please negotiate offline first.", p.ConnectorId, err),
+				}, nil
+			}
+		}
+	}
+
 	// 将 proto EvidenceConfig 转换为内部 circulation.EvidenceConfig（如果有）
 	var evConfig *circulation.EvidenceConfig
 	if req.EvidenceConfig != nil {
@@ -537,6 +614,23 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 			RetentionDays:  int(req.EvidenceConfig.RetentionDays),
 			CompressData:   req.EvidenceConfig.CompressData,
 			CustomSettings: req.EvidenceConfig.CustomSettings,
+		}
+	}
+
+	// 如果配置了外部存证连接器，将其添加到接收方列表
+	if evConfig != nil && evConfig.ConnectorID != "" {
+		externalEvidenceID := evConfig.ConnectorID
+		// 检查是否已存在
+		exists := false
+		for _, id := range receiverIDs {
+			if id == externalEvidenceID {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			log.Printf("Adding external evidence connector %s to receiver list", externalEvidenceID)
+			receiverIDs = append(receiverIDs, externalEvidenceID)
 		}
 	}
 
@@ -572,20 +666,6 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 		}
 	}
 
-	// 自动接受创建者和所有远端参与者（在发送通知之前）
-	log.Printf("✓ Auto-accepting creator and remote participants for channel %s", channel.ChannelID)
-	_ = s.channelManager.AcceptChannelProposal(channel.ChannelID, req.CreatorConnectorId)
-	for _, id := range senderIDs {
-		_ = s.channelManager.AcceptChannelProposal(channel.ChannelID, id)
-	}
-	for _, id := range receiverIDs {
-		_ = s.channelManager.AcceptChannelProposal(channel.ChannelID, id)
-	}
-
-	// 重新获取频道状态（确认已激活）
-	channel, _ = s.channelManager.GetChannel(channel.ChannelID)
-	log.Printf("✓ Channel %s status after auto-accept: %s", channel.ChannelID, channel.Status)
-
 	// 向所有远端内核发送提议通知
 	for rk := range remoteKernels {
 		// 查找已连接的内核信息
@@ -617,6 +697,29 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 		for _, p := range req.ReceiverIds {
 			if p.KernelId == rk && p.ConnectorId != "" {
 				targetConnectorIDs = append(targetConnectorIDs, p.ConnectorId)
+			}
+		}
+
+		// 检查外部存证连接器是否在该远端内核上
+		if evConfig != nil && evConfig.ConnectorID != "" {
+			if strings.Contains(evConfig.ConnectorID, ":") {
+				parts := strings.SplitN(evConfig.ConnectorID, ":", 2)
+				evidenceKernelID := parts[0]
+				evidenceConnectorID := parts[1]
+				if evidenceKernelID == rk {
+					// 检查是否已存在
+					exists := false
+					for _, id := range targetConnectorIDs {
+						if id == evidenceConnectorID {
+							exists = true
+							break
+						}
+					}
+					if !exists {
+						log.Printf("Adding external evidence connector %s to remote kernel notification", evConfig.ConnectorID)
+						targetConnectorIDs = append(targetConnectorIDs, evidenceConnectorID)
+					}
+				}
 			}
 		}
 
@@ -687,6 +790,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 	}
 
 	// 转发数据到频道
+	// 注意：需要根据 payload 内容判断消息类型（proto 没有 MessageType 字段）
 	dataPacket := &circulation.DataPacket{
 		ChannelID:      req.DataPacket.ChannelId,
 		SequenceNumber: req.DataPacket.SequenceNumber,
@@ -695,7 +799,14 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 		Timestamp:      req.DataPacket.Timestamp,
 		SenderID:       req.DataPacket.SenderId,
 		TargetIDs:      req.DataPacket.TargetIds,
-		MessageType:    circulation.MessageType(req.DataPacket.MessageType),
+	}
+
+	// 根据 payload 内容判断消息类型
+	var testMsg circulation.ControlMessage
+	if err := json.Unmarshal(req.DataPacket.Payload, &testMsg); err == nil {
+		if testMsg.MessageType == "channel_update" || testMsg.MessageType == "permission_request" {
+			dataPacket.MessageType = circulation.MessageTypeControl
+		}
 	}
 	err = channel.PushData(dataPacket)
 	if err != nil {
@@ -816,5 +927,94 @@ func (s *KernelServiceServer) SyncConnectorInfo(ctx context.Context, req *pb.Syn
 		Success:     true,
 		Message:     "connector info synced successfully",
 		SyncedCount: int32(syncedCount),
+	}, nil
+}
+
+// SyncPermissionRequest 同步权限请求到其他内核
+func (s *KernelServiceServer) SyncPermissionRequest(ctx context.Context, req *pb.SyncPermissionRequestRequest) (*pb.SyncPermissionRequestResponse, error) {
+	if req == nil || req.ChannelId == "" || req.Request == nil {
+		return &pb.SyncPermissionRequestResponse{
+			Success: false,
+			Message: "invalid request: channel_id and request are required",
+		}, nil
+	}
+
+	// 转换 proto 请求到内部结构
+	remoteReq := &RemotePermissionRequest{
+		RequestID:     req.Request.RequestId,
+		RequesterID:   req.Request.RequesterId,
+		ChannelID:     req.Request.ChannelId,
+		ChangeType:    req.Request.ChangeType,
+		TargetID:      req.Request.TargetId,
+		Reason:        req.Request.Reason,
+		Status:        req.Request.Status,
+		SourceKernelID: req.SourceKernelId,
+		CreatedAt:     time.Unix(req.Request.CreatedAt, 0),
+	}
+
+	// 添加到远程权限请求列表
+	s.multiKernelManager.AddRemotePermissionRequest(remoteReq)
+
+	// 同时存储到频道本地的权限请求列表，这样 connector 才能通过 list-permissions 看到
+	// 并使用 approve-permission 批准
+	channel, err := s.channelManager.GetChannel(req.ChannelId)
+	if err == nil && channel != nil {
+		// 构造 PermissionRequestMessage 用于存储
+		permReqMsg := &circulation.PermissionRequestMessage{
+			RequestID:  remoteReq.RequestID,
+			ChannelID:  remoteReq.ChannelID,
+			ChangeType: remoteReq.ChangeType,
+			TargetID:   remoteReq.TargetID,
+			Reason:     remoteReq.Reason,
+		}
+		// 从 SourceKernelID 提取 requesterID（格式：kernel-X:connector-Y）
+		requesterID := remoteReq.SourceKernelID
+		channel.StorePermissionRequestFromRemote(permReqMsg, requesterID)
+		log.Printf("✓ Stored permission request %s to channel %s local list", remoteReq.RequestID, remoteReq.ChannelID)
+	} else {
+		log.Printf("⚠️ Cannot get channel %s to store permission request: %v", remoteReq.ChannelID, err)
+	}
+
+	log.Printf("Synced permission request %s from kernel %s for channel %s", 
+		remoteReq.RequestID, req.SourceKernelId, remoteReq.ChannelID)
+
+	return &pb.SyncPermissionRequestResponse{
+		Success: true,
+		Message: "permission request synced successfully",
+	}, nil
+}
+
+// GetRemotePermissionRequests 获取其他内核同步过来的权限请求
+func (s *KernelServiceServer) GetRemotePermissionRequests(ctx context.Context, req *pb.GetRemotePermissionRequestsRequest) (*pb.GetRemotePermissionRequestsResponse, error) {
+	if req == nil || req.ChannelId == "" {
+		return &pb.GetRemotePermissionRequestsResponse{
+			Success:  false,
+			Message:  "invalid request: channel_id is required",
+			Requests: nil,
+		}, nil
+	}
+
+	// 获取远程权限请求
+	remoteReqs := s.multiKernelManager.GetRemotePermissionRequests(req.ChannelId)
+
+	// 转换为 proto 格式
+	pbReqs := make([]*pb.PermissionChangeRequest, 0, len(remoteReqs))
+	for _, r := range remoteReqs {
+		pbReqs = append(pbReqs, &pb.PermissionChangeRequest{
+			RequestId:   r.RequestID,
+			RequesterId: r.RequesterID,
+			ChannelId:   r.ChannelID,
+			ChangeType:  r.ChangeType,
+			TargetId:    r.TargetID,
+			Reason:      r.Reason,
+			Status:      r.Status,
+			CreatedAt:   r.CreatedAt.Unix(),
+		})
+	}
+
+	return &pb.GetRemotePermissionRequestsResponse{
+		Success:  true,
+		Requests: pbReqs,
+		Message:  "remote permission requests retrieved successfully",
 	}, nil
 }

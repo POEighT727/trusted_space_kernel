@@ -51,6 +51,7 @@ type Connector struct {
 	serverAddr   string
 	status       ConnectorStatus // 连接器状态，默认为active
 	kernelID     string // 可选：连接器所在内核ID（用于跨内核发现请求）
+	exposed      *bool  // 是否向其他内核公开自己的信息，默认为true（使用指针以支持可选字段）
 
 	conn         *grpc.ClientConn
 	identitySvc  pb.IdentityServiceClient
@@ -95,6 +96,8 @@ type Config struct {
 	EvidenceStoragePath  string // 本地存证存储路径
 	// 可选：当前连接器所属的内核ID（用于跨内核发现）
 	KernelID string
+	// 是否向其他内核公开自己的信息，默认为true（使用指针以支持可选字段）
+	Exposed *bool
 }
 
 // NewConnector 创建新的连接器
@@ -127,6 +130,7 @@ func NewConnector(config *Config) (*Connector, error) {
 		publicKey:   config.PublicKey,
 		serverAddr:  config.ServerAddr,
 		kernelID:    config.KernelID,
+		exposed:     config.Exposed, // 是否向其他内核公开自己的信息（传递指针）
 		status:      ConnectorStatusActive, // 默认状态为active
 		conn:        conn,
 		identitySvc: pb.NewIdentityServiceClient(conn),
@@ -154,6 +158,7 @@ func (c *Connector) Connect() error {
 		EntityType:  c.entityType,
 		PublicKey:   c.publicKey,
 		Timestamp:   time.Now().Unix(),
+		Exposed:     c.exposed, // 是否向其他内核公开自己的信息（已经是*bool类型）
 	})
 	if err != nil {
 		return fmt.Errorf("handshake failed: %w", err)

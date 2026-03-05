@@ -29,6 +29,7 @@ type ConnectorInfo struct {
 	LastHeartbeat time.Time
 	RegisteredAt  time.Time
 	SessionToken  string
+	Exposed       bool // 是否向其他内核公开自己的信息，true=公开，false=不公开
 }
 
 // Registry 身份注册表，维护连接器信息
@@ -45,7 +46,8 @@ func NewRegistry() *Registry {
 }
 
 // Register 注册连接器
-func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken string) error {
+// exposed: 是否向其他内核公开该连接器信息，默认为 true
+func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken string, exposed ...bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -54,6 +56,12 @@ func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken str
 	}
 
 	now := time.Now()
+
+	// 确定是否公开，默认为 true
+	isExposed := true
+	if len(exposed) > 0 {
+		isExposed = exposed[0]
+	}
 
 	// 检查是否已注册
 	if info, exists := r.connectors[connectorID]; exists {
@@ -68,6 +76,8 @@ func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken str
 		}
 		info.LastHeartbeat = now
 		info.SessionToken = sessionToken
+		// 更新公开状态
+		info.Exposed = isExposed
 		return nil
 	}
 
@@ -80,6 +90,7 @@ func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken str
 		LastHeartbeat: now,
 		RegisteredAt:  now,
 		SessionToken:  sessionToken,
+		Exposed:       isExposed,
 	}
 
 	return nil
@@ -210,6 +221,34 @@ func (r *Registry) IsActive(connectorID string) bool {
 	}
 
 	return info.Status == ConnectorStatusActive
+}
+
+// IsExposed 检查连接器是否向其他内核公开信息
+func (r *Registry) IsExposed(connectorID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	info, exists := r.connectors[connectorID]
+	if !exists {
+		return false // 未注册的连接器默认不公开
+	}
+
+	return info.Exposed
+}
+
+// ListExposedConnectors 列出所有公开的连接器
+func (r *Registry) ListExposedConnectors() []*ConnectorInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	list := make([]*ConnectorInfo, 0)
+	for _, info := range r.connectors {
+		if info.Exposed {
+			list = append(list, info)
+		}
+	}
+
+	return list
 }
 
 // StartHealthCheck 启动健康检查协程

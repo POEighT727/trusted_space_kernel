@@ -20,6 +20,19 @@ import (
 	"github.com/trusted-space/kernel/kernel/control"
 )
 
+// RemotePermissionRequest 表示同步过来的权限请求
+type RemotePermissionRequest struct {
+	RequestID     string
+	RequesterID   string
+	ChannelID     string
+	ChangeType    string
+	TargetID      string
+	Reason        string
+	Status        string
+	SourceKernelID string
+	CreatedAt     time.Time
+}
+
 // KernelConfig 内核配置
 type KernelConfig struct {
 	KernelID          string
@@ -67,6 +80,10 @@ type MultiKernelManager struct {
 	running bool
 	// NotificationManager 用于内核间服务通知本地连接器（由外部注入）
 	notificationManager *NotificationManager
+
+	// 同步的权限请求（key: channelID, value: 权限请求列表）
+	remotePermissionRequests     map[string][]*RemotePermissionRequest
+	remotePermissionRequestsMu sync.RWMutex
 }
 
 // NewMultiKernelManager 创建多内核管理器
@@ -79,6 +96,7 @@ func NewMultiKernelManager(config *KernelConfig, registry *control.Registry,
 		channelManager: channelManager,
 		kernels:        make(map[string]*KernelInfo),
 		pendingRequests: make(map[string]*PendingInterconnectRequest),
+		remotePermissionRequests: make(map[string][]*RemotePermissionRequest),
 		running:        true,
 	}
 
@@ -917,6 +935,36 @@ func (m *MultiKernelManager) GetConnectedKernelCount() int {
 	return len(m.kernels)
 }
 
+// GetKernelID 获取本内核ID
+func (m *MultiKernelManager) GetKernelID() string {
+	return m.config.KernelID
+}
+
+// AddRemotePermissionRequest 添加同步过来的权限请求
+func (m *MultiKernelManager) AddRemotePermissionRequest(req *RemotePermissionRequest) {
+	m.remotePermissionRequestsMu.Lock()
+	defer m.remotePermissionRequestsMu.Unlock()
+
+	// 检查是否已存在（根据 requestID）
+	channelReqs := m.remotePermissionRequests[req.ChannelID]
+	for _, existing := range channelReqs {
+		if existing.RequestID == req.RequestID {
+			// 已存在，更新状态
+			existing.Status = req.Status
+			return
+		}
+	}
+	// 添加新请求
+	m.remotePermissionRequests[req.ChannelID] = append(channelReqs, req)
+}
+
+// GetRemotePermissionRequests 获取指定频道的远程权限请求
+func (m *MultiKernelManager) GetRemotePermissionRequests(channelID string) []*RemotePermissionRequest {
+	m.remotePermissionRequestsMu.RLock()
+	defer m.remotePermissionRequestsMu.RUnlock()
+	return m.remotePermissionRequests[channelID]
+}
+
 // connectToKernelIdentityService 连接到内核的IdentityService（主服务器端口）
 func (m *MultiKernelManager) connectToKernelIdentityService(kernel *KernelInfo) (*grpc.ClientConn, error) {
 	// 创建TLS配置，同时包含自己的CA和对等内核的CA
@@ -1084,12 +1132,12 @@ func (m *MultiKernelManager) createKernelClient(kernelID, address string, port i
 	return nil
 }
 
-// CollectAllConnectors 收集所有连接内核的连接器信息
+// CollectAllConnectors 收集所有连接内核的连接器信息（只收集公开的连接器）
 func (m *MultiKernelManager) CollectAllConnectors() ([]*pb.ConnectorInfo, error) {
 	var allConnectors []*pb.ConnectorInfo
 
-	// 添加本地连接器
-	localConnectors := m.registry.ListConnectors()
+	// 添加本地连接器（只添加公开的）
+	localConnectors := m.registry.ListExposedConnectors()
 	for _, conn := range localConnectors {
 		allConnectors = append(allConnectors, &pb.ConnectorInfo{
 			ConnectorId:   conn.ConnectorID,

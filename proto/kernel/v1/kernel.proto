@@ -34,6 +34,12 @@ service KernelService {
 
   // 同步连接器信息
   rpc SyncConnectorInfo (SyncConnectorInfoRequest) returns (SyncConnectorInfoResponse);
+
+  // 权限请求同步（跨内核）
+  rpc SyncPermissionRequest (SyncPermissionRequestRequest) returns (SyncPermissionRequestResponse);
+
+  // 获取同步的权限请求
+  rpc GetRemotePermissionRequests (GetRemotePermissionRequestsRequest) returns (GetRemotePermissionRequestsResponse);
 }
 
 // ------------------------------------------------------------
@@ -179,4 +185,29 @@ message SyncConnectorInfoResponse {
   bool success = 1;
   string message = 2;
   int32 synced_count = 3;       // 同步的连接器数量
+}
+
+// ------------------------------------------------------------
+// 权限请求同步相关消息定义
+// ------------------------------------------------------------
+message SyncPermissionRequestRequest {
+  string source_kernel_id = 1;  // 源内核ID
+  string channel_id = 2;         // 频道ID
+  PermissionChangeRequest request = 3; // 权限变更请求
+}
+
+message SyncPermissionRequestResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetRemotePermissionRequestsRequest {
+  string requester_id = 1;       // 请求者ID
+  string channel_id = 2;         // 频道ID
+}
+
+message GetRemotePermissionRequestsResponse {
+  bool success = 1;
+  repeated PermissionChangeRequest requests = 2; // 权限变更请求列表
+  string message = 3;
 }

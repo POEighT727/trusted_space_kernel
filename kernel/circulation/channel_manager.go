@@ -295,6 +295,19 @@ func (cm *ChannelManager) CreateChannelWithID(channelID, creatorID, approverID s
 		channel.ChannelProposal.ReceiverApprovals[id] = false
 	}
 
+	// 创建者自动批准自己的提议（跨内核场景需要）
+	// 需要匹配裸 ID 和带 kernel 前缀的 ID（如 kernel-1:connector-A）
+	for _, id := range senderIDs {
+		if id == creatorID || strings.HasSuffix(id, ":"+creatorID) {
+			channel.ChannelProposal.SenderApprovals[id] = true
+		}
+	}
+	for _, id := range receiverIDs {
+		if id == creatorID || strings.HasSuffix(id, ":"+creatorID) {
+			channel.ChannelProposal.ReceiverApprovals[id] = true
+		}
+	}
+
 	cm.channels[channelID] = channel
 
 	return channel, nil
@@ -333,7 +346,6 @@ func (c *Channel) SetRemoteReceiver(connectorID, kernelID string) {
 		c.remoteReceivers = make(map[string]string)
 	}
 	c.remoteReceivers[connectorID] = kernelID
-	log.Printf("✓ Set remote receiver %s -> kernel %s in channel %s", connectorID, kernelID, c.ChannelID)
 }
 
 // GetRemoteKernelID 获取指定 connector 对应的远端内核 ID
@@ -437,16 +449,15 @@ func (cm *ChannelManager) ProposeChannel(creatorID, approverID string, senderIDs
 	}
 
 	// 创建者自动批准自己的提议
+	// 需要匹配裸 ID 和带 kernel 前缀的 ID（如 kernel-1:connector-A）
 	for _, id := range senderIDs {
-		if id == creatorID {
+		if id == creatorID || strings.HasSuffix(id, ":"+creatorID) {
 			senderApprovals[id] = true
-			break
 		}
 	}
 	for _, id := range receiverIDs {
-		if id == creatorID {
+		if id == creatorID || strings.HasSuffix(id, ":"+creatorID) {
 			receiverApprovals[id] = true
-			break
 		}
 	}
 
@@ -557,7 +568,42 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 	}
 
 	// 检查是否所有参与方都已确认
+	// 需要区分本地频道和跨内核频道
+	hasRemoteParticipants := false
+	for _, id := range channel.SenderIDs {
+		if strings.Contains(id, ":") {
+			hasRemoteParticipants = true
+			break
+		}
+	}
+	if !hasRemoteParticipants {
+		for _, id := range channel.ReceiverIDs {
+			if strings.Contains(id, ":") {
+				hasRemoteParticipants = true
+				break
+			}
+		}
+	}
+
 	allApproved := true
+	if hasRemoteParticipants {
+		// 跨内核频道：需要所有参与者（包括远端）都确认
+		for _, approved := range channel.ChannelProposal.SenderApprovals {
+			if !approved {
+				allApproved = false
+				break
+			}
+		}
+		if allApproved {
+			for _, approved := range channel.ChannelProposal.ReceiverApprovals {
+				if !approved {
+					allApproved = false
+					break
+				}
+			}
+		}
+	} else {
+		// 本地频道：只需要本地参与者确认
 	for id, approved := range channel.ChannelProposal.SenderApprovals {
 		// 跳过远端参与者（带 kernel 前缀）
 		if strings.Contains(id, ":") {
@@ -565,6 +611,7 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 		}
 		if !approved {
 			allApproved = false
+				break
 		}
 	}
 	if allApproved {
@@ -575,6 +622,8 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 			}
 			if !approved {
 				allApproved = false
+					break
+				}
 			}
 		}
 	}
@@ -1099,7 +1148,7 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		if err := json.Unmarshal(packet.Payload, &msg); err == nil {
 			if msg.MessageType == "permission_request" && msg.PermissionRequest != nil {
 				// 使用 packet.SenderID（已添加内核前缀）而不是 msg.SenderID
-				c.storePermissionRequestFromRemote(msg.PermissionRequest, packet.SenderID)
+				c.StorePermissionRequestFromRemote(msg.PermissionRequest, packet.SenderID)
 			} else if msg.MessageType == "channel_update" && msg.ChannelUpdate != nil {
 				// 更新本地频道的发送方/接收方列表
 				c.handleChannelUpdate(msg.ChannelUpdate)
@@ -1168,15 +1217,29 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		}
 
 		for _, receiverID := range c.ReceiverIDs {
+			// 首先检查是否是跨内核格式
 			if strings.Contains(receiverID, ":") {
-				// 远端格式 kernelID:connectorID
 				parts := strings.SplitN(receiverID, ":", 2)
 				kernelPart := parts[0]
-				// 跳过当前内核（避免循环转发）
+				connectorPart := parts[1]
+				
+				// 如果是当前内核的接收者，当作本地接收者处理
 				if kernelPart == currentKernelID {
+					// 本地接收者 - 需要正确处理跨内核格式
+					// subscribers map 使用裸 connectorID 作为 key
+					if _, subscribed := c.subscribers[connectorPart]; subscribed {
+						// 订阅者已订阅，数据会通过订阅通道发送
+						hasSubscribers = true
+						continue // 已订阅，不再检查离线状态
+					}
+					// 未订阅才检查离线状态
+					if c.manager != nil && !c.manager.IsConnectorOnline(connectorPart) {
+						offlineTargets = append(offlineTargets, connectorPart)
+					}
 					continue
 				}
-				connectorPart := parts[1]
+				
+				// 远端格式 kernelID:connectorID，跳过当前内核（避免循环转发）
 				remoteTargetsByKernel[kernelPart] = append(remoteTargetsByKernel[kernelPart], connectorPart)
 				continue
 			}
@@ -1192,10 +1255,20 @@ func (c *Channel) PushData(packet *DataPacket) error {
 				continue
 			}
 
-			// 本地接收者
-			if _, subscribed := c.subscribers[receiverID]; !subscribed {
-				if c.manager != nil && !c.manager.IsConnectorOnline(receiverID) {
-					offlineTargets = append(offlineTargets, receiverID)
+			// 本地接收者 - 需要正确处理跨内核格式 (kernelID:connectorID)
+			// subscribers map 使用裸 connectorID 作为 key
+			localReceiverID := receiverID
+			if strings.Contains(receiverID, ":") {
+				parts := strings.SplitN(receiverID, ":", 2)
+				localReceiverID = parts[1]
+			}
+			if _, subscribed := c.subscribers[localReceiverID]; subscribed {
+				// 订阅者已订阅，数据会通过订阅通道发送
+				hasSubscribers = true
+			} else {
+				// 未订阅才检查离线状态
+				if c.manager != nil && !c.manager.IsConnectorOnline(localReceiverID) {
+					offlineTargets = append(offlineTargets, localReceiverID)
 				}
 			}
 		}
@@ -1238,12 +1311,7 @@ func (c *Channel) PushData(packet *DataPacket) error {
 	for _, offlineTarget := range offlineTargets {
 		if c.manager != nil {
 			c.manager.BufferDataForOfflineConnector(offlineTarget, packet)
-			log.Printf("📦 Buffered data for offline connector %s in channel %s", offlineTarget, c.ChannelID)
 		}
-	}
-
-	if len(offlineTargets) > 0 {
-		log.Printf("📦 Found %d offline targets for packet in channel %s", len(offlineTargets), c.ChannelID)
 	}
 
 	// 决定是否需要频道级别的缓冲
@@ -1264,6 +1332,19 @@ func (c *Channel) PushData(packet *DataPacket) error {
 	}
 
 	c.mu.RUnlock()
+
+	// 重要：先发送到订阅通道，再处理频道级别缓冲
+	// 这样订阅者可以立即收到数据，未订阅但在线的接收者也可以在订阅后收到缓冲的数据
+
+	// 将数据推送到本地队列（如果有本地订阅者）
+	if hasSubscribers {
+		select {
+		case c.dataQueue <- packet:
+			// 成功推送到队列
+		case <-time.After(5 * time.Second):
+			return fmt.Errorf("timeout pushing data to channel")
+		}
+	}
 
 	if shouldBuffer {
 		// 有指定的目标接收者未订阅（但在线），暂存数据等待他们订阅
@@ -1287,16 +1368,6 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		c.buffer = append(c.buffer, bufferedPacket)
 		c.bufferMu.Unlock()
 		return nil
-	}
-
-	// 将数据推送到本地队列（如果有本地订阅者）
-	if hasSubscribers {
-		select {
-		case c.dataQueue <- packet:
-			// pushed locally
-		case <-time.After(5 * time.Second):
-			return fmt.Errorf("timeout pushing data to channel")
-		}
 	}
 
 	// 转发到远端内核（如果有远端目标）
@@ -1369,15 +1440,8 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 	// 合并所有缓冲数据
 	allBufferedPackets := append(bufferedPackets, connectorBufferedPackets...)
 
-	log.Printf("📊 Total buffered packets for %s: %d (channel: %d, connector: %d)",
-		subscriberID, len(allBufferedPackets), len(bufferedPackets), len(connectorBufferedPackets))
-
 	// 在goroutine中发送所有暂存的数据，避免阻塞
 	go func() {
-		if len(allBufferedPackets) > 0 {
-			log.Printf("📤 Sending %d buffered packets to recovered connector %s", len(allBufferedPackets), subscriberID)
-		}
-
 		for _, packet := range allBufferedPackets {
 			// 检查是否应该发送给此订阅者
 			if shouldSendToSubscriber(packet, subscriberID) {
@@ -1403,8 +1467,16 @@ func shouldSendToSubscriber(packet *DataPacket, subscriberID string) bool {
 	}
 	// 检查订阅者是否在目标列表中
 	for _, targetID := range packet.TargetIDs {
+		// 直接匹配
 		if targetID == subscriberID {
 			return true
+		}
+		// 处理跨内核格式 (kernel-ID:connectorID -> connectorID)
+		if strings.Contains(targetID, ":") {
+			parts := strings.SplitN(targetID, ":", 2)
+			if len(parts) == 2 && parts[1] == subscriberID {
+				return true
+			}
 		}
 	}
 	return false
@@ -1507,19 +1579,12 @@ func (c *Channel) SubscribeWithRecovery(subscriberID string, isRestartRecovery b
 	// 合并所有缓冲数据
 	allBufferedPackets := append(bufferedPackets, connectorBufferedPackets...)
 
-	log.Printf("📊 Total buffered packets for %s: %d (channel: %d, connector: %d)",
-		subscriberID, len(allBufferedPackets), len(bufferedPackets), len(connectorBufferedPackets))
-
 	// 在goroutine中发送所有暂存的数据，避免阻塞
 	go func() {
-		if len(allBufferedPackets) > 0 {
-			log.Printf("📤 Sending %d buffered packets to connector %s", len(allBufferedPackets), subscriberID)
-		}
 		for _, packet := range allBufferedPackets {
 			select {
 			case subChan <- packet:
 			case <-time.After(5 * time.Second):
-				log.Printf("⚠️ Timeout sending buffered packet to %s", subscriberID)
 				return
 			}
 		}
@@ -1968,19 +2033,21 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 	// 注意：对于 add_sender，应该使用 TargetID（目标连接器），而不是 RequesterID（请求者）
 	switch request.ChangeType {
 	case "add_sender":
-		// 使用带内核前缀的目标ID（如果请求者来自远程内核，需要构造目标的内核前缀）
+		// 如果目标ID已经包含内核前缀，直接使用
+		// 否则，如果请求者来自远程内核，使用请求者的内核前缀
 		senderID := request.TargetID
-		if request.RequesterID != "" && strings.Contains(request.RequesterID, ":") {
-			// 请求者来自远程内核，构造目标的内核前缀
+		if !strings.Contains(senderID, ":") && request.RequesterID != "" && strings.Contains(request.RequesterID, ":") {
+			// 请求者来自远程内核，且目标是裸ID，构造目标的内核前缀
 			parts := strings.SplitN(request.RequesterID, ":", 2)
 			kernelPart := parts[0]
 			senderID = kernelPart + ":" + request.TargetID
 		}
 		c.SenderIDs = append(c.SenderIDs, senderID)
 	case "remove_sender":
-		// 移除时也需要考虑内核前缀
+		// 如果目标ID已经包含内核前缀，直接使用
+		// 否则，如果请求者来自远程内核，使用请求者的内核前缀
 		targetID := request.TargetID
-		if request.RequesterID != "" && strings.Contains(request.RequesterID, ":") {
+		if !strings.Contains(targetID, ":") && request.RequesterID != "" && strings.Contains(request.RequesterID, ":") {
 			parts := strings.SplitN(request.RequesterID, ":", 2)
 			kernelPart := parts[0]
 			targetID = kernelPart + ":" + request.TargetID
@@ -2068,9 +2135,9 @@ func (c *Channel) GetPermissionRequests() []*PermissionChangeRequest {
 	return requests
 }
 
-// storePermissionRequestFromRemote 从远端内核接收并存储权限变更请求
+// StorePermissionRequestFromRemote 从远端内核接收并存储权限变更请求
 // 当跨内核频道中一个内核收到权限请求时，需要在本地存储以便批准者可以批准
-func (c *Channel) storePermissionRequestFromRemote(permReq *PermissionRequestMessage, requesterID string) {
+func (c *Channel) StorePermissionRequestFromRemote(permReq *PermissionRequestMessage, requesterID string) {
 	c.permissionMu.Lock()
 	defer c.permissionMu.Unlock()
 
