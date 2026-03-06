@@ -344,6 +344,63 @@ func main() {
 
 	// 注册服务
 	channelService := server.NewChannelServiceServer(channelManager, policyEngine, registry, auditLog, multiKernelManager)
+	
+	// 设置权限变更回调：当权限被批准时，通知被添加的连接器（含跨内核转发）
+	channelManager.SetPermissionChangeCallback(func(channelID, connectorID, changeType string) {
+		log.Printf("📨 Permission change approved, notifying connector %s: channel=%s, type=%s", connectorID, channelID, changeType)
+		// 获取频道信息
+		channel, err := channelManager.GetChannel(channelID)
+		if err != nil {
+			log.Printf("⚠️ Failed to get channel %s: %v", channelID, err)
+			return
+		}
+
+		// 构建通知消息，携带 ACCEPTED 状态便于对端内核直接激活频道
+		notification := &pb.ChannelNotification{
+			ChannelId:         channelID,
+			CreatorId:         channel.CreatorID,
+			SenderIds:         channel.SenderIDs,
+			ReceiverIds:       channel.ReceiverIDs,
+			Encrypted:         channel.Encrypted,
+			DataTopic:         channel.DataTopic,
+			CreatedAt:         channel.CreatedAt.Unix(),
+			NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED,
+		}
+
+		// NotifyParticipant 支持本地和跨内核通知（kernelID:connectorID 格式）
+		if err := channelService.NotifyParticipant(connectorID, notification); err != nil {
+			log.Printf("⚠️ Failed to notify connector %s: %v", connectorID, err)
+		} else {
+			log.Printf("✓ Notified connector %s of permission change", connectorID)
+		}
+	})
+	
+	// 设置频道更新后通知回调：当远端内核同步的 channel_update 添加了本地接收者时，通知它们
+	channelManager.SetChannelUpdateNotifyCallback(func(channelID string, addedLocalReceivers []string) {
+		ch, err := channelManager.GetChannel(channelID)
+		if err != nil {
+			log.Printf("⚠️ channel update notify: channel %s not found: %v", channelID, err)
+			return
+		}
+		notification := &pb.ChannelNotification{
+			ChannelId:         channelID,
+			CreatorId:         ch.CreatorID,
+			SenderIds:         ch.SenderIDs,
+			ReceiverIds:       ch.ReceiverIDs,
+			Encrypted:         ch.Encrypted,
+			DataTopic:         ch.DataTopic,
+			CreatedAt:         ch.CreatedAt.Unix(),
+			NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED,
+		}
+		for _, connID := range addedLocalReceivers {
+			if err := channelService.NotificationManager.Notify(connID, notification); err != nil {
+				log.Printf("⚠️ Failed to notify locally added receiver %s after channel update: %v", connID, err)
+			} else {
+				log.Printf("✓ Notified locally added receiver %s of channel update (channel %s)", connID, channelID)
+			}
+		}
+	})
+
 	pb.RegisterChannelServiceServer(grpcServer, channelService)
 
 	identityService := server.NewIdentityServiceServer(registry, auditLog, ca, channelManager, channelService.NotificationManager, multiKernelManager)

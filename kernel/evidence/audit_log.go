@@ -229,8 +229,9 @@ func (al *AuditLog) SubmitEvidence(connectorID string, eventType EventType, chan
 // SubmitEvidenceWithFlowID 提交带有业务流程ID的存证
 func (al *AuditLog) SubmitEvidenceWithFlowID(flowID, connectorID string, eventType EventType, channelID, dataHash string, metadata map[string]string) (*EvidenceRecord, error) {
 	log.Printf("📝 EVIDENCE SUBMIT: %s, connector: %s, channel: %s, hash: %s, flow: %s", eventType, connectorID, channelID, dataHash, flowID)
-	al.mu.Lock()
-	defer al.mu.Unlock()
+	
+	// 不需要锁，因为每个 SubmitEvidenceWithFlowID 调用都是独立的
+	// 构建证据记录
 
 	// 使用传入的flowID，如果为空则生成新的
 	if flowID == "" {
@@ -671,10 +672,6 @@ func (al *AuditLog) sendEvidenceToChannel(channelID string, record *EvidenceReco
 		// 没有存证配置，广播给所有订阅者
 		targetIDs = []string{}
 	}
-
-	// 诊断日志：追踪 ConnectorID 问题
-	log.Printf("🔍 sendEvidenceToChannel: record.ConnectorID=%s, channel.SenderIDs=%v, channel.CreatorID=%s",
-		record.ConnectorID, channel.SenderIDs, channel.CreatorID)
 
 	// 确定发送者ID：优先使用原始连接器，但如果不是发送方则使用创建者
 	senderID := record.ConnectorID

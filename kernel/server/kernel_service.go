@@ -845,6 +845,7 @@ func (s *KernelServiceServer) GetCrossKernelChannelInfo(ctx context.Context, req
 	// 对于远端连接器（有 kernel:connector 格式），KernelId 设置为对应内核 ID，ConnectorId 为裸 ID
 	senders := make([]*pb.CrossKernelParticipant, 0, len(channel.SenderIDs))
 	receivers := make([]*pb.CrossKernelParticipant, 0, len(channel.ReceiverIDs))
+	localKernelID := s.multiKernelManager.config.KernelID
 	for _, sID := range channel.SenderIDs {
 		var kernelId, connectorId string
 		if strings.Contains(sID, ":") {
@@ -852,7 +853,9 @@ func (s *KernelServiceServer) GetCrossKernelChannelInfo(ctx context.Context, req
 			kernelId = parts[0]
 			connectorId = parts[1]
 		} else {
-			kernelId = ""
+			// Local connector: always include this kernel's ID so remote kernels
+			// store the participant with the correct kernel prefix.
+			kernelId = localKernelID
 			connectorId = sID
 		}
 		senders = append(senders, &pb.CrossKernelParticipant{
@@ -867,7 +870,9 @@ func (s *KernelServiceServer) GetCrossKernelChannelInfo(ctx context.Context, req
 			kernelId = parts[0]
 			connectorId = parts[1]
 		} else {
-			kernelId = ""
+			// Local connector: always include this kernel's ID so remote kernels
+			// store the participant with the correct kernel prefix.
+			kernelId = localKernelID
 			connectorId = rID
 		}
 		receivers = append(receivers, &pb.CrossKernelParticipant{

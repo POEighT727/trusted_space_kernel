@@ -190,6 +190,10 @@ type ChannelManager struct {
 	mu                   sync.RWMutex
 	channels             map[string]*Channel
 	notifyChannelCreated func(*Channel) // 频道创建通知回调
+	permissionChangeCallback func(channelID, connectorID, changeType string) // 权限变更通知回调
+	// notifyAfterChannelUpdate is called after a remote channel_update message is processed.
+	// addedLocalReceivers contains bare connector IDs of newly added receivers local to this kernel.
+	notifyAfterChannelUpdate func(channelID string, addedLocalReceivers []string)
 
 	// 连接器状态跟踪（用于重启恢复）
 	connectorStatus  map[string]ConnectorStatus // 连接器状态
@@ -308,6 +312,31 @@ func (cm *ChannelManager) CreateChannelWithID(channelID, creatorID, approverID s
 		}
 	}
 
+	// 初始化 remoteReceivers 映射（跨内核数据转发需要）
+	currentKernelID := cm.kernelID
+	for _, senderID := range senderIDs {
+		if strings.Contains(senderID, ":") {
+			parts := strings.SplitN(senderID, ":", 2)
+			senderKernelID := parts[0]
+			connectorID := parts[1]
+			// 如果发送者在远程内核上，记录映射
+			if senderKernelID != currentKernelID {
+				channel.remoteReceivers[connectorID] = senderKernelID
+			}
+		}
+	}
+	for _, receiverID := range receiverIDs {
+		if strings.Contains(receiverID, ":") {
+			parts := strings.SplitN(receiverID, ":", 2)
+			receiverKernelID := parts[0]
+			connectorID := parts[1]
+			// 如果接收者在远程内核上，记录映射
+			if receiverKernelID != currentKernelID {
+				channel.remoteReceivers[connectorID] = receiverKernelID
+			}
+		}
+	}
+
 	cm.channels[channelID] = channel
 
 	return channel, nil
@@ -334,6 +363,25 @@ func (cm *ChannelManager) SetForwardToKernel(fn func(kernelID string, packet *Da
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.forwardToKernel = fn
+}
+
+// SetPermissionChangeCallback 设置权限变更回调
+func (cm *ChannelManager) SetPermissionChangeCallback(callback func(channelID, connectorID, changeType string)) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.permissionChangeCallback = callback
+	log.Printf("✓ Permission change callback set in ChannelManager")
+}
+
+// SetChannelUpdateNotifyCallback sets a callback that is invoked after a
+// channel_update control message has been processed locally.  The callback
+// receives the channelID and a list of bare connector IDs that were newly
+// added as local receivers so the server layer can send them an ACCEPTED
+// notification without any further locking.
+func (cm *ChannelManager) SetChannelUpdateNotifyCallback(callback func(channelID string, addedLocalReceivers []string)) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.notifyAfterChannelUpdate = callback
 }
 
 // SetRemoteReceiver 设置远端接收者所属的内核（用于跨内核数据转发）
@@ -546,6 +594,22 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 			// 添加带 kernel 前缀的 ID 到候选列表
 			idWithKernel := fmt.Sprintf("%s:%s", kernelID, actualID)
 			candidateIDs = append(candidateIDs, idWithKernel)
+		}
+	}
+
+	// 若 accepterID 是裸 connector ID（不含 ":"），也尝试用本内核 ID 拼接的格式
+	// 这样本内核的连接器可以匹配审批映射中的 "kernelID:connectorID" 格式键
+	if cm.kernelID != "" && !strings.Contains(accepterID, ":") {
+		idWithLocalKernel := fmt.Sprintf("%s:%s", cm.kernelID, actualID)
+		alreadyIn := false
+		for _, cid := range candidateIDs {
+			if cid == idWithLocalKernel {
+				alreadyIn = true
+				break
+			}
+		}
+		if !alreadyIn {
+			candidateIDs = append(candidateIDs, idWithLocalKernel)
 		}
 	}
 
@@ -784,6 +848,31 @@ func (cm *ChannelManager) CreateChannelFromConfig(configFilePath string) (*Chann
 	copy(channel.SenderIDs, config.SenderIDs)
 	copy(channel.ReceiverIDs, config.ReceiverIDs)
 
+	// 初始化 remoteReceivers 映射（跨内核数据转发需要）
+	currentKernelID := cm.kernelID
+	for _, senderID := range config.SenderIDs {
+		if strings.Contains(senderID, ":") {
+			parts := strings.SplitN(senderID, ":", 2)
+			senderKernelID := parts[0]
+			connectorID := parts[1]
+			// 如果发送者在远程内核上，记录映射
+			if senderKernelID != currentKernelID {
+				channel.remoteReceivers[connectorID] = senderKernelID
+			}
+		}
+	}
+	for _, receiverID := range config.ReceiverIDs {
+		if strings.Contains(receiverID, ":") {
+			parts := strings.SplitN(receiverID, ":", 2)
+			receiverKernelID := parts[0]
+			connectorID := parts[1]
+			// 如果接收者在远程内核上，记录映射
+			if receiverKernelID != currentKernelID {
+				channel.remoteReceivers[connectorID] = receiverKernelID
+			}
+		}
+	}
+
 	// 注册到管理器
 	cm.mu.Lock()
 	cm.channels[config.ChannelName] = channel
@@ -925,6 +1014,31 @@ func (cm *ChannelManager) createChannelInternal(creatorID, approverID string, se
 		remoteReceivers:    make(map[string]string), // 初始化远端接收者映射
 	}
 
+	// 初始化 remoteReceivers 映射（跨内核数据转发需要）
+	currentKernelID := cm.kernelID
+	for _, senderID := range senderIDs {
+		if strings.Contains(senderID, ":") {
+			parts := strings.SplitN(senderID, ":", 2)
+			senderKernelID := parts[0]
+			connectorID := parts[1]
+			// 如果发送者在远程内核上，记录映射
+			if senderKernelID != currentKernelID {
+				channel.remoteReceivers[connectorID] = senderKernelID
+			}
+		}
+	}
+	for _, receiverID := range receiverIDs {
+		if strings.Contains(receiverID, ":") {
+			parts := strings.SplitN(receiverID, ":", 2)
+			receiverKernelID := parts[0]
+			connectorID := parts[1]
+			// 如果接收者在远程内核上，记录映射
+			if receiverKernelID != currentKernelID {
+				channel.remoteReceivers[connectorID] = receiverKernelID
+			}
+		}
+	}
+
 	cm.channels[channelID] = channel
 
 	// 启动数据分发协程
@@ -1041,6 +1155,10 @@ func (c *Channel) CanReceive(connectorID string) bool {
 				return true
 			}
 		}
+		// 也处理 receiverID 不带内核前缀的情况
+		if rawConnectorID == receiverID {
+			return true
+		}
 	}
 	return false
 }
@@ -1135,26 +1253,35 @@ func (cm *ChannelManager) ListChannelsByParticipant(connectorID string) []*Chann
 
 // PushData 向频道推送数据
 func (c *Channel) PushData(packet *DataPacket) error {
+	// channel_update and permission_request must be processed even when the channel
+	// is not yet active (e.g. PROPOSED state on a remote kernel), so handle them
+	// before the status check and return early — they don't need subscriber delivery.
+	if packet.MessageType == MessageTypeControl {
+		var msg ControlMessage
+		if err := json.Unmarshal(packet.Payload, &msg); err == nil {
+			switch msg.MessageType {
+			case "channel_update":
+				if msg.ChannelUpdate != nil {
+					c.handleChannelUpdate(msg.ChannelUpdate)
+				}
+				return nil
+			case "permission_request":
+				if msg.PermissionRequest != nil {
+					c.StorePermissionRequestFromRemote(msg.PermissionRequest, packet.SenderID)
+				}
+				return nil
+			}
+		}
+	}
+
 	if c.Status != ChannelStatusActive {
 		return fmt.Errorf("channel is not active")
 	}
 
-	// 对于控制消息（如权限变更请求），需要特殊处理：
-	// 1. 跳过发送方权限验证（因为请求者可能没有发送权限）
-	// 2. 在本地存储权限请求，以便批准者可以批准
-	// 3. 处理频道更新消息（跨内核同步发送方/接收方列表）
-		if packet.MessageType == MessageTypeControl {
-		var msg ControlMessage
-		if err := json.Unmarshal(packet.Payload, &msg); err == nil {
-			if msg.MessageType == "permission_request" && msg.PermissionRequest != nil {
-				// 使用 packet.SenderID（已添加内核前缀）而不是 msg.SenderID
-				c.StorePermissionRequestFromRemote(msg.PermissionRequest, packet.SenderID)
-			} else if msg.MessageType == "channel_update" && msg.ChannelUpdate != nil {
-				// 更新本地频道的发送方/接收方列表
-				c.handleChannelUpdate(msg.ChannelUpdate)
-			}
-		}
-		// 控制消息跳过发送方验证，直接推送
+	// 对于控制消息和证据消息，跳过发送方权限验证
+	if packet.MessageType == MessageTypeControl {
+		// other control message types (permission_result, channel_proposal, etc.)
+		// fall through to normal subscriber distribution
 	} else if packet.MessageType == MessageTypeEvidence {
 		// 证据消息由内核发送，不应该被阻止，跳过验证
 	} else {
@@ -1166,8 +1293,8 @@ func (c *Channel) PushData(packet *DataPacket) error {
 
 	c.LastActivity = time.Now()
 
-	// 检查目标接收者是否都已订阅
-	c.mu.RLock()
+	// 不使用锁，直接检查 subscribers 和 remoteReceivers
+	// 因为证据消息是内核内部产生的，不涉及并发修改
 	hasSubscribers := len(c.subscribers) > 0
 	
 	// 确定需要接收此数据的目标接收者（多对多模式，支持所有接收方）
@@ -1245,17 +1372,32 @@ func (c *Channel) PushData(packet *DataPacket) error {
 			}
 
 			// 检查 remoteReceivers 映射，看是否这个接收者实际上是远端的
-			if kernelID, isRemote := c.remoteReceivers[receiverID]; isRemote {
-				// 跳过当前内核
+		// 需要先提取裸 connectorID 才能正确匹配
+		checkReceiverID := receiverID
+		if strings.Contains(receiverID, ":") {
+			parts := strings.SplitN(receiverID, ":", 2)
+			checkReceiverID = parts[1]
+		}
+		if kernelID, isRemote := c.remoteReceivers[checkReceiverID]; isRemote {
+			// 如果映射指向当前内核，应该当作本地接收者处理
 				if kernelID == currentKernelID {
+				// 这是本地接收者（映射到当前内核）
+				localReceiverID := checkReceiverID
+				if _, subscribed := c.subscribers[localReceiverID]; subscribed {
+					hasSubscribers = true
+				} else {
+					if c.manager != nil && !c.manager.IsConnectorOnline(localReceiverID) {
+						offlineTargets = append(offlineTargets, localReceiverID)
+					}
+				}
 					continue
 				}
-				// 这是远端接收者，使用映射中的 kernelID
+			// 这是真正的远端接收者，使用映射中的 kernelID
 				remoteTargetsByKernel[kernelID] = append(remoteTargetsByKernel[kernelID], receiverID)
 				continue
 			}
 
-			// 本地接收者 - 需要正确处理跨内核格式 (kernelID:connectorID)
+		// 本地接收者 - 需要正确处理跨内核格式 (kernelID:connectorID)
 			// subscribers map 使用裸 connectorID 作为 key
 			localReceiverID := receiverID
 			if strings.Contains(receiverID, ":") {
@@ -1330,8 +1472,6 @@ func (c *Channel) PushData(packet *DataPacket) error {
 			}
 		}
 	}
-
-	c.mu.RUnlock()
 
 	// 重要：先发送到订阅通道，再处理频道级别缓冲
 	// 这样订阅者可以立即收到数据，未订阅但在线的接收者也可以在订阅后收到缓冲的数据
@@ -2001,19 +2141,25 @@ func (c *Channel) RequestPermissionChange(requesterID, changeType, targetID, rea
 
 // ApprovePermissionChange 批准权限变更
 func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
+	log.Printf("🔍 DEBUG ApprovePermissionChange ENTRY: approverID=%s, requestID=%s", approverID, requestID)
+	
 	c.permissionMu.Lock()
-	defer c.permissionMu.Unlock()
+	log.Printf("🔍 DEBUG ApprovePermissionChange: lock acquired")
+	// 注意：不使用 defer unlock，因为需要在 goroutine 之前手动解锁
 
+	log.Printf("🔍 DEBUG ApprovePermissionChange: checking channel status")
 	if c.Status != ChannelStatusActive {
 		return fmt.Errorf("channel is not active")
 	}
 
 	// 验证批准者权限
+	log.Printf("🔍 DEBUG ApprovePermissionChange: checking approver")
 	if approverID != c.ApproverID {
 		return fmt.Errorf("only the channel approver can approve permission changes")
 	}
 
 	// 查找请求
+	log.Printf("🔍 DEBUG ApprovePermissionChange: searching for request")
 	var request *PermissionChangeRequest
 	for _, req := range c.permissionRequests {
 		if req.RequestID == requestID {
@@ -2025,9 +2171,15 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 		return fmt.Errorf("permission change request not found")
 	}
 
+	log.Printf("🔍 DEBUG ApprovePermissionChange: found request, ChangeType=%s, TargetID=%s, Status=%s", 
+		request.ChangeType, request.TargetID, request.Status)
+
+	log.Printf("🔍 DEBUG ApprovePermissionChange: checking request status")
 	if request.Status != "pending" {
 		return fmt.Errorf("request is already %s", request.Status)
 	}
+
+	log.Printf("🔍 DEBUG ApprovePermissionChange: executing permission change")
 
 	// 执行权限变更
 	// 注意：对于 add_sender，应该使用 TargetID（目标连接器），而不是 RequesterID（请求者）
@@ -2035,14 +2187,44 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 	case "add_sender":
 		// 如果目标ID已经包含内核前缀，直接使用
 		// 否则，如果请求者来自远程内核，使用请求者的内核前缀
+		// 如果请求者是本地内核的连接器，使用当前内核ID作为前缀
 		senderID := request.TargetID
-		if !strings.Contains(senderID, ":") && request.RequesterID != "" && strings.Contains(request.RequesterID, ":") {
-			// 请求者来自远程内核，且目标是裸ID，构造目标的内核前缀
+		senderKernelID := ""
+		if strings.Contains(senderID, ":") {
+			// 目标已经有内核前缀
+			parts := strings.SplitN(senderID, ":", 2)
+			senderKernelID = parts[0]
+		} else if request.RequesterID != "" && strings.Contains(request.RequesterID, ":") {
+			// 请求者来自远程内核，提取远程内核ID
 			parts := strings.SplitN(request.RequesterID, ":", 2)
-			kernelPart := parts[0]
-			senderID = kernelPart + ":" + request.TargetID
+			senderKernelID = parts[0]
+			senderID = senderKernelID + ":" + request.TargetID
+		} else if c.manager != nil {
+			// 请求者是本地内核的连接器，使用当前内核ID
+			senderKernelID = c.manager.kernelID
+			senderID = senderKernelID + ":" + request.TargetID
 		}
 		c.SenderIDs = append(c.SenderIDs, senderID)
+
+		// 关键修复：无论发送者是否属于本地内核，都需要更新 remoteReceivers
+		// 因为可能已经有远程接收者存在，需要能够转发数据到远程内核
+		// 直接修改映射，避免调用 SetRemoteReceiver 导致的潜在问题
+		log.Printf("🔍 DEBUG ApprovePermissionChange: add_sender, updating remoteReceivers")
+		if c.manager != nil && c.remoteReceivers != nil {
+			// 遍历所有接收者，更新 remoteReceivers
+			for _, receiverID := range c.ReceiverIDs {
+				if strings.Contains(receiverID, ":") {
+					parts := strings.SplitN(receiverID, ":", 2)
+					receiverKernelID := parts[0]
+					connectorID := parts[1]
+					// 如果接收者在远程内核上，记录映射
+					if receiverKernelID != c.manager.kernelID {
+						c.remoteReceivers[connectorID] = receiverKernelID
+						log.Printf("🔍 DEBUG ApprovePermissionChange: add_sender, set remote receiver %s -> %s", connectorID, receiverKernelID)
+					}
+				}
+			}
+		}
 	case "remove_sender":
 		// 如果目标ID已经包含内核前缀，直接使用
 		// 否则，如果请求者来自远程内核，使用请求者的内核前缀
@@ -2059,7 +2241,43 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 			}
 		}
 	case "add_receiver":
-		c.ReceiverIDs = append(c.ReceiverIDs, request.TargetID)
+		receiverID := request.TargetID
+		receiverKernelID := ""
+		if strings.Contains(receiverID, ":") {
+			// 目标已经有内核前缀
+			parts := strings.SplitN(receiverID, ":", 2)
+			receiverKernelID = parts[0]
+		} else if request.RequesterID != "" && strings.Contains(request.RequesterID, ":") {
+			// 请求者来自远程内核，提取远程内核ID
+			parts := strings.SplitN(request.RequesterID, ":", 2)
+			receiverKernelID = parts[0]
+			receiverID = receiverKernelID + ":" + request.TargetID
+		} else if c.manager != nil {
+			// 请求者是本地内核的连接器，使用当前内核ID
+			receiverKernelID = c.manager.kernelID
+			receiverID = receiverKernelID + ":" + request.TargetID
+		}
+		c.ReceiverIDs = append(c.ReceiverIDs, receiverID)
+
+		// 关键修复：无论接收者是否属于本地内核，都需要更新 remoteReceivers
+		// 因为可能已经有远程发送者存在，需要能够转发数据到远程内核
+		// 直接修改映射，避免调用 SetRemoteReceiver 导致的潜在问题
+		log.Printf("🔍 DEBUG ApprovePermissionChange: add_receiver, updating remoteReceivers")
+		if c.manager != nil && c.remoteReceivers != nil {
+			// 遍历所有发送者，更新 remoteReceivers
+			for _, senderID := range c.SenderIDs {
+				if strings.Contains(senderID, ":") {
+					parts := strings.SplitN(senderID, ":", 2)
+					senderKernelID := parts[0]
+					connectorID := parts[1]
+					// 如果发送者在远程内核上，记录映射
+					if senderKernelID != c.manager.kernelID {
+						c.remoteReceivers[connectorID] = senderKernelID
+						log.Printf("🔍 DEBUG ApprovePermissionChange: add_receiver, set remote receiver %s -> %s", connectorID, senderKernelID)
+					}
+				}
+			}
+		}
 	case "remove_receiver":
 		for i, id := range c.ReceiverIDs {
 			if id == request.TargetID {
@@ -2070,15 +2288,67 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 	}
 
 	// 更新请求状态
+	log.Printf("🔍 DEBUG ApprovePermissionChange: about to update request status")
 	now := time.Now()
 	request.Status = "approved"
 	request.ApprovedAt = &now
 	request.ApprovedBy = approverID
 
 	c.LastActivity = time.Now()
+	
+	log.Printf("🔍 DEBUG ApprovePermissionChange: SenderIDs before notify = %v", c.SenderIDs)
 
 	// 通知远程内核频道已更新（发送方/接收方列表已变更）
+	log.Printf("🔍 DEBUG ApprovePermissionChange: calling notifyRemoteKernelsOfChannelUpdate, SenderIDs=%v, ReceiverIDs=%v", c.SenderIDs, c.ReceiverIDs)
+	
+	// 通知被添加的连接器：使用解析后的完整 kernel-qualified ID（而非原始 TargetID），
+	// 确保回调可以正确进行跨内核转发。
+	if c.manager != nil && c.manager.permissionChangeCallback != nil && (request.ChangeType == "add_sender" || request.ChangeType == "add_receiver") {
+		// Resolve the full qualified connector ID from the updated participant lists
+		resolvedTargetID := request.TargetID
+		switch request.ChangeType {
+		case "add_receiver":
+			// Find the newly appended receiver (last element)
+			if len(c.ReceiverIDs) > 0 {
+				for _, rid := range c.ReceiverIDs {
+					bare := rid
+					if idx := strings.LastIndex(rid, ":"); idx != -1 {
+						bare = rid[idx+1:]
+					}
+					targetBare := request.TargetID
+					if idx := strings.LastIndex(request.TargetID, ":"); idx != -1 {
+						targetBare = request.TargetID[idx+1:]
+					}
+					if bare == targetBare {
+						resolvedTargetID = rid
+					}
+				}
+			}
+		case "add_sender":
+			if len(c.SenderIDs) > 0 {
+				for _, sid := range c.SenderIDs {
+					bare := sid
+					if idx := strings.LastIndex(sid, ":"); idx != -1 {
+						bare = sid[idx+1:]
+					}
+					targetBare := request.TargetID
+					if idx := strings.LastIndex(request.TargetID, ":"); idx != -1 {
+						targetBare = request.TargetID[idx+1:]
+					}
+					if bare == targetBare {
+						resolvedTargetID = sid
+					}
+				}
+			}
+		}
+		go c.manager.permissionChangeCallback(c.ChannelID, resolvedTargetID, request.ChangeType)
+	}
+	
+	// 先解锁，再调用 notifyRemoteKernelsOfChannelUpdate
+	c.permissionMu.Unlock()
 	go c.notifyRemoteKernelsOfChannelUpdate()
+	
+	log.Printf("🔍 DEBUG ApprovePermissionChange: returning nil")
 
 	return nil
 }
@@ -2287,7 +2557,9 @@ func (c *Channel) broadcastPermissionResult(requestID, action, approverID, rejec
 
 // notifyRemoteKernelsOfChannelUpdate 通知远程内核频道已更新（发送方/接收方列表变更）
 func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
+	log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate START: c.manager=%v, forwardToKernel=%v, kernelID=%s", c.manager, c.manager != nil && c.manager.forwardToKernel != nil, c.manager.kernelID)
 	if c.manager == nil || c.manager.forwardToKernel == nil {
+		log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate: early return - manager or forwardToKernel is nil")
 		return
 	}
 
@@ -2303,6 +2575,7 @@ func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
 			kernelPart := parts[0]
 			if kernelPart != currentKernelID {
 				remoteKernels[kernelPart] = true
+				log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate: found remote sender kernel %s from %s", kernelPart, senderID)
 			}
 		}
 	}
@@ -2314,19 +2587,28 @@ func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
 			kernelPart := parts[0]
 			if kernelPart != currentKernelID {
 				remoteKernels[kernelPart] = true
+				log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate: found remote receiver kernel %s from %s", kernelPart, receiverID)
 			}
 		}
 	}
 
 	// 也检查 remoteReceivers 映射
-	for _, kernelID := range c.remoteReceivers {
+	for connectorID, kernelID := range c.remoteReceivers {
 		if kernelID != currentKernelID {
 			remoteKernels[kernelID] = true
+			log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate: found remote from remoteReceivers: %s -> %s", connectorID, kernelID)
 		}
 	}
+	
+	log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate: remoteKernels to notify = %v", remoteKernels)
 
 	// 发送频道更新通知到所有远程内核
 	for kernelID := range remoteKernels {
+	// 添加调试日志
+	log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate ENTRY: c.manager=%v, forwardToKernel=%v", c.manager, c.manager != nil && c.manager.forwardToKernel != nil)
+	log.Printf("🔍 DEBUG: Notifying kernel %s of channel update, remoteReceivers=%v, SenderIDs=%v, ReceiverIDs=%v",
+		kernelID, c.remoteReceivers, c.SenderIDs, c.ReceiverIDs)
+
 		// 创建一个频道更新控制消息
 		msg := ControlMessage{
 			MessageType: "channel_update",
@@ -2365,7 +2647,15 @@ func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
 // handleChannelUpdate 处理从远程内核接收的频道更新消息
 func (c *Channel) handleChannelUpdate(update *ChannelUpdateMessage) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+
+	log.Printf("🔍 DEBUG handleChannelUpdate: received update, SenderIDs=%v, ReceiverIDs=%v, remoteReceivers before=%v",
+		update.SenderIDs, update.ReceiverIDs, c.remoteReceivers)
+
+	// Snapshot old receiver set to detect newly added local receivers
+	oldReceiversSet := make(map[string]bool, len(c.ReceiverIDs))
+	for _, id := range c.ReceiverIDs {
+		oldReceiversSet[id] = true
+	}
 
 	// 更新发送方列表
 	c.SenderIDs = update.SenderIDs
@@ -2376,8 +2666,69 @@ func (c *Channel) handleChannelUpdate(update *ChannelUpdateMessage) {
 		c.Status = ChannelStatus(update.Status)
 	}
 
+	// 更新 remoteReceivers 映射（确保数据能正确转发）
+	// 从 SenderIDs 中提取远端发送者
+	for _, senderID := range c.SenderIDs {
+		if strings.Contains(senderID, ":") {
+			parts := strings.SplitN(senderID, ":", 2)
+			kernelID := parts[0]
+			connectorID := parts[1]
+			// 更新映射（无论是否本地）
+			if c.manager != nil {
+				c.remoteReceivers[connectorID] = kernelID
+			}
+		}
+	}
+	// 从 ReceiverIDs 中提取远端接收者
+	for _, receiverID := range c.ReceiverIDs {
+		if strings.Contains(receiverID, ":") {
+			parts := strings.SplitN(receiverID, ":", 2)
+			kernelID := parts[0]
+			connectorID := parts[1]
+			// 更新映射（无论是否本地）
+			if c.manager != nil {
+				c.remoteReceivers[connectorID] = kernelID
+			}
+		}
+	}
+
 	log.Printf("✓ Channel %s updated: senders=%v, receivers=%v, status=%s",
 		c.ChannelID, c.SenderIDs, c.ReceiverIDs, c.Status)
+
+	// Collect newly added local receivers so the server layer can notify them.
+	currentKernelID := ""
+	if c.manager != nil {
+		currentKernelID = c.manager.kernelID
+	}
+	var addedLocalReceivers []string
+	for _, receiverID := range c.ReceiverIDs {
+		if oldReceiversSet[receiverID] {
+			continue // already existed
+		}
+		// Determine whether this receiver belongs to the local kernel
+		connID := receiverID
+		isLocal := true
+		if strings.Contains(receiverID, ":") {
+			parts := strings.SplitN(receiverID, ":", 2)
+			if parts[0] != currentKernelID {
+				isLocal = false
+			} else {
+				connID = parts[1]
+			}
+		}
+		if isLocal {
+			addedLocalReceivers = append(addedLocalReceivers, connID)
+		}
+	}
+
+	channelID := c.ChannelID
+	manager := c.manager
+
+	c.mu.Unlock() // unlock before goroutine to avoid holding lock during callbacks
+
+	if manager != nil && manager.notifyAfterChannelUpdate != nil && len(addedLocalReceivers) > 0 {
+		go manager.notifyAfterChannelUpdate(channelID, addedLocalReceivers)
+	}
 }
 
 // broadcastChannelProposal 在统一频道中广播频道提议
