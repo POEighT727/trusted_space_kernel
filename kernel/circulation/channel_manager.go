@@ -1986,9 +1986,16 @@ func (c *Channel) ApproveChannelSubscription(approverID, requestID string) (stri
 				break
 			}
 		}
-		if !isSender {
-			c.SenderIDs = append(c.SenderIDs, senderID)
+		if isSender {
+			return "", fmt.Errorf("connector %s is already a sender", senderID)
 		}
+		// 检查是否已经是接收者（禁止双向身份）
+		for _, receiver := range c.ReceiverIDs {
+			if receiver == senderID {
+				return "", fmt.Errorf("connector %s is already a receiver, cannot add as sender", senderID)
+			}
+		}
+		c.SenderIDs = append(c.SenderIDs, senderID)
 	case "add_receiver":
 		// 使用 RequesterID 来获取带内核前缀的接收者ID（如果来自远程内核）
 		receiverID := request.TargetID
@@ -2006,9 +2013,16 @@ func (c *Channel) ApproveChannelSubscription(approverID, requestID string) (stri
 				break
 			}
 		}
-		if !isReceiver {
-			c.ReceiverIDs = append(c.ReceiverIDs, receiverID)
+		if isReceiver {
+			return "", fmt.Errorf("connector %s is already a receiver", receiverID)
 		}
+		// 检查是否已经是发送者（禁止双向身份）
+		for _, sender := range c.SenderIDs {
+			if sender == receiverID {
+				return "", fmt.Errorf("connector %s is already a sender, cannot add as receiver", receiverID)
+			}
+		}
+		c.ReceiverIDs = append(c.ReceiverIDs, receiverID)
 	default:
 		return "", fmt.Errorf("invalid change type for subscription: %s", request.ChangeType)
 	}
@@ -2096,9 +2110,17 @@ func (c *Channel) RequestPermissionChange(requesterID, changeType, targetID, rea
 		if c.CanSend(targetID) {
 			return nil, fmt.Errorf("target is already a sender")
 		}
+		// 检查是否已经是接收者（禁止双向身份）
+		if c.CanReceive(targetID) {
+			return nil, fmt.Errorf("target is already a receiver, cannot add as sender")
+		}
 	case "add_receiver":
 		if c.CanReceive(targetID) {
 			return nil, fmt.Errorf("target is already a receiver")
+		}
+		// 检查是否已经是发送者（禁止双向身份）
+		if c.CanSend(targetID) {
+			return nil, fmt.Errorf("target is already a sender, cannot add as receiver")
 		}
 	case "remove_sender":
 		if !c.CanSend(targetID) {
@@ -2204,6 +2226,12 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 			senderKernelID = c.manager.kernelID
 			senderID = senderKernelID + ":" + request.TargetID
 		}
+		// 检查是否已经是接收者（禁止双向身份）
+		for _, receiver := range c.ReceiverIDs {
+			if receiver == senderID {
+				return fmt.Errorf("connector %s is already a receiver, cannot add as sender", senderID)
+			}
+		}
 		c.SenderIDs = append(c.SenderIDs, senderID)
 
 		// 关键修复：无论发送者是否属于本地内核，都需要更新 remoteReceivers
@@ -2256,6 +2284,12 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 			// 请求者是本地内核的连接器，使用当前内核ID
 			receiverKernelID = c.manager.kernelID
 			receiverID = receiverKernelID + ":" + request.TargetID
+		}
+		// 检查是否已经是发送者（禁止双向身份）
+		for _, sender := range c.SenderIDs {
+			if sender == receiverID {
+				return fmt.Errorf("connector %s is already a sender, cannot add as receiver", receiverID)
+			}
 		}
 		c.ReceiverIDs = append(c.ReceiverIDs, receiverID)
 
@@ -2415,6 +2449,24 @@ func (c *Channel) StorePermissionRequestFromRemote(permReq *PermissionRequestMes
 	for _, req := range c.permissionRequests {
 		if req.RequestID == permReq.RequestID {
 			log.Printf("ℹ️ Permission request %s already exists locally, skipping", permReq.RequestID)
+			return
+		}
+	}
+
+	// 验证权限变更请求
+	// 检查是否已经有双向身份（禁止将接收方添加为发送方或将发送方添加为接收方）
+	targetID := permReq.TargetID
+	switch permReq.ChangeType {
+	case "add_sender":
+		// 检查是否已经是接收者（禁止双向身份）
+		if c.CanReceive(targetID) {
+			log.Printf("✗ Rejecting permission request: target %s is already a receiver, cannot add as sender", targetID)
+			return
+		}
+	case "add_receiver":
+		// 检查是否已经是发送者（禁止双向身份）
+		if c.CanSend(targetID) {
+			log.Printf("✗ Rejecting permission request: target %s is already a sender, cannot add as receiver", targetID)
 			return
 		}
 	}
