@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,6 +15,7 @@ import (
 	pb "github.com/trusted-space/kernel/proto/kernel/v1"
 	"github.com/trusted-space/kernel/kernel/circulation"
 	"github.com/trusted-space/kernel/kernel/control"
+	"github.com/trusted-space/kernel/kernel/evidence"
 )
 
 // KernelServiceServer 内核服务服务器
@@ -23,25 +26,27 @@ type KernelServiceServer struct {
 	channelManager     *circulation.ChannelManager
 	registry           *control.Registry
 	notificationManager *NotificationManager
+	auditLog           *evidence.AuditLog
 }
 
 // NewKernelServiceServer 创建内核服务服务器
 func NewKernelServiceServer(multiKernelManager *MultiKernelManager,
-	channelManager *circulation.ChannelManager, registry *control.Registry, notificationManager *NotificationManager) *KernelServiceServer {
+	channelManager *circulation.ChannelManager, registry *control.Registry, notificationManager *NotificationManager, auditLog *evidence.AuditLog) *KernelServiceServer {
 
 	return &KernelServiceServer{
 		multiKernelManager:  multiKernelManager,
 		channelManager:      channelManager,
 		registry:            registry,
 		notificationManager: notificationManager,
+		auditLog:            auditLog,
 	}
 }
 
 // RegisterKernel 注册内核
 func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.RegisterKernelRequest) (*pb.RegisterKernelResponse, error) {
-	// 避免在 interconnect 协商路径产生重复日志：当请求带有 interconnect_request 或 interconnect_approve 时，
+	// 避免在 interconnect 协商路径产生重复日志：当请求带有 is_interconnect_request 或 is_interconnect_approve 时，
 	// 后续分支会产生更有意义的日志，所以这里跳过初始注册日志以减少噪音。
-	if md := req.GetMetadata(); md == nil || (md["interconnect_request"] != "true" && md["interconnect_approve"] != "true") {
+	if !req.IsInterconnectRequest && !req.IsInterconnectApprove {
 		log.Printf("Kernel %s registering from %s:%d", req.KernelId, req.Address, req.Port)
 	}
 
@@ -78,100 +83,120 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 	}
 
 	// 如果这是一个互联批准（interconnect_approve），直接完成注册（由目标发起approve时调用）
-	if md := req.GetMetadata(); md != nil {
-		if v, ok := md["interconnect_approve"]; ok && (v == "true" || v == "1") {
-			// 保存对方的CA证书（如果提供）
-			if len(req.CaCertificate) > 0 {
-				peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", req.KernelId)
-				if err := os.WriteFile(peerCACertPath, req.CaCertificate, 0644); err != nil {
-					log.Printf("Warning: failed to save peer CA certificate for %s: %v", req.KernelId, err)
-				} else {
-					// suppressed detailed CA saved log
-				}
-			}
-
-			// 创建内核信息并保存（直接认为已注册）
-			kernelInfo := &KernelInfo{
-				KernelID:      req.KernelId,
-				Address:       req.Address,
-				Port:          int(req.Port),
-				MainPort:      int(req.Port),
-				Status:        "active",
-				LastHeartbeat: time.Now().Unix(),
-				PublicKey:     req.PublicKey,
-				Description:   "",
-			}
-			s.multiKernelManager.kernelsMu.Lock()
-			s.multiKernelManager.kernels[req.KernelId] = kernelInfo
-			log.Printf("✓ Saved kernel %s to kernels map (via approve)", req.KernelId)
-			s.multiKernelManager.kernelsMu.Unlock()
-
-			// 重要：同步创建到新注册内核的客户端连接（用于后续 ForwardData 和通知转发）
-			targetPort := int(req.Port) + 2 // kernel-to-kernel 端口 = 主端口 + 2
-			log.Printf("🔧 Creating client for approved kernel %s at %s:%d", req.KernelId, req.Address, targetPort)
-			if err := s.multiKernelManager.createKernelClient(req.KernelId, req.Address, targetPort); err != nil {
-				log.Printf("⚠ Failed to create client for approved kernel %s: %v", req.KernelId, err)
+	if req.IsInterconnectApprove {
+		// 保存对方的CA证书（如果提供）
+		if len(req.CaCertificate) > 0 {
+			peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", req.KernelId)
+			if err := os.WriteFile(peerCACertPath, req.CaCertificate, 0644); err != nil {
+				log.Printf("Warning: failed to save peer CA certificate for %s: %v", req.KernelId, err)
 			} else {
-				log.Printf("✓ Client connection established for approved kernel %s", req.KernelId)
+				// suppressed detailed CA saved log
 			}
-
-			// 广播本内核已知的其他内核给新注册的内核
-			go s.multiKernelManager.BroadcastKnownKernels(req.KernelId)
-
-			ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
-			if err != nil {
-				ownCACertData = nil
-			}
-
-			log.Printf("Kernel %s registered via approve by peer", req.KernelId)
-			return &pb.RegisterKernelResponse{
-				Success:           true,
-				Message:           "kernel registered via approve",
-				SessionToken:      fmt.Sprintf("session_%s_%d", req.KernelId, time.Now().Unix()),
-				PeerCaCertificate: ownCACertData,
-				KnownKernels:      []*pb.KernelInfo{},
-			}, nil
 		}
+
+		// 创建内核信息并保存（直接认为已注册）
+		kernelInfo := &KernelInfo{
+			KernelID:      req.KernelId,
+			Address:       req.Address,
+			Port:          int(req.Port),
+			MainPort:      int(req.Port),
+			Status:        "active",
+			LastHeartbeat: time.Now().Unix(),
+			PublicKey:     req.PublicKey,
+			Description:   "",
+		}
+		s.multiKernelManager.kernelsMu.Lock()
+		s.multiKernelManager.kernels[req.KernelId] = kernelInfo
+		log.Printf("✓ Saved kernel %s to kernels map (via approve)", req.KernelId)
+		s.multiKernelManager.kernelsMu.Unlock()
+
+		// 重要：同步创建到新注册内核的客户端连接（用于后续 ForwardData 和通知转发）
+		targetPort := int(req.Port) + 2 // kernel-to-kernel 端口 = 主端口 + 2
+		log.Printf("🔧 Creating client for approved kernel %s at %s:%d", req.KernelId, req.Address, targetPort)
+		if err := s.multiKernelManager.createKernelClient(req.KernelId, req.Address, targetPort); err != nil {
+			log.Printf("⚠ Failed to create client for approved kernel %s: %v", req.KernelId, err)
+		} else {
+			log.Printf("✓ Client connection established for approved kernel %s", req.KernelId)
+		}
+
+		// 广播本内核已知的其他内核给新注册的内核
+		go s.multiKernelManager.BroadcastKnownKernels(req.KernelId)
+
+		// 记录互联批准存证
+		if s.auditLog != nil {
+			s.auditLog.SubmitBasicEvidence(
+				s.multiKernelManager.config.KernelID,
+				evidence.EventTypeInterconnectApproved,
+				"",
+				"",
+				evidence.DirectionIncoming,
+				req.KernelId,
+			)
+		}
+
+		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
+		if err != nil {
+			ownCACertData = nil
+		}
+
+		log.Printf("Kernel %s registered via approve by peer", req.KernelId)
+		return &pb.RegisterKernelResponse{
+			Success:           true,
+			Message:           "kernel registered via approve",
+			SessionToken:      fmt.Sprintf("session_%s_%d", req.KernelId, time.Now().Unix()),
+			PeerCaCertificate: ownCACertData,
+			KnownKernels:      []*pb.KernelInfo{},
+		}, nil
 	}
 
 	// 如果这是一个互联请求（由发起方主动发起），则创建一个待审批请求并返回 request id
-	if md := req.GetMetadata(); md != nil {
-		if v, ok := md["interconnect_request"]; ok && (v == "true" || v == "1") {
-			// 使用 UUID 生成 request id
-			requestID := uuid.New().String()
+	if req.IsInterconnectRequest {
+		// 使用 UUID 生成 request id
+		requestID := uuid.New().String()
 
-			// 记录请求方的主端口和内核通信端口（假定 kernel_port = main_port + 2）
-			mainPort := int(req.Port)
-			kernelPort := mainPort + 2
-			pending := &PendingInterconnectRequest{
-				RequestID:         requestID,
-				RequesterKernelID: req.KernelId,
-				Address:           req.Address,
-				MainPort:          mainPort,
-				KernelPort:        kernelPort,
-				CaCertificate:     req.CaCertificate,
-				Timestamp:         req.Timestamp,
-				Status:            "pending",
-			}
-			// add to pending list
-			s.multiKernelManager.AddPendingRequest(pending)
-
-			// 尝试读取自己的 CA 证书返回给对端（方便对端保存）
-			ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
-			if err != nil {
-				ownCACertData = nil
-			}
-
-			log.Printf("Saved interconnect request %s from kernel %s", requestID, req.KernelId)
-
-			return &pb.RegisterKernelResponse{
-				Success:           true,
-				Message:           fmt.Sprintf("interconnect_request_id:%s;status:pending", requestID),
-				SessionToken:      "", // not a session yet
-				PeerCaCertificate: ownCACertData,
-				KnownKernels:      []*pb.KernelInfo{}, // not registering yet
-			}, nil
+		// 记录请求方的主端口和内核通信端口（假定 kernel_port = main_port + 2）
+		mainPort := int(req.Port)
+		kernelPort := mainPort + 2
+		pending := &PendingInterconnectRequest{
+			RequestID:         requestID,
+			RequesterKernelID: req.KernelId,
+			Address:           req.Address,
+			MainPort:          mainPort,
+			KernelPort:        kernelPort,
+			CaCertificate:     req.CaCertificate,
+			Timestamp:         req.Timestamp,
+			Status:            "pending",
 		}
+		// add to pending list
+		s.multiKernelManager.AddPendingRequest(pending)
+
+		// 记录互联请求存证
+		if s.auditLog != nil {
+			s.auditLog.SubmitBasicEvidence(
+				req.KernelId,
+				evidence.EventTypeInterconnectRequested,
+				"", // 无频道ID
+				requestID,
+				evidence.DirectionIncoming,
+				s.multiKernelManager.config.KernelID,
+			)
+		}
+
+		// 尝试读取自己的 CA 证书返回给对端（方便对端保存）
+		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
+		if err != nil {
+			ownCACertData = nil
+		}
+
+		log.Printf("Saved interconnect request %s from kernel %s", requestID, req.KernelId)
+
+		return &pb.RegisterKernelResponse{
+			Success:           true,
+			Message:           fmt.Sprintf("interconnect_request_id:%s;status:pending", requestID),
+			SessionToken:      "", // not a session yet
+			PeerCaCertificate: ownCACertData,
+			KnownKernels:      []*pb.KernelInfo{}, // not registering yet
+		}, nil
 	}
 
 	// 保存对方的CA证书（如果提供）
@@ -455,17 +480,14 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 			}
 		}
 
-		// 转换存证配置（如果有）用于本地提议
+		// 转换存证配置（如果有）用于本地提议（仅支持内核内置存证）
 		var evConfig *circulation.EvidenceConfig
 		if req.EvidenceConfig != nil {
 			evConfig = &circulation.EvidenceConfig{
-				Mode:           circulation.EvidenceMode(req.EvidenceConfig.Mode),
-				Strategy:       circulation.EvidenceStrategy(req.EvidenceConfig.Strategy),
-				ConnectorID:    req.EvidenceConfig.ConnectorId,
-				BackupEnabled:  req.EvidenceConfig.BackupEnabled,
-				RetentionDays:  int(req.EvidenceConfig.RetentionDays),
-				CompressData:   req.EvidenceConfig.CompressData,
-				CustomSettings: req.EvidenceConfig.CustomSettings,
+				Mode:          circulation.EvidenceMode(req.EvidenceConfig.Mode),
+				Strategy:      circulation.EvidenceStrategy(req.EvidenceConfig.Strategy),
+				RetentionDays: int(req.EvidenceConfig.RetentionDays),
+				CompressData:  req.EvidenceConfig.CompressData,
 			}
 		}
 
@@ -603,34 +625,14 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 		}
 	}
 
-	// 将 proto EvidenceConfig 转换为内部 circulation.EvidenceConfig（如果有）
+	// 将 proto EvidenceConfig 转换为内部 circulation.EvidenceConfig（仅支持内核内置存证）
 	var evConfig *circulation.EvidenceConfig
 	if req.EvidenceConfig != nil {
 		evConfig = &circulation.EvidenceConfig{
-			Mode:           circulation.EvidenceMode(req.EvidenceConfig.Mode),
-			Strategy:       circulation.EvidenceStrategy(req.EvidenceConfig.Strategy),
-			ConnectorID:    req.EvidenceConfig.ConnectorId,
-			BackupEnabled:  req.EvidenceConfig.BackupEnabled,
-			RetentionDays:  int(req.EvidenceConfig.RetentionDays),
-			CompressData:   req.EvidenceConfig.CompressData,
-			CustomSettings: req.EvidenceConfig.CustomSettings,
-		}
-	}
-
-	// 如果配置了外部存证连接器，将其添加到接收方列表
-	if evConfig != nil && evConfig.ConnectorID != "" {
-		externalEvidenceID := evConfig.ConnectorID
-		// 检查是否已存在
-		exists := false
-		for _, id := range receiverIDs {
-			if id == externalEvidenceID {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			log.Printf("Adding external evidence connector %s to receiver list", externalEvidenceID)
-			receiverIDs = append(receiverIDs, externalEvidenceID)
+			Mode:          circulation.EvidenceMode(req.EvidenceConfig.Mode),
+			Strategy:      circulation.EvidenceStrategy(req.EvidenceConfig.Strategy),
+			RetentionDays: int(req.EvidenceConfig.RetentionDays),
+			CompressData:  req.EvidenceConfig.CompressData,
 		}
 	}
 
@@ -697,29 +699,6 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 		for _, p := range req.ReceiverIds {
 			if p.KernelId == rk && p.ConnectorId != "" {
 				targetConnectorIDs = append(targetConnectorIDs, p.ConnectorId)
-			}
-		}
-
-		// 检查外部存证连接器是否在该远端内核上
-		if evConfig != nil && evConfig.ConnectorID != "" {
-			if strings.Contains(evConfig.ConnectorID, ":") {
-				parts := strings.SplitN(evConfig.ConnectorID, ":", 2)
-				evidenceKernelID := parts[0]
-				evidenceConnectorID := parts[1]
-				if evidenceKernelID == rk {
-					// 检查是否已存在
-					exists := false
-					for _, id := range targetConnectorIDs {
-						if id == evidenceConnectorID {
-							exists = true
-							break
-						}
-					}
-					if !exists {
-						log.Printf("Adding external evidence connector %s to remote kernel notification", evConfig.ConnectorID)
-						targetConnectorIDs = append(targetConnectorIDs, evidenceConnectorID)
-					}
-				}
 			}
 		}
 
@@ -818,6 +797,67 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 	}
 
 	log.Printf("Data forwarded from kernel %s to channel %s", req.SourceKernelId, req.ChannelId)
+
+	// 记录存证：kernel-1 -> kernel-2 (DATA_RECEIVE)
+	// 用于记录数据从远程内核到达当前内核
+	if s.auditLog != nil {
+		// 获取当前内核ID
+		currentKernelID := ""
+		if s.multiKernelManager != nil && s.multiKernelManager.config != nil {
+			currentKernelID = s.multiKernelManager.config.KernelID
+		}
+
+		// 计算数据哈希
+		dataHash := ""
+		if len(req.DataPacket.Payload) > 0 {
+			hash := sha256.Sum256(req.DataPacket.Payload)
+			dataHash = hex.EncodeToString(hash[:])
+		}
+
+		// 记录存证：kernel-1 -> kernel-2 (DATA_RECEIVE)
+		// 数据从 kernel-1 转发到 kernel-2，从 kernel-2 角度是接收数据
+		s.auditLog.SubmitBasicEvidence(
+			req.SourceKernelId, // source: kernel-1 (发送方)
+			evidence.EventTypeDataReceive,
+			req.ChannelId,
+			dataHash,
+			evidence.DirectionInternal,
+			currentKernelID, // target: kernel-2 (接收方内核)
+		)
+
+		// 记录存证：kernel-2 -> connector-U (DATA_RECEIVE)
+		// 与频道接收方连接器相关，记 DATA_RECEIVE
+		// 查找本地接收者
+		for _, receiverID := range channel.ReceiverIDs {
+			// 跳过远程接收者（格式为 other-kernel:connector）
+			if strings.Contains(receiverID, ":") {
+				// 检查是否是远程内核的接收者
+				parts := strings.SplitN(receiverID, ":", 2)
+				if len(parts) >= 2 && parts[0] != currentKernelID {
+					continue // 远程接收者，跳过
+				}
+				// 如果是 currentKernelID:connector 格式，说明是本地接收者
+				// receiverID 就是 connectorID
+			}
+			// 本地接收者
+			targetConnectorID := receiverID
+			if strings.Contains(receiverID, ":") {
+				// 本地格式为 kernelID:connectorID，提取 connectorID
+				parts := strings.SplitN(receiverID, ":", 2)
+				targetConnectorID = parts[1]
+			}
+			if _, err := s.auditLog.SubmitBasicEvidence(
+				currentKernelID, // source: kernel-2
+				evidence.EventTypeDataReceive,
+				req.ChannelId,
+				dataHash,
+				evidence.DirectionInternal,
+				targetConnectorID, // target: connector-U (接收方连接器)
+			); err != nil {
+				log.Printf("⚠ Failed to submit kernel->connector DATA_SEND evidence: %v", err)
+			}
+		}
+	}
 
 	return &pb.ForwardDataResponse{
 		Success:          true,

@@ -96,7 +96,7 @@
 - **协商机制**：支持两阶段频道创建（提议-确认）
 - **跨内核频道**：支持跨内核的频道创建和数据转发
 
-### 4. 存证溯源模块 (Evidence)
+### 4溯源模块 (. 存证Evidence)
 
 采用**时间戳排序的哈希链记录**方式：
 
@@ -113,6 +113,78 @@
 - **直接连接**：内核间直接建立 gRPC 连接（50053 端口）
 - **多跳路由**：支持配置多跳路由链路
 - **心跳维护**：60 秒心跳间隔检测连接状态
+
+---
+
+## 事件类型详解
+
+系统支持以下主要事件类型，用于记录数据流转的完整生命周期：
+
+### 认证相关事件
+| 事件类型 | 说明 |
+|---------|------|
+| AUTH_SUCCESS | 连接器认证成功 |
+| AUTH_FAILED | 连接器认证失败 |
+| AUTH_TIMEOUT | 认证超时 |
+
+### 互联相关事件
+| 事件类型 | 说明 |
+|---------|------|
+| INTERCONNECT_REQUESTED | 发起内核互联请求 |
+| INTERCONNECT_APPROVED | 互联请求已批准 |
+| INTERCONNECT_REJECTED | 互联请求被拒绝 |
+| INTERCONNECT_CLOSED | 互联连接已关闭 |
+
+### 频道管理事件
+| 事件类型 | 说明 |
+|---------|------|
+| CHANNEL_PROPOSED | 频道提议创建 |
+| CHANNEL_ACCEPTED | 频道提议已接受 |
+| CHANNEL_REJECTED | 频道提议被拒绝 |
+| CHANNEL_CREATED | 频道已正式创建 |
+| CHANNEL_CLOSED | 频道已关闭 |
+| CHANNEL_SUBSCRIBED | 订阅频道 |
+| CHANNEL_UNSUBSCRIBED | 取消订阅 |
+
+### 数据传输事件
+| 事件类型 | 说明 |
+|---------|------|
+| DATA_SEND | 数据发送（connector→kernel 或 kernel→kernel） |
+| DATA_RECEIVE | 数据接收（kernel→connector 或 kernel→kernel） |
+
+### 权限管理事件
+| 事件类型 | 说明 |
+|---------|------|
+| PERMISSION_REQUESTED | 权限变更请求 |
+| PERMISSION_GRANTED | 权限已授予 |
+| PERMISSION_REJECTED | 权限被拒绝 |
+| PERMISSION_REVOKED | 权限已撤销 |
+
+---
+
+## 典型数据流转场景
+
+### 场景一：单内核内数据传输
+
+```
+connector-A ──────► kernel-1 ──────► connector-B
+
+产生存证记录：
+1. DATA_SEND: connector-A → kernel-1
+2. DATA_RECEIVE: kernel-1 → connector-B
+```
+
+### 场景二：跨内核数据传输（两跳）
+
+```
+connector-A ──► kernel-1 ──► kernel-2 ──► connector-U
+
+产生存证记录：
+1. DATA_SEND: connector-A → kernel-1         (本地发送)
+2. DATA_SEND: kernel-1 → kernel-2           (跨内核转发)
+3. DATA_RECEIVE: kernel-1 → kernel-2        (到达目标内核)
+4. DATA_RECEIVE: kernel-2 → connector-U     (分发到接收者)
+```
 
 ---
 
@@ -195,6 +267,7 @@ trusted_space_kernel/
 ### 环境要求
 
 - **Go**: 1.21 或更高版本
+- **数据库**: MySQL 5.7+ (可选，默认使用文件存储)
 - **操作系统**: Linux / macOS / Windows
 
 ### 1. 生成证书
@@ -207,7 +280,17 @@ trusted_space_kernel/
 .\scripts\gen_certs.ps1
 ```
 
-### 2. 启动内核
+### 2. 配置数据库（可选）
+
+如果使用 MySQL 存储存证记录，需要先创建数据库：
+
+```sql
+CREATE DATABASE IF NOT EXISTS trusted_space CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+然后修改配置文件 `config/kernel.yaml` 中的数据库配置。
+
+### 3. 启动内核
 
 ```bash
 # 交互模式（推荐）
@@ -217,7 +300,7 @@ trusted_space_kernel/
 ./bin/kernel.exe --config config/kernel.yaml -daemon
 ```
 
-### 3. 启动连接器
+### 4. 启动连接器
 
 ```bash
 # 首次启动会自动注册并获取证书
@@ -226,9 +309,11 @@ trusted_space_kernel/
 
 ---
 
-## 使用指南
+## 交互命令详解
 
 ### 内核管理命令
+
+在启动内核的终端中，可以使用以下命令：
 
 ```bash
 # 查看状态
@@ -245,6 +330,7 @@ kernels 或 ks
 
 # 连接到其他内核
 connect-kernel <kernel_id> <address> <port>
+# 示例: connect-kernel kernel-2 192.168.202.136 50053
 
 # 批准互联请求
 approve-request <request_id>
@@ -267,8 +353,10 @@ exit 或 quit
 
 ### 连接器命令
 
+在启动连接器的终端中，可以使用以下命令：
+
 ```bash
-# 列出连接器
+# 查看已连接的连接器
 list 或 ls
 
 # 查看连接器信息
@@ -286,6 +374,8 @@ reject <channel_id> <proposal_id> --reason <reason>
 
 # 发送数据
 sendto <channel_id> [file_path]
+# 示例: sendto <channel-id>
+#       (输入数据，回车发送，输入 END 结束)
 
 # 订阅频道
 subscribe <channel_id>
@@ -306,7 +396,113 @@ list-permissions <channel_id>
 
 # 设置状态
 status [active|inactive|closed]
+
+# 帮助
+help
 ```
+
+---
+
+## 演示：跨内核数据传输
+
+以下是一个完整的跨内核数据传输演示流程：
+
+### 1. 环境准备
+
+```
+┌─────────────────────┐          ┌─────────────────────┐
+│   kernel-1          │          │   kernel-2          │
+│   192.168.31.155    │◄────────►│   192.168.202.136  │
+│   (Windows)         │   mTLS   │   (Linux VM)       │
+└─────────┬───────────┘          └─────────┬───────────┘
+          │                              │
+    connector-A                    connector-U
+```
+
+### 2. 启动服务
+
+```bash
+# 在 kernel-1 (Windows) 启动内核
+.\bin\kernel.exe --config .\config\kernel.yaml
+
+# 在 kernel-2 (Linux) 启动内核
+./bin/kernel.exe --config config/kernel.yaml
+```
+
+### 3. 建立内核互联
+
+```bash
+# 在 kernel-1 上执行
+connect-kernel kernel-2 192.168.202.136 50053
+
+# 在 kernel-2 上执行
+approve-request <request_id>
+# 示例: approve-request ab29212c-35de-4a4f-9c65-09bae93c78d9
+```
+
+### 4. 连接器加入
+
+```bash
+# 在 kernel-1 上启动 connector-A
+.\bin\connector.exe --config .\config\connector-A.yaml
+
+# 在 kernel-2 上启动 connector-U
+./bin/connector.exe --config config/connector-U.yaml
+```
+
+### 5. 创建跨内核频道
+
+```bash
+# 在 connector-A 上创建频道
+create --sender connector-A --receiver kernel-2:connector-U --reason "测试数据传输"
+
+# 在 connector-U 上接受频道
+accept <channel_id> <proposal_id>
+# 示例: accept 296bf273-e720-4930-b52a-b3867621897d 024cd002-5329-496c-9ca4-30701ca8847f
+```
+
+### 6. 发送数据
+
+```bash
+# 在 connector-A 上发送数据
+sendto <channel_id>
+# 输入数据内容
+# 输入 END 结束发送
+```
+
+### 7. 查看存证记录
+
+```bash
+# 在内核上查询
+query-evidence --channel <channel_id>
+```
+
+---
+
+## 存证记录示例
+
+当 connector-A 通过跨内核频道向 connector-U 发送 "hello" 数据时，会产生以下存证记录：
+
+### kernel-1 存证记录
+
+| 事件类型 | source_id | target_id | 说明 |
+|---------|-----------|-----------|------|
+| AUTH_SUCCESS | connector-A | kernel-1 | 连接器认证成功 |
+| INTERCONNECT_REQUESTED | kernel-1 | kernel-2 | 发起内核互联 |
+| CHANNEL_CREATED | kernel-1 | kernel-1 | 频道创建成功 |
+| DATA_SEND | connector-A | kernel-1 | connector-A 发送数据到内核 |
+| DATA_SEND | kernel-1 | kernel-2 | 内核转发到目标内核 |
+| DATA_SEND | kernel-1 | kernel-2 | 转发完成确认（带 data_hash） |
+
+### kernel-2 存证记录
+
+| 事件类型 | source_id | target_id | 说明 |
+|---------|-----------|-----------|------|
+| AUTH_SUCCESS | connector-U | kernel-2 | 连接器认证成功 |
+| INTERCONNECT_APPROVED | kernel-2 | kernel-1 | 互联请求已批准 |
+| CHANNEL_CREATED | kernel-2 | kernel-2 | 频道创建成功 |
+| DATA_RECEIVE | kernel-1 | kernel-2 | 接收来自 kernel-1 的数据 |
+| DATA_RECEIVE | kernel-2 | connector-U | 分发给目标连接器 |
 
 ---
 
@@ -335,17 +531,17 @@ service ChannelService {
   rpc SubscribeData(SubscribeRequest) returns (stream DataPacket);
   rpc CloseChannel(CloseChannelRequest) returns (CloseChannelResponse);
   rpc GetChannelInfo(GetChannelInfoRequest) returns (GetChannelInfoResponse);
-  
+
   // 协商相关
   rpc ProposeChannel(ProposeChannelRequest) returns (ProposeChannelResponse);
   rpc AcceptChannelProposal(AcceptChannelProposalRequest) returns (AcceptChannelProposalResponse);
   rpc RejectChannelProposal(RejectChannelProposalRequest) returns (RejectChannelProposalResponse);
-  
+
   // 订阅申请
   rpc RequestChannelSubscription(RequestChannelSubscriptionRequest) returns (RequestChannelSubscriptionResponse);
   rpc ApproveChannelSubscription(ApproveChannelSubscriptionRequest) returns (ApproveChannelSubscriptionResponse);
   rpc RejectChannelSubscription(RejectChannelSubscriptionRequest) returns (RejectChannelSubscriptionResponse);
-  
+
   // 权限变更
   rpc RequestPermissionChange(RequestPermissionChangeRequest) returns (RequestPermissionChangeResponse);
   rpc ApprovePermissionChange(ApprovePermissionChangeRequest) returns (ApprovePermissionChangeResponse);
@@ -400,14 +596,14 @@ service KernelService {
 ┌─────────────────────────────────────────────────────────────┐
 │                    多内核互联网络                             │
 │                                                             │
-│    ┌──────────┐         ┌──────────┐         ┌──────────┐ │
-│    │ kernel-1 │◄───────►│ kernel-2 │◄───────►│ kernel-3 │ │
-│    └────┬─────┘         └────┬─────┘         └────┬─────┘ │
-│         │                    │                    │       │
-│         │  ┌─────────────────┼──────────────────┐ │       │
-│         └─►│   内核发现与同步  │◄─────────────────┘ │       │
-│            │  (SyncKnownKernels)│                  │       │
-│            └─────────────────┴──────────────────┘ │       │
+│    ┌──────────┐         ┌──────────┐         ┌──────────┐    │
+│    │ kernel-1 │◄───────►│ kernel-2 │◄───────►│ kernel-3 │    │
+│    └────┬─────┘         └────┬─────┘         └────┬─────┘    │
+│         │                    │                    │          │
+│         │  ┌─────────────────┼──────────────────┐ │          │
+│         └─►│   内核发现与同步  │◄─────────────────┘ │          │
+│            │  (SyncKnownKernels)│                  │          │
+│            └─────────────────┴──────────────────┘ │          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -420,6 +616,8 @@ service KernelService {
 ---
 
 ## 数据流通流程
+
+### 单内核流程
 
 ```
 发送方连接器          内核            接收方连接器
@@ -450,6 +648,33 @@ service KernelService {
      │                 ├──────────────────>│
 ```
 
+### 跨内核流程
+
+```
+connector-A        kernel-1            kernel-2         connector-U
+    │                 │                    │                 │
+    │ ProposeChannel  │                    │                 │
+    ├────────────────>│                    │                 │
+    │                 │ 创建跨内核频道       │                 │
+    │                 ├───────────────────>│                 │
+    │                 │                    │ 通知接收方       │
+    │                 │                    ├────────────────>│
+    │                 │                    │                 │
+    │                 │              AcceptChannelProposal  │
+    │                 │<────────────────────────────────────┤
+    │                 │                    │                 │
+    │                 │ ChannelCreated     │                 │
+    │<────────────────┤<───────────────────│                 │
+    │                 │                    │                 │
+    │ StreamData      │                    │                 │
+    ├────────────────>│                    │                 │
+    │                 │ ForwardData        │                 │
+    │                 ├───────────────────>│                 │
+    │                 │                    │ PushData        │
+    │                 │                    ├────────────────>│
+    │                 │                    │                 │
+```
+
 ---
 
 ## 存证溯源机制
@@ -459,20 +684,40 @@ service KernelService {
 ```
 Record N:
 {
-  TxID: "uuid",
-  EventType: "TRANSFER_START",
+  EventID: "uuid",
+  EventType: "DATA_SEND",
+  SourceID: "connector-A",
+  TargetID: "kernel-1",
+  ChannelID: "channel-uuid",
   DataHash: "sha256(...)",
-  PrevHash: "hash of Record N-1",
-  RecordHash: "sha256(this record)"
+  Signature: "RSA signature",
+  Hash: "sha256(this record)",
+  PrevHash: "hash of Record N-1"
 }
     │
     ↓ 链接
 Record N+1:
 {
   PrevHash: "hash of Record N",  ← 指向前一条
-  RecordHash: "sha256(this record)"
+  Hash: "sha256(this record)"
 }
 ```
+
+### 存证字段说明
+
+| 字段 | 说明 |
+|------|------|
+| event_id | 事件唯一标识 (UUID) |
+| event_type | 事件类型 |
+| timestamp | 精确到微秒的时间戳 |
+| source_id | 事件来源（连接器或内核） |
+| target_id | 目标 ID（直接下一跳） |
+| channel_id | 关联的频道 ID |
+| data_hash | 数据哈希（可选） |
+| signature | 内核数字签名 |
+| hash | 记录内容哈希 |
+| prev_hash | 上一条记录的哈希（哈希链） |
+| metadata | 扩展元数据（JSON） |
 
 ---
 
@@ -653,6 +898,7 @@ make build
 | 证书错误 | 检查证书路径、有效期、CA 签名 |
 | 权限拒绝 | 检查 ACL 策略配置 |
 | 存证失败 | 自动降级到文件存储 |
+| 跨内核转发失败 | 重试机制，保留原始数据 |
 
 ---
 

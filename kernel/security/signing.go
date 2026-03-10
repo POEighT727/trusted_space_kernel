@@ -58,13 +58,12 @@ func GenerateEvidenceSignature(connectorID, eventType, channelID, dataHash strin
 	// 构建要签名的数据
 	data := fmt.Sprintf("%s|%s|%s|%s|%d", connectorID, eventType, channelID, dataHash, timestamp)
 
-	// 尝试加载内核的私钥（用于evidence签名）
-	// 这里我们使用CA的私钥，因为内核应该有CA的私钥
-	caKeyPath := "certs/ca.key"  // 假设CA私钥文件路径
-	log.Printf("🔍 DEBUG GenerateEvidenceSignature: loading key from %s", caKeyPath)
-	privateKey, err := LoadRSAPrivateKey(caKeyPath)
+	// 使用内核的私钥进行签名
+	kernelKeyPath := "certs/kernel.key"
+	log.Printf("🔍 DEBUG GenerateEvidenceSignature: loading key from %s", kernelKeyPath)
+	privateKey, err := LoadRSAPrivateKey(kernelKeyPath)
 	if err != nil {
-		// 如果找不到CA私钥，返回空签名（不影响主要功能）
+		// 如果找不到内核私钥，返回空签名（不影响主要功能）
 		return "", fmt.Errorf("failed to load private key for connector %s: %w", connectorID, err)
 	}
 

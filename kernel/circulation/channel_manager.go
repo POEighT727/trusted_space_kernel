@@ -61,10 +61,8 @@ type ChannelProposal struct {
 type EvidenceMode string
 
 const (
-	EvidenceModeNone         EvidenceMode = "none"         // 不进行存证
-	EvidenceModeInternal     EvidenceMode = "internal"     // 使用内核内置存证
-	EvidenceModeExternal     EvidenceMode = "external"     // 使用外部存证连接器
-	EvidenceModeHybrid       EvidenceMode = "hybrid"       // 同时使用内置和外部存证
+	EvidenceModeNone     EvidenceMode = "none"     // 不进行存证
+	EvidenceModeInternal EvidenceMode = "internal" // 使用内核内置存证
 )
 
 // EvidenceStrategy 存证策略
@@ -77,15 +75,12 @@ const (
 	EvidenceStrategyImportant EvidenceStrategy = "important" // 只存证重要消息
 )
 
-// EvidenceConfig 存证配置
+// EvidenceConfig 存证配置（内核内置）
 type EvidenceConfig struct {
-	Mode           EvidenceMode     // 存证方式
-	Strategy       EvidenceStrategy // 存证策略
-	ConnectorID    string           // 外部存证连接器ID（当Mode为external或hybrid时使用）
-	BackupEnabled  bool             // 是否启用备份存证
-	RetentionDays  int              // 存证数据保留天数
-	CompressData   bool             // 是否压缩存证数据
-	CustomSettings map[string]string // 自定义存证设置
+	Mode          EvidenceMode     // 存证方式（仅支持 none/internal）
+	Strategy      EvidenceStrategy // 存证策略
+	RetentionDays int              // 存证数据保留天数
+	CompressData bool             // 是否压缩存证数据
 }
 
 // Channel 数据传输频道（统一频道模式，支持多种消息类型）
@@ -173,18 +168,6 @@ const (
 	ConnectorStatusOffline // 离线
 )
 
-// EvidenceConnector 外部存证连接器信息
-type EvidenceConnector struct {
-	ConnectorID   string            // 连接器ID
-	Name          string            // 连接器名称
-	Description   string            // 连接器描述
-	Capabilities  []string          // 支持的存证能力
-	Status        ConnectorStatus   // 连接器状态
-	RegisteredAt  time.Time         // 注册时间
-	LastHeartbeat time.Time         // 最后心跳时间
-	Config        map[string]string // 连接器配置
-}
-
 // ChannelManager 频道管理器
 type ChannelManager struct {
 	mu                   sync.RWMutex
@@ -200,10 +183,6 @@ type ChannelManager struct {
 	connectorBuffers map[string][]*DataPacket   // 离线连接器的个人缓冲区
 	lastActivity     map[string]time.Time       // 连接器最后活动时间
 	connectorMu      sync.RWMutex               // 连接器状态的锁
-
-	// 外部存证连接器管理
-	evidenceConnectors map[string]*EvidenceConnector // 已注册的存证连接器
-	evidenceMu         sync.RWMutex                   // 存证连接器的锁
 
 	// 频道配置管理（可选，由创建者指定配置文件路径时使用）
 	configManager *ChannelConfigManager // 频道配置管理器
@@ -221,7 +200,6 @@ func NewChannelManager() *ChannelManager {
 		connectorStatus:     make(map[string]ConnectorStatus),
 		connectorBuffers:    make(map[string][]*DataPacket),
 		lastActivity:        make(map[string]time.Time),
-		evidenceConnectors:  make(map[string]*EvidenceConnector),
 	}
 }
 
@@ -430,12 +408,10 @@ func (cm *ChannelManager) SetDefaultEvidenceConfig(config *EvidenceConfig) error
 func (cm *ChannelManager) GetDefaultEvidenceConfig() *EvidenceConfig {
 	if cm.configManager == nil {
 		return &EvidenceConfig{
-			Mode:           EvidenceModeNone,
-			Strategy:       EvidenceStrategyAll,
-			BackupEnabled:  false,
-			RetentionDays:  30,
-			CompressData:   true,
-			CustomSettings: make(map[string]string),
+			Mode:          EvidenceModeNone,
+			Strategy:      EvidenceStrategyAll,
+			RetentionDays: 30,
+			CompressData:  true,
 		}
 	}
 
@@ -795,23 +771,6 @@ func (cm *ChannelManager) CreateChannelFromConfig(configFilePath string) (*Chann
 	// 验证配置
 	if config.ChannelName == "" {
 		return nil, fmt.Errorf("channel name is required in config file")
-	}
-
-	// 如果配置了外部存证，自动将外部存证连接器添加到接收方列表
-	if config.EvidenceConfig != nil && config.EvidenceConfig.Mode == EvidenceModeExternal && config.EvidenceConfig.ConnectorID != "" {
-		externalConnectorID := config.EvidenceConfig.ConnectorID
-		// 检查是否已经在接收方列表中
-		alreadyInReceivers := false
-		for _, receiverID := range config.ReceiverIDs {
-			if receiverID == externalConnectorID {
-				alreadyInReceivers = true
-				break
-			}
-		}
-		if !alreadyInReceivers {
-			config.ReceiverIDs = append(config.ReceiverIDs, externalConnectorID)
-			log.Printf("✓ 外部存证连接器 %s 已自动添加到接收方列表", externalConnectorID)
-		}
 	}
 
 	// 处理创建时间
@@ -2439,6 +2398,19 @@ func (c *Channel) GetPermissionRequests() []*PermissionChangeRequest {
 	return requests
 }
 
+// GetPermissionRequestByID 根据请求ID获取权限变更请求
+func (c *Channel) GetPermissionRequestByID(requestID string) *PermissionChangeRequest {
+	c.permissionMu.RLock()
+	defer c.permissionMu.RUnlock()
+
+	for _, req := range c.permissionRequests {
+		if req.RequestID == requestID {
+			return req
+		}
+	}
+	return nil
+}
+
 // StorePermissionRequestFromRemote 从远端内核接收并存储权限变更请求
 // 当跨内核频道中一个内核收到权限请求时，需要在本地存储以便批准者可以批准
 func (c *Channel) StorePermissionRequestFromRemote(permReq *PermissionRequestMessage, requesterID string) {
@@ -2961,162 +2933,52 @@ func (c *Channel) forwardControlMessageToRemoteKernels(packet *DataPacket) {
 // - 内核职责简化，专注核心功能
 // -----------------------------------------------------------
 
-// -----------------------------------------------------------
-// 外部存证连接器管理方法
-// -----------------------------------------------------------
+// 外部存证连接器管理方法已移除
+// 存证功能现由内核内置实现，存证方的具体功能由连接器自行扩展
 
-// RegisterEvidenceConnector 注册外部存证连接器
-func (cm *ChannelManager) RegisterEvidenceConnector(connectorID, name, description string, capabilities []string, config map[string]string) (*EvidenceConnector, error) {
-	cm.evidenceMu.Lock()
-	defer cm.evidenceMu.Unlock()
-
-	if connectorID == "" {
-		return nil, fmt.Errorf("connector ID cannot be empty")
-	}
-
-	if _, exists := cm.evidenceConnectors[connectorID]; exists {
-		return nil, fmt.Errorf("evidence connector %s already registered", connectorID)
-	}
-
-	connector := &EvidenceConnector{
-		ConnectorID:   connectorID,
-		Name:          name,
-		Description:   description,
-		Capabilities:  capabilities,
-		Status:        ConnectorStatusOnline,
-		RegisteredAt:  time.Now(),
-		LastHeartbeat: time.Now(),
-		Config:        config,
-	}
-
-	cm.evidenceConnectors[connectorID] = connector
-
-	log.Printf("✓ Evidence connector registered: %s (%s)", connectorID, name)
-	return connector, nil
+// RegisterEvidenceConnector 注册外部存证连接器（已废弃）
+// 内核不再支持外部存证连接器，存证功能由内核内置实现
+func (cm *ChannelManager) RegisterEvidenceConnector(connectorID, name, description string, capabilities []string, config map[string]string) (interface{}, error) {
+	return nil, fmt.Errorf("external evidence connector is not supported, use built-in evidence instead")
 }
 
-// UnregisterEvidenceConnector 注销外部存证连接器
+// UnregisterEvidenceConnector 注销外部存证连接器（已废弃）
 func (cm *ChannelManager) UnregisterEvidenceConnector(connectorID string) error {
-	cm.evidenceMu.Lock()
-	defer cm.evidenceMu.Unlock()
-
-	if _, exists := cm.evidenceConnectors[connectorID]; !exists {
-		return fmt.Errorf("evidence connector %s not found", connectorID)
-	}
-
-	delete(cm.evidenceConnectors, connectorID)
-	log.Printf("✓ Evidence connector unregistered: %s", connectorID)
-	return nil
+	return fmt.Errorf("external evidence connector is not supported")
 }
 
-// GetEvidenceConnector 获取存证连接器信息
-func (cm *ChannelManager) GetEvidenceConnector(connectorID string) (*EvidenceConnector, error) {
-	cm.evidenceMu.RLock()
-	defer cm.evidenceMu.RUnlock()
-
-	connector, exists := cm.evidenceConnectors[connectorID]
-	if !exists {
-		return nil, fmt.Errorf("evidence connector %s not found", connectorID)
-	}
-
-	return connector, nil
+// GetEvidenceConnector 获取存证连接器信息（已废弃）
+func (cm *ChannelManager) GetEvidenceConnector(connectorID string) (interface{}, error) {
+	return nil, fmt.Errorf("external evidence connector is not supported")
 }
 
-// ListEvidenceConnectors 列出所有已注册的存证连接器
-func (cm *ChannelManager) ListEvidenceConnectors() []*EvidenceConnector {
-	cm.evidenceMu.RLock()
-	defer cm.evidenceMu.RUnlock()
-
-	connectors := make([]*EvidenceConnector, 0, len(cm.evidenceConnectors))
-	for _, connector := range cm.evidenceConnectors {
-		connectors = append(connectors, connector)
-	}
-
-	return connectors
+// ListEvidenceConnectors 列出所有已注册的存证连接器（已废弃）
+func (cm *ChannelManager) ListEvidenceConnectors() []interface{} {
+	return []interface{}{}
 }
 
-// UpdateEvidenceConnectorHeartbeat 更新存证连接器心跳
+// UpdateEvidenceConnectorHeartbeat 更新存证连接器心跳（已废弃）
 func (cm *ChannelManager) UpdateEvidenceConnectorHeartbeat(connectorID string) error {
-	cm.evidenceMu.Lock()
-	defer cm.evidenceMu.Unlock()
-
-	connector, exists := cm.evidenceConnectors[connectorID]
-	if !exists {
-		return fmt.Errorf("evidence connector %s not found", connectorID)
-	}
-
-	connector.LastHeartbeat = time.Now()
-	connector.Status = ConnectorStatusOnline
-
-	return nil
+	return fmt.Errorf("external evidence connector is not supported")
 }
 
-// IsEvidenceConnectorAvailable 检查存证连接器是否可用
+// IsEvidenceConnectorAvailable 检查存证连接器是否可用（已废弃）
 func (cm *ChannelManager) IsEvidenceConnectorAvailable(connectorID string) bool {
-	cm.evidenceMu.RLock()
-	defer cm.evidenceMu.RUnlock()
-
-	connector, exists := cm.evidenceConnectors[connectorID]
-	if !exists {
-		return false
-	}
-
-	// 检查连接器是否在线且心跳在合理时间内
-	return connector.Status == ConnectorStatusOnline &&
-		   time.Since(connector.LastHeartbeat) < 5*time.Minute
+	return false
 }
 
-// GetAvailableEvidenceConnectors 获取所有可用的存证连接器
-func (cm *ChannelManager) GetAvailableEvidenceConnectors() []*EvidenceConnector {
-	cm.evidenceMu.RLock()
-	defer cm.evidenceMu.RUnlock()
-
-	connectors := make([]*EvidenceConnector, 0)
-	for _, connector := range cm.evidenceConnectors {
-		if cm.IsEvidenceConnectorAvailable(connector.ConnectorID) {
-			connectors = append(connectors, connector)
-		}
-	}
-
-	return connectors
+// GetAvailableEvidenceConnectors 获取所有可用的存证连接器（已废弃）
+func (cm *ChannelManager) GetAvailableEvidenceConnectors() []interface{} {
+	return []interface{}{}
 }
 
-// StartEvidenceConnectorHeartbeatCheck 启动存证连接器心跳检查协程
+// StartEvidenceConnectorHeartbeatCheck 启动存证连接器心跳检查协程（已废弃）
 func (cm *ChannelManager) StartEvidenceConnectorHeartbeatCheck() {
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute) // 每分钟检查一次
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				cm.checkEvidenceConnectorHeartbeats()
-			}
-		}
-	}()
-	log.Println("✓ Started evidence connector heartbeat check routine")
+	// no-op: external evidence connectors are no longer supported
 }
 
-// checkEvidenceConnectorHeartbeats 检查存证连接器心跳状态
+// checkEvidenceConnectorHeartbeats 检查存证连接器心跳状态（已废弃）
 func (cm *ChannelManager) checkEvidenceConnectorHeartbeats() {
-	cm.evidenceMu.Lock()
-	defer cm.evidenceMu.Unlock()
-
-	now := time.Now()
-	offlineCount := 0
-
-	for _, connector := range cm.evidenceConnectors {
-		if now.Sub(connector.LastHeartbeat) > 5*time.Minute {
-			if connector.Status == ConnectorStatusOnline {
-				connector.Status = ConnectorStatusOffline
-				offlineCount++
-				log.Printf("📴 Evidence connector %s marked as offline", connector.ConnectorID)
-			}
-		}
-	}
-
-	if offlineCount > 0 {
-		log.Printf("📊 Marked %d evidence connectors as offline", offlineCount)
-	}
+	// no-op: external evidence connectors are no longer supported
 }
 

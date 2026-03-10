@@ -18,6 +18,7 @@ import (
 	pb "github.com/trusted-space/kernel/proto/kernel/v1"
 	"github.com/trusted-space/kernel/kernel/circulation"
 	"github.com/trusted-space/kernel/kernel/control"
+	"github.com/trusted-space/kernel/kernel/evidence"
 )
 
 // RemotePermissionRequest 表示同步过来的权限请求
@@ -68,6 +69,7 @@ type MultiKernelManager struct {
 	config         *KernelConfig
 	registry       *control.Registry
 	channelManager *circulation.ChannelManager
+	auditLog       *evidence.AuditLog
 
 	// multiHopConfigManager 多跳路由配置管理器（由外部注入）
 	multiHopConfigManager *MultiHopConfigManager
@@ -106,6 +108,11 @@ func NewMultiKernelManager(config *KernelConfig, registry *control.Registry,
 // SetNotificationManager 注入 NotificationManager（由 main 初始化后设置）
 func (m *MultiKernelManager) SetNotificationManager(nm *NotificationManager) {
 	m.notificationManager = nm
+}
+
+// SetAuditLog 注入 AuditLog（由 main 初始化后设置）
+func (m *MultiKernelManager) SetAuditLog(al *evidence.AuditLog) {
+	m.auditLog = al
 }
 
 // SetMultiHopConfigManager 设置多跳路由配置管理器
@@ -154,6 +161,18 @@ func (m *MultiKernelManager) ApprovePendingRequest(requestID string) error {
 	}
 	delete(m.pendingRequests, requestID)
 	m.pendingRequestsMu.Unlock()
+
+	// 记录互联批准存证
+	if m.auditLog != nil {
+		m.auditLog.SubmitBasicEvidence(
+			m.config.KernelID,
+			evidence.EventTypeInterconnectApproved,
+			"", // 无频道ID
+			requestID,
+			evidence.DirectionOutgoing,
+			req.RequesterKernelID,
+		)
+	}
 
 	// 在批准前先检查是否已经知晓该内核（避免重复通知）
 	m.kernelsMu.RLock()
@@ -237,7 +256,7 @@ func (m *MultiKernelManager) notifyRequesterApprove(req *PendingInterconnectRequ
 		Port:          int32(m.config.Port),
 		PublicKey:     "",
 		CaCertificate: ownCACertData,
-		Metadata:      map[string]string{"interconnect_approve": "true"},
+		IsInterconnectApprove: true,
 		Timestamp:     time.Now().Unix(),
 	}
 
@@ -387,7 +406,7 @@ func (m *MultiKernelManager) StartKernelServer() error {
 
 	server := grpc.NewServer(grpc.Creds(creds))
 
-	kernelService := NewKernelServiceServer(m, m.channelManager, m.registry, m.notificationManager)
+	kernelService := NewKernelServiceServer(m, m.channelManager, m.registry, m.notificationManager, m.auditLog)
 	pb.RegisterKernelServiceServer(server, kernelService)
 
 	listener, err := net.Listen("tcp", address)
@@ -483,15 +502,25 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 		PublicKey:    "", // TODO: 读取公钥
 		CaCertificate: caCertData, // 发送自己的CA证书
 		Timestamp:    time.Now().Unix(),
-	}
-	if interconnectRequest {
-		registerReq.Metadata = map[string]string{"interconnect_request": "true"}
+		IsInterconnectRequest: interconnectRequest,
 	}
 
 	resp, err := client.RegisterKernel(context.Background(), registerReq)
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("failed to register with kernel %s: %w", kernelID, err)
+	}
+
+	// 如果是发起互联请求，记录存证
+	if interconnectRequest && m.auditLog != nil {
+		m.auditLog.SubmitBasicEvidence(
+			m.config.KernelID,
+			evidence.EventTypeInterconnectRequested,
+			"",
+			"",
+			evidence.DirectionOutgoing,
+			kernelID,
+		)
 	}
 
 	// 如果目标返回了一个 interconnect_request_id，说明它把请求作为待审批处理，先不算最终连接
@@ -691,7 +720,7 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int,
 		Port:         int32(m.config.Port),
 		PublicKey:    "", // TODO: 读取公钥
 		CaCertificate: caCertData, // 发送自己的CA证书
-		Metadata:     map[string]string{"interconnect_request": "true"},
+		IsInterconnectRequest: true,
 		Timestamp:    time.Now().Unix(),
 	}
 
@@ -699,6 +728,29 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int,
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("failed to register with kernel %s: %w", kernelID, err)
+	}
+
+	// 如果是发起互联请求，记录存证
+	if m.auditLog != nil {
+		// 尝试从响应中提取 request ID
+		requestID := ""
+		if resp.Message != "" && strings.Contains(resp.Message, "interconnect_request_id:") {
+			parts := strings.Split(resp.Message, ";")
+			for _, p := range parts {
+				if strings.HasPrefix(p, "interconnect_request_id:") {
+					requestID = strings.TrimPrefix(p, "interconnect_request_id:")
+					break
+				}
+			}
+		}
+		m.auditLog.SubmitBasicEvidence(
+			m.config.KernelID,
+			evidence.EventTypeInterconnectRequested,
+			"",
+			requestID,
+			evidence.DirectionOutgoing,
+			kernelID,
+		)
 	}
 
 	// 如果目标返回了一个 interconnect_request_id，说明它把请求作为待审批处理，先不算最终连接

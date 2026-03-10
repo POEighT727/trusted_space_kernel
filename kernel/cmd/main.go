@@ -99,11 +99,9 @@ func main() {
 	configPath := flag.String("config", "config/kernel.yaml", "path to config file")
 	daemon := flag.Bool("daemon", false, "run in daemon/background mode without interactive shell")
 
-	// 默认存证配置相关参数（带默认值，会被配置文件覆盖）
-	defaultEvidenceMode := flag.String("default-evidence-mode", "none", "default evidence mode (none, internal, external, hybrid)")
+	// 默认存证配置相关参数（仅支持内核内置存证）
+	defaultEvidenceMode := flag.String("default-evidence-mode", "none", "default evidence mode (none, internal)")
 	defaultEvidenceStrategy := flag.String("default-evidence-strategy", "all", "default evidence strategy (all, data, control, important)")
-	defaultEvidenceConnector := flag.String("default-evidence-connector", "", "default external evidence connector ID")
-	defaultEvidenceBackup := flag.Bool("default-evidence-backup", false, "enable backup evidence by default")
 	defaultEvidenceRetention := flag.Int("default-evidence-retention", 30, "default evidence retention days")
 	defaultEvidenceCompress := flag.Bool("default-evidence-compress", true, "compress evidence data by default")
 
@@ -148,13 +146,9 @@ func main() {
 	if config.Channel.Evidence.DefaultStrategy != "" {
 		*defaultEvidenceStrategy = config.Channel.Evidence.DefaultStrategy
 	}
-	if config.Channel.Evidence.DefaultConnectorID != "" {
-		*defaultEvidenceConnector = config.Channel.Evidence.DefaultConnectorID
-	}
 	if config.Channel.Evidence.DefaultRetentionDays > 0 {
 		*defaultEvidenceRetention = config.Channel.Evidence.DefaultRetentionDays
 	}
-	*defaultEvidenceBackup = config.Channel.Evidence.DefaultBackupEnabled
 	*defaultEvidenceCompress = config.Channel.Evidence.DefaultCompressData
 
 	// 初始化组件
@@ -183,15 +177,12 @@ func main() {
 	}
 	channelManager.SetConfigManager(configManager)
 
-	// 设置默认存证配置（当频道未指定配置文件时使用）
+	// 设置默认存证配置（当频道未指定配置文件时使用，仅支持内核内置存证）
 	defaultEvidenceConfig := &circulation.EvidenceConfig{
-		Mode:           circulation.EvidenceMode(*defaultEvidenceMode),
-		Strategy:       circulation.EvidenceStrategy(*defaultEvidenceStrategy),
-		ConnectorID:    *defaultEvidenceConnector,
-		BackupEnabled:  *defaultEvidenceBackup,
-		RetentionDays:  *defaultEvidenceRetention,
-		CompressData:   *defaultEvidenceCompress,
-		CustomSettings: make(map[string]string),
+		Mode:          circulation.EvidenceMode(*defaultEvidenceMode),
+		Strategy:      circulation.EvidenceStrategy(*defaultEvidenceStrategy),
+		RetentionDays: *defaultEvidenceRetention,
+		CompressData:  *defaultEvidenceCompress,
 	}
 
 	if err := channelManager.SetDefaultEvidenceConfig(defaultEvidenceConfig); err != nil {
@@ -411,8 +402,10 @@ func main() {
 
 	// 将 ChannelService 的 NotificationManager 注入到 MultiKernelManager，供内核间服务使用
 	multiKernelManager.SetNotificationManager(channelService.NotificationManager)
+	// 将 AuditLog 注入到 MultiKernelManager，供内核间服务使用
+	multiKernelManager.SetAuditLog(auditLog)
 	// 注册内核间通信服务（多内核网络核心服务）
-	kernelService := server.NewKernelServiceServer(multiKernelManager, channelManager, registry, channelService.NotificationManager)
+	kernelService := server.NewKernelServiceServer(multiKernelManager, channelManager, registry, channelService.NotificationManager, auditLog)
 	pb.RegisterKernelServiceServer(grpcServer, kernelService)
 	log.Println("✓ Kernel-to-kernel service registered")
 

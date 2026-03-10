@@ -15,84 +15,85 @@ import (
 	"github.com/trusted-space/kernel/kernel/security"
 )
 
-// EventType 事件类型
+// EventType 事件类型（内核可直达的基本事件）
 type EventType string
 
 const (
-	// 数据传输事件
-	EventTypeTransferStart        EventType = "TRANSFER_START"
-	EventTypeTransferEnd          EventType = "TRANSFER_END"
-	EventTypeDataReceived         EventType = "DATA_RECEIVED"
-	EventTypeFileTransferStart    EventType = "FILE_TRANSFER_START"
-	EventTypeFileTransferEnd      EventType = "FILE_TRANSFER_END"
+	// 连接器事件
+	EventTypeConnectorRegistered   EventType = "CONNECTOR_REGISTERED"   // 连接器注册
+	EventTypeConnectorUnregistered EventType = "CONNECTOR_UNREGISTERED" // 连接器注销
+	EventTypeConnectorOnline       EventType = "CONNECTOR_ONLINE"       // 连接器上线
+	EventTypeConnectorOffline      EventType = "CONNECTOR_OFFLINE"      // 连接器离线
+	EventTypeConnectorHeartbeat   EventType = "CONNECTOR_HEARTBEAT"   // 连接器心跳
+
+	// 数据传输事件（兼容旧接口）
+	EventTypeDataSend       EventType = "DATA_SEND"       // 数据发送
+	EventTypeDataReceive    EventType = "DATA_RECEIVE"    // 数据接收
+	EventTypeDataForward    EventType = "DATA_FORWARD"    // 数据转发（跨内核转发）
+	EventTypeTransferStart  EventType = "TRANSFER_START"  // 传输开始（兼容旧接口）
+	EventTypeTransferEnd    EventType = "TRANSFER_END"    // 传输结束（兼容旧接口）
 
 	// 频道管理事件
-	EventTypeChannelCreated       EventType = "CHANNEL_CREATED"
-	EventTypeChannelClosed        EventType = "CHANNEL_CLOSED"
-	EventTypeChannelActivated     EventType = "CHANNEL_ACTIVATED"
-	EventTypeChannelSuspended     EventType = "CHANNEL_SUSPENDED"
-	EventTypeChannelResumed       EventType = "CHANNEL_RESUMED"
+	EventTypeChannelCreated EventType = "CHANNEL_CREATED" // 频道创建
+	EventTypeChannelClosed  EventType = "CHANNEL_CLOSED"  // 频道关闭
 
 	// 权限管理事件
-	EventTypePermissionRequest    EventType = "PERMISSION_REQUEST"
-	EventTypePermissionGranted    EventType = "PERMISSION_GRANTED"
-	EventTypePermissionDenied     EventType = "PERMISSION_DENIED"
-	EventTypePermissionRevoked    EventType = "PERMISSION_REVOKED"
-	EventTypeRoleChanged          EventType = "ROLE_CHANGED"
+	EventTypePermissionChange   EventType = "PERMISSION_CHANGE"   // 权限变更
+	EventTypePermissionRequest EventType = "PERMISSION_REQUEST"   // 权限请求（兼容旧接口）
+	EventTypePermissionGranted EventType = "PERMISSION_GRANTED"   // 权限授予（兼容旧接口）
+	EventTypePermissionDenied  EventType = "PERMISSION_DENIED"    // 权限拒绝（兼容旧接口）
+	EventTypePermissionRevoked EventType = "PERMISSION_REVOKED"  // 权限撤销（兼容旧接口）
 
-	// 身份认证事件
-	EventTypeAuthSuccess          EventType = "AUTH_SUCCESS"
-	EventTypeAuthFail             EventType = "AUTH_FAIL"
-	EventTypeAuthAttempt          EventType = "AUTH_ATTEMPT"
-	EventTypeAuthLogout           EventType = "AUTH_LOGOUT"
-	EventTypeTokenGenerated       EventType = "TOKEN_GENERATED"
-	EventTypeTokenValidated       EventType = "TOKEN_VALIDATED"
-	EventTypeTokenExpired         EventType = "TOKEN_EXPIRED"
+	// 身份认证事件（兼容旧接口）
+	EventTypeAuthSuccess      EventType = "AUTH_SUCCESS"      // 认证成功
+	EventTypeAuthFail         EventType = "AUTH_FAIL"         // 认证失败
+	EventTypeAuthAttempt      EventType = "AUTH_ATTEMPT"      // 认证尝试
+	EventTypeAuthLogout       EventType = "AUTH_LOGOUT"       // 登出
+	EventTypeTokenGenerated   EventType = "TOKEN_GENERATED"    // Token生成
+	EventTypeTokenValidated   EventType = "TOKEN_VALIDATED"   // Token验证
+	EventTypeTokenExpired     EventType = "TOKEN_EXPIRED"     // Token过期
 
-	// 安全事件
-	EventTypePolicyViolation      EventType = "POLICY_VIOLATION"
-	EventTypeSecurityViolation    EventType = "SECURITY_VIOLATION"
-	EventTypeDataTampering        EventType = "DATA_TAMPERING"
-	EventTypeIntegrityCheckFail   EventType = "INTEGRITY_CHECK_FAIL"
-	EventTypeSuspiciousActivity   EventType = "SUSPICIOUS_ACTIVITY"
-	EventTypeAccessDenied         EventType = "ACCESS_DENIED"
+	// 系统事件（兼容旧接口）
+	EventTypeSystemStartup    EventType = "SYSTEM_STARTUP"    // 系统启动
+	EventTypeSystemShutdown   EventType = "SYSTEM_SHUTDOWN"   // 系统关闭
+	EventTypeConfigChanged   EventType = "CONFIG_CHANGED"    // 配置变更
 
-	// 连接器事件
-	EventTypeConnectorRegistered  EventType = "CONNECTOR_REGISTERED"
-	EventTypeConnectorUnregistered EventType = "CONNECTOR_UNREGISTERED"
-	EventTypeConnectorStatusChanged EventType = "CONNECTOR_STATUS_CHANGED"
-	EventTypeConnectorHeartbeat   EventType = "CONNECTOR_HEARTBEAT"
-	EventTypeConnectorOffline     EventType = "CONNECTOR_OFFLINE"
-	EventTypeConnectorOnline      EventType = "CONNECTOR_ONLINE"
+	// 多内核互联事件
+	EventTypeInterconnectRequested EventType = "INTERCONNECT_REQUESTED" // 内核互联请求
+	EventTypeInterconnectApproved  EventType = "INTERCONNECT_APPROVED"  // 内核互联批准
+	EventTypeInterconnectRejected EventType = "INTERCONNECT_REJECTED" // 内核互联拒绝
 
-	// 证据相关事件
-	EventTypeEvidenceGenerated    EventType = "EVIDENCE_GENERATED"
-	EventTypeEvidenceVerified     EventType = "EVIDENCE_VERIFIED"
-	EventTypeEvidenceIntegrityFail EventType = "EVIDENCE_INTEGRITY_FAIL"
-	EventTypeEvidenceDistributed  EventType = "EVIDENCE_DISTRIBUTED"
-	EventTypeEvidenceStored       EventType = "EVIDENCE_STORED"
-
-	// 系统事件
-	EventTypeSystemStartup        EventType = "SYSTEM_STARTUP"
-	EventTypeSystemShutdown       EventType = "SYSTEM_SHUTDOWN"
-	EventTypeConfigChanged        EventType = "CONFIG_CHANGED"
-	EventTypeBackupCreated        EventType = "BACKUP_CREATED"
-	EventTypeMaintenanceStart     EventType = "MAINTENANCE_START"
-	EventTypeMaintenanceEnd       EventType = "MAINTENANCE_END"
+	// 其他兼容旧接口
+	EventTypePolicyViolation    EventType = "POLICY_VIOLATION"     // 策略违规
+	EventTypeConnectorStatusChanged EventType = "CONNECTOR_STATUS_CHANGED" // 连接器状态变更
 )
 
-// EvidenceRecord 存证记录
+// EvidenceDirection 存证方向
+type EvidenceDirection string
+
+const (
+	DirectionOutgoing EvidenceDirection = "outgoing" // 发送方向：数据流出内核
+	DirectionIncoming EvidenceDirection = "incoming" // 接收方向：数据流入内核
+	DirectionInternal EvidenceDirection = "internal" // 内部事件：不涉及外部数据流
+)
+
+// EvidenceRecord 存证记录（内核级别，只记录内核可直达的信息）
 type EvidenceRecord struct {
-	TxID        string            `json:"tx_id"`        // 业务流程ID (flow_id)
-	ConnectorID string            `json:"connector_id"`
-	EventType   EventType         `json:"event_type"`
-	ChannelID   string            `json:"channel_id"`
-	DataHash    string            `json:"data_hash"`
-	Signature   string            `json:"signature"`
-	Timestamp   time.Time         `json:"timestamp"`
-	Metadata    map[string]string `json:"metadata"`
+	EventID     string            `json:"event_id"`     // 事件实例ID
+	EventType   EventType         `json:"event_type"`  // 事件类型
+	Timestamp   time.Time         `json:"timestamp"`   // 时间戳
+	SourceID    string            `json:"source_id"`   // 事件来源ID（连接器ID或内核ID）
+	TargetID    string            `json:"target_id"`   // 目标ID（直接下一跳：内核或连接器）
+	Direction   EvidenceDirection `json:"direction"`   // 存证方向
+	ChannelID   string            `json:"channel_id"`  // 频道ID
+	DataHash    string            `json:"data_hash"`   // 数据哈希
+	Signature   string            `json:"signature"`   // 内核签名
 	Hash        string            `json:"hash"`        // 记录内容哈希，用于完整性验证
-	EventID     string            `json:"event_id"`    // 事件实例ID (可选，用于区分同一流程中的不同事件)
+	PrevHash    string            `json:"prev_hash"`   // 上一条记录的哈希（哈希链）
+
+	// 兼容旧接口的字段
+	TxID        string            `json:"tx_id,omitempty"`        // 业务流程ID（兼容旧接口）
+	ConnectorID string            `json:"connector_id,omitempty"` // 连接器ID（兼容旧接口）
 }
 
 // UnmarshalJSON 自定义JSON反序列化，支持向后兼容
@@ -126,9 +127,11 @@ type AuditLog struct {
 
 	// 内存缓存（可选，用于性能优化）
 	records    []*EvidenceRecord
-	indexByID  map[string]*EvidenceRecord // 按 TxID 索引
 	indexByCh  map[string][]*EvidenceRecord // 按 ChannelID 索引
-	indexByConn map[string][]*EvidenceRecord // 按 ConnectorID 索引
+	indexBySource map[string][]*EvidenceRecord // 按 SourceID 索引
+	indexByTarget map[string][]*EvidenceRecord // 按 TargetID 索引
+	indexByEventType map[EventType][]*EvidenceRecord // 按事件类型索引
+	lastRecordHash string // 最新记录的哈希（用于哈希链）
 
 	// 文件存储（向下兼容）
 	logFile    *os.File
@@ -146,19 +149,23 @@ type EvidenceStore interface {
 	Update(record *EvidenceRecord) error
 	Delete(id int64) error
 	Count(filter interface{}) (int64, error)
-	GetByTxID(txID string) ([]*EvidenceRecord, error)
+	GetByEventID(eventID string) (*EvidenceRecord, error)
 	GetByChannel(channelID string, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
-	GetByConnector(connectorID string, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
-	GetByChannelAndConnector(channelID, connectorID string, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
+	GetBySource(sourceID string, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
+	GetByTarget(targetID string, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
+	GetByDirection(direction EvidenceDirection, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
+	GetByEventType(eventType EventType, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
 	VerifyRecord(record *EvidenceRecord) error
 	Close() error
 }
 
 // EvidenceFilter 证据查询过滤器
 type EvidenceFilter struct {
-	TxID        string
-	ConnectorID string
+	EventID     string
 	EventType   string
+	SourceID    string
+	TargetID    string
+	Direction   string
 	ChannelID   string
 	StartTime   *time.Time
 	EndTime     *time.Time
@@ -198,9 +205,10 @@ func NewAuditLogWithConfig(config AuditLogConfig) (*AuditLog, error) {
 	// 初始化内存缓存（如果启用）
 	if config.UseMemoryCache {
 		al.records = make([]*EvidenceRecord, 0)
-		al.indexByID = make(map[string]*EvidenceRecord)
 		al.indexByCh = make(map[string][]*EvidenceRecord)
-		al.indexByConn = make(map[string][]*EvidenceRecord)
+		al.indexBySource = make(map[string][]*EvidenceRecord)
+		al.indexByTarget = make(map[string][]*EvidenceRecord)
+		al.indexByEventType = make(map[EventType][]*EvidenceRecord)
 	}
 
 	// 如果使用文件存储
@@ -221,89 +229,116 @@ func NewAuditLogWithConfig(config AuditLogConfig) (*AuditLog, error) {
 	return al, nil
 }
 
-// SubmitEvidence 提交存证
-func (al *AuditLog) SubmitEvidence(connectorID string, eventType EventType, channelID, dataHash string, metadata map[string]string) (*EvidenceRecord, error) {
-	return al.SubmitEvidenceWithFlowID("", connectorID, eventType, channelID, dataHash, metadata)
+// SubmitEvidence 提交存证（兼容旧接口，内部调用新版方法）
+func (al *AuditLog) SubmitEvidence(connectorID string, eventType EventType, channelID, dataHash string) (*EvidenceRecord, error) {
+	return al.SubmitBasicEvidence(connectorID, eventType, channelID, dataHash, DirectionInternal, "")
 }
 
-// SubmitEvidenceWithFlowID 提交带有业务流程ID的存证
-func (al *AuditLog) SubmitEvidenceWithFlowID(flowID, connectorID string, eventType EventType, channelID, dataHash string, metadata map[string]string) (*EvidenceRecord, error) {
-	log.Printf("📝 EVIDENCE SUBMIT: %s, connector: %s, channel: %s, hash: %s, flow: %s", eventType, connectorID, channelID, dataHash, flowID)
-	
-	// 不需要锁，因为每个 SubmitEvidenceWithFlowID 调用都是独立的
-	// 构建证据记录
+// SubmitEvidenceWithFlowID 提交带有业务流程ID的存证（兼容旧接口）
+// flowID 参数保留以兼容旧接口，但不再用于记录中
+func (al *AuditLog) SubmitEvidenceWithFlowID(flowID, connectorID string, eventType EventType, channelID, dataHash string) (*EvidenceRecord, error) {
+	return al.SubmitBasicEvidence(connectorID, eventType, channelID, dataHash, DirectionInternal, "")
+}
 
-	// 使用传入的flowID，如果为空则生成新的
-	if flowID == "" {
-		flowID = uuid.New().String()
-	}
+// SubmitBasicEvidence 提交基本事件存证
+// sourceID: 事件来源ID（连接器ID或内核ID）
+// eventType: 事件类型
+// channelID: 频道ID（可选）
+// dataHash: 数据哈希（可选）
+// direction: 存证方向
+// targetID: 目标ID（直接下一跳：内核或连接器）
+func (al *AuditLog) SubmitBasicEvidence(sourceID string, eventType EventType, channelID, dataHash string, direction EvidenceDirection, targetID string) (*EvidenceRecord, error) {
+	return al.SubmitBasicEvidenceWithRetry(sourceID, eventType, channelID, dataHash, direction, targetID, 3)
+}
 
-	// 生成事件实例ID（用于区分同一流程中的不同事件）
+// SubmitBasicEvidenceWithRetry 提交基本事件存证（带重试机制）
+// maxRetries: 最大重试次数
+func (al *AuditLog) SubmitBasicEvidenceWithRetry(sourceID string, eventType EventType, channelID, dataHash string, direction EvidenceDirection, targetID string, maxRetries int) (*EvidenceRecord, error) {
+	log.Printf("📝 EVIDENCE SUBMIT: %s, source: %s, channel: %s, direction: %s, target: %s",
+		eventType, sourceID, channelID, direction, targetID)
+
+	// 生成事件实例ID
 	eventID := uuid.New().String()
-
-	// 创建临时记录用于签名（不包含TxID，因为TxID是动态生成的）
 	tempTimestamp := time.Now()
 
 	// 生成数字签名
-	signature, err := al.generateEvidenceSignature(connectorID, string(eventType), channelID, dataHash, tempTimestamp.Unix())
+	signature, err := al.generateEvidenceSignature(sourceID, string(eventType), channelID, dataHash, tempTimestamp.Unix())
 	if err != nil {
 		log.Printf("⚠️  Failed to generate signature for evidence: %v", err)
-		// 如果签名生成失败，设置为空签名，但仍继续处理
 		signature = ""
 	}
 
+	al.mu.Lock()
+	prevHash := al.lastRecordHash
+	al.mu.Unlock()
+
 	record := &EvidenceRecord{
-		TxID:        flowID,      // 使用业务流程ID作为TxID
-		ConnectorID: connectorID,
-		EventType:   eventType,
-		ChannelID:   channelID,
-		DataHash:    dataHash,
-		Signature:   signature,
-		Timestamp:   tempTimestamp,
-		Metadata:    metadata,
-		EventID:     eventID,     // 事件实例ID
+		EventID:   eventID,
+		EventType: eventType,
+		Timestamp: tempTimestamp,
+		SourceID:  sourceID,
+		TargetID:  targetID,
+		Direction: direction,
+		ChannelID: channelID,
+		DataHash:  dataHash,
+		Signature: signature,
+		PrevHash:  prevHash,
 	}
 
 	// 计算记录内容的哈希
 	record.Hash = al.calculateRecordHash(record)
 
-	// 如果使用数据库存储
+	// 更新最后记录哈希（用于哈希链）
+	al.mu.Lock()
+	al.lastRecordHash = record.Hash
+	al.mu.Unlock()
+
+	// 如果使用数据库存储，添加重试机制
 	if al.store != nil {
-		if err := al.store.Store(record); err != nil {
-			log.Printf("⚠️ Failed to store evidence in database: %v", err)
-			// 继续执行，不返回错误，确保其他存储方式仍然工作
-		} else {
-			log.Printf("✓ Evidence stored in database: %s", flowID)
+		var lastErr error
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			if err := al.store.Store(record); err != nil {
+				lastErr = err
+				log.Printf("⚠️ Failed to store evidence in database (attempt %d/%d): %v", attempt, maxRetries, err)
+				if attempt < maxRetries {
+					time.Sleep(time.Duration(attempt) * 500 * time.Millisecond) // 指数退避
+					continue
+				}
+			} else {
+				log.Printf("✓ Evidence stored in database: %s", eventID)
+				break
+			}
+		}
+		if lastErr != nil {
+			log.Printf("⚠️ Failed to store evidence in database after %d attempts: %v", maxRetries, lastErr)
 		}
 	}
 
 	// 更新内存缓存（如果启用）
 	if al.records != nil {
-	al.records = append(al.records, record)
-	al.indexByID[flowID] = record
+		al.mu.Lock()
+		al.records = append(al.records, record)
 
-	if channelID != "" {
-		al.indexByCh[channelID] = append(al.indexByCh[channelID], record)
-	}
+		if channelID != "" {
+			al.indexByCh[channelID] = append(al.indexByCh[channelID], record)
+		}
 
-	if connectorID != "" {
-		al.indexByConn[connectorID] = append(al.indexByConn[connectorID], record)
-	}
-	}
+		if sourceID != "" {
+			al.indexBySource[sourceID] = append(al.indexBySource[sourceID], record)
+		}
 
-	// 通过频道传输存证数据
-	// 外部存证模式：只发送给指定外部存证连接器
-	// 内部存证模式：广播给所有订阅者（分布式存储）
-	if err := al.transmitEvidenceViaChannel(record); err != nil {
-		log.Printf("⚠️ Failed to transmit evidence via channel: %v", err)
-		// 不返回错误，因为证据已经存储，只是分发失败
+		if targetID != "" {
+			al.indexByTarget[targetID] = append(al.indexByTarget[targetID], record)
+		}
+
+		al.indexByEventType[eventType] = append(al.indexByEventType[eventType], record)
+		al.mu.Unlock()
 	}
 
 	// 持久化到文件（可选，本地备份）
 	if al.persistent && al.logFile != nil {
 		if err := al.writeRecordToFile(record); err != nil {
 			log.Printf("⚠️ Failed to persist record to file: %v", err)
-			// 不返回错误，因为主要存储已成功
 		}
 	}
 
@@ -312,67 +347,118 @@ func (al *AuditLog) SubmitEvidenceWithFlowID(flowID, connectorID string, eventTy
 
 // calculateRecordHash 计算记录内容的哈希值
 func (al *AuditLog) calculateRecordHash(record *EvidenceRecord) string {
-	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%d|%s",
-		record.TxID,
-		record.ConnectorID,
+	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s",
+		record.EventID,
 		record.EventType,
+		record.SourceID,
+		record.TargetID,
+		record.Direction,
 		record.ChannelID,
 		record.DataHash,
-		record.Signature,
 		record.Timestamp.Unix(),
-		record.EventID,
+		record.PrevHash,
 	)
 
-	// 如果有metadata，包含在哈希中
-	if len(record.Metadata) > 0 {
-		metadataJSON, _ := json.Marshal(record.Metadata)
-		data += "|" + string(metadataJSON)
-	}
-
+	// 计算哈希
 	hash := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(hash[:])
 }
 
-// QueryByTxID 根据业务流程ID查询所有相关事件
-func (al *AuditLog) QueryByTxID(flowID string) ([]*EvidenceRecord, error) {
-	// 如果使用数据库存储
+// QueryByEventID 根据事件ID查询
+func (al *AuditLog) QueryByEventID(eventID string) (*EvidenceRecord, error) {
 	if al.store != nil {
-		records, err := al.store.GetByTxID(flowID)
+		record, err := al.store.GetByEventID(eventID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query evidence from database: %w", err)
 		}
-		return records, nil
+		return record, nil
 	}
 
-	// 内存缓存查询 - 查找所有匹配的记录
+	// 内存缓存查询
 	al.mu.RLock()
 	defer al.mu.RUnlock()
 
-	var records []*EvidenceRecord
 	for _, record := range al.records {
-		if record.TxID == flowID {
-			records = append(records, record)
+		if record.EventID == eventID {
+			return record, nil
 		}
 	}
 
-	return records, nil
+	return nil, fmt.Errorf("evidence record not found for eventID: %s", eventID)
 }
 
-// QueryByTxIDSingle 根据交易ID查询单个事件（向后兼容）
+// QueryByTxID 根据业务流程ID查询所有相关事件（兼容旧接口）
+// 由于新版不再使用TxID，返回空结果
+func (al *AuditLog) QueryByTxID(flowID string) ([]*EvidenceRecord, error) {
+	return []*EvidenceRecord{}, nil
+}
+
+// QueryByTxIDSingle 根据交易ID查询单个事件（兼容旧接口）
 func (al *AuditLog) QueryByTxIDSingle(txID string) (*EvidenceRecord, error) {
-	records, err := al.QueryByTxID(txID)
-	if err != nil {
-		return nil, err
+	return nil, fmt.Errorf("TxID query is no longer supported, use QueryByEventID instead")
+}
+
+// QueryByChannelAndConnector 根据频道和连接器ID查询证据记录（兼容旧接口）
+func (al *AuditLog) QueryByChannelAndConnector(channelID, connectorID string, startTime, endTime time.Time, limit int) []*EvidenceRecord {
+	// 使用新版查询方法组合实现
+	channelRecords := al.QueryByChannel(channelID, startTime, endTime, 0)
+	sourceRecords := al.QueryBySource(connectorID, startTime, endTime, 0)
+
+	// 合并结果
+	records := make([]*EvidenceRecord, 0)
+	seen := make(map[string]bool)
+	for _, r := range channelRecords {
+		if !seen[r.EventID] {
+			records = append(records, r)
+			seen[r.EventID] = true
+		}
 	}
-	if len(records) == 0 {
-		return nil, fmt.Errorf("evidence record not found for txID: %s", txID)
+	for _, r := range sourceRecords {
+		if !seen[r.EventID] {
+			records = append(records, r)
+			seen[r.EventID] = true
+		}
 	}
-	return records[0], nil
+
+	// 应用限制
+	if limit > 0 && len(records) > limit {
+		records = records[:limit]
+	}
+
+	return records
+}
+
+// QueryByConnector 根据连接器ID查询（兼容旧接口，查询source或target）
+func (al *AuditLog) QueryByConnector(connectorID string, startTime, endTime time.Time, limit int) []*EvidenceRecord {
+	sourceRecords := al.QueryBySource(connectorID, startTime, endTime, 0)
+	targetRecords := al.QueryByTarget(connectorID, startTime, endTime, 0)
+
+	// 合并结果
+	records := make([]*EvidenceRecord, 0)
+	seen := make(map[string]bool)
+	for _, r := range sourceRecords {
+		if !seen[r.EventID] {
+			records = append(records, r)
+			seen[r.EventID] = true
+		}
+	}
+	for _, r := range targetRecords {
+		if !seen[r.EventID] {
+			records = append(records, r)
+			seen[r.EventID] = true
+		}
+	}
+
+	// 应用限制
+	if limit > 0 && len(records) > limit {
+		records = records[:limit]
+	}
+
+	return records
 }
 
 // QueryByChannel 根据频道 ID 查询
 func (al *AuditLog) QueryByChannel(channelID string, startTime, endTime time.Time, limit int) []*EvidenceRecord {
-	// 如果使用数据库存储
 	if al.store != nil {
 		var startTimePtr, endTimePtr *time.Time
 		if !startTime.IsZero() {
@@ -388,7 +474,6 @@ func (al *AuditLog) QueryByChannel(channelID string, startTime, endTime time.Tim
 			return []*EvidenceRecord{}
 		}
 
-		// 应用限制
 		if limit > 0 && len(records) > limit {
 			records = records[:limit]
 		}
@@ -405,24 +490,11 @@ func (al *AuditLog) QueryByChannel(channelID string, startTime, endTime time.Tim
 		return []*EvidenceRecord{}
 	}
 
-	// 过滤时间范围
-	filtered := make([]*EvidenceRecord, 0)
-	for _, record := range records {
-		if (startTime.IsZero() || record.Timestamp.After(startTime)) &&
-			(endTime.IsZero() || record.Timestamp.Before(endTime)) {
-			filtered = append(filtered, record)
-			if limit > 0 && len(filtered) >= limit {
-				break
-			}
-		}
-	}
-
-	return filtered
+	return al.filterByTimeRange(records, startTime, endTime, limit)
 }
 
-// QueryByChannelAndConnector 根据频道和连接器ID查询证据记录
-func (al *AuditLog) QueryByChannelAndConnector(channelID, connectorID string, startTime, endTime time.Time, limit int) []*EvidenceRecord {
-	// 如果使用数据库存储
+// QueryBySource 根据来源ID查询
+func (al *AuditLog) QueryBySource(sourceID string, startTime, endTime time.Time, limit int) []*EvidenceRecord {
 	if al.store != nil {
 		var startTimePtr, endTimePtr *time.Time
 		if !startTime.IsZero() {
@@ -432,13 +504,12 @@ func (al *AuditLog) QueryByChannelAndConnector(channelID, connectorID string, st
 			endTimePtr = &endTime
 		}
 
-		records, err := al.store.GetByChannelAndConnector(channelID, connectorID, startTimePtr, endTimePtr)
+		records, err := al.store.GetBySource(sourceID, startTimePtr, endTimePtr)
 		if err != nil {
 			log.Printf("⚠️ Failed to query evidence from database: %v", err)
 			return []*EvidenceRecord{}
 		}
 
-		// 应用限制
 		if limit > 0 && len(records) > limit {
 			records = records[:limit]
 		}
@@ -450,30 +521,16 @@ func (al *AuditLog) QueryByChannelAndConnector(channelID, connectorID string, st
 	al.mu.RLock()
 	defer al.mu.RUnlock()
 
-	records, exists := al.indexByCh[channelID]
+	records, exists := al.indexBySource[sourceID]
 	if !exists {
 		return []*EvidenceRecord{}
 	}
 
-	// 过滤连接器和时间范围
-	filtered := make([]*EvidenceRecord, 0)
-	for _, record := range records {
-		if record.ConnectorID == connectorID &&
-			(startTime.IsZero() || record.Timestamp.After(startTime)) &&
-			(endTime.IsZero() || record.Timestamp.Before(endTime)) {
-			filtered = append(filtered, record)
-			if limit > 0 && len(filtered) >= limit {
-				break
-			}
-		}
-	}
-
-	return filtered
+	return al.filterByTimeRange(records, startTime, endTime, limit)
 }
 
-// QueryByConnector 根据连接器 ID 查询
-func (al *AuditLog) QueryByConnector(connectorID string, startTime, endTime time.Time, limit int) []*EvidenceRecord {
-	// 如果使用数据库存储
+// QueryByTarget 根据目标ID查询
+func (al *AuditLog) QueryByTarget(targetID string, startTime, endTime time.Time, limit int) []*EvidenceRecord {
 	if al.store != nil {
 		var startTimePtr, endTimePtr *time.Time
 		if !startTime.IsZero() {
@@ -483,13 +540,12 @@ func (al *AuditLog) QueryByConnector(connectorID string, startTime, endTime time
 			endTimePtr = &endTime
 		}
 
-		records, err := al.store.GetByConnector(connectorID, startTimePtr, endTimePtr)
+		records, err := al.store.GetByTarget(targetID, startTimePtr, endTimePtr)
 		if err != nil {
 			log.Printf("⚠️ Failed to query evidence from database: %v", err)
 			return []*EvidenceRecord{}
 		}
 
-		// 应用限制
 		if limit > 0 && len(records) > limit {
 			records = records[:limit]
 		}
@@ -501,12 +557,101 @@ func (al *AuditLog) QueryByConnector(connectorID string, startTime, endTime time
 	al.mu.RLock()
 	defer al.mu.RUnlock()
 
-	records, exists := al.indexByConn[connectorID]
+	records, exists := al.indexByTarget[targetID]
 	if !exists {
 		return []*EvidenceRecord{}
 	}
 
-	// 过滤时间范围
+	return al.filterByTimeRange(records, startTime, endTime, limit)
+}
+
+// QueryByDirection 根据方向查询
+func (al *AuditLog) QueryByDirection(direction EvidenceDirection, startTime, endTime time.Time, limit int) []*EvidenceRecord {
+	if al.store != nil {
+		var startTimePtr, endTimePtr *time.Time
+		if !startTime.IsZero() {
+			startTimePtr = &startTime
+		}
+		if !endTime.IsZero() {
+			endTimePtr = &endTime
+		}
+
+		records, err := al.store.GetByDirection(direction, startTimePtr, endTimePtr)
+		if err != nil {
+			log.Printf("⚠️ Failed to query evidence from database: %v", err)
+			return []*EvidenceRecord{}
+		}
+
+		if limit > 0 && len(records) > limit {
+			records = records[:limit]
+		}
+
+		return records
+	}
+
+	// 内存缓存查询
+	al.mu.RLock()
+	defer al.mu.RUnlock()
+
+	var filtered []*EvidenceRecord
+	for _, records := range al.indexByEventType {
+		for _, record := range records {
+			if record.Direction == direction {
+				if (startTime.IsZero() || record.Timestamp.After(startTime)) &&
+					(endTime.IsZero() || record.Timestamp.Before(endTime)) {
+					filtered = append(filtered, record)
+					if limit > 0 && len(filtered) >= limit {
+						break
+					}
+				}
+			}
+		}
+		if limit > 0 && len(filtered) >= limit {
+			break
+		}
+	}
+
+	return filtered
+}
+
+// QueryByEventType 根据事件类型查询
+func (al *AuditLog) QueryByEventType(eventType EventType, startTime, endTime time.Time, limit int) []*EvidenceRecord {
+	if al.store != nil {
+		var startTimePtr, endTimePtr *time.Time
+		if !startTime.IsZero() {
+			startTimePtr = &startTime
+		}
+		if !endTime.IsZero() {
+			endTimePtr = &endTime
+		}
+
+		records, err := al.store.GetByEventType(eventType, startTimePtr, endTimePtr)
+		if err != nil {
+			log.Printf("⚠️ Failed to query evidence from database: %v", err)
+			return []*EvidenceRecord{}
+		}
+
+		if limit > 0 && len(records) > limit {
+			records = records[:limit]
+		}
+
+		return records
+	}
+
+	// 内存缓存查询
+	al.mu.RLock()
+	defer al.mu.RUnlock()
+
+	records, exists := al.indexByEventType[eventType]
+	if !exists {
+		return []*EvidenceRecord{}
+	}
+
+	return al.filterByTimeRange(records, startTime, endTime, limit)
+}
+
+// filterByTimeRange 按时间范围过滤记录
+func (al *AuditLog) filterByTimeRange(records []*EvidenceRecord, startTime, endTime time.Time, limit int) []*EvidenceRecord {
 	filtered := make([]*EvidenceRecord, 0)
 	for _, record := range records {
 		if (startTime.IsZero() || record.Timestamp.After(startTime)) &&
@@ -517,7 +662,6 @@ func (al *AuditLog) QueryByConnector(connectorID string, startTime, endTime time
 			}
 		}
 	}
-
 	return filtered
 }
 
@@ -581,16 +725,28 @@ func (al *AuditLog) loadFromFile(filePath string) error {
 			if len(lines) > 0 {
 				var record EvidenceRecord
 				if err := json.Unmarshal(lines, &record); err == nil {
+					al.mu.Lock()
 					al.records = append(al.records, &record)
-					al.indexByID[record.TxID] = &record
-					
+
 					if record.ChannelID != "" {
 						al.indexByCh[record.ChannelID] = append(al.indexByCh[record.ChannelID], &record)
 					}
-					
-					if record.ConnectorID != "" {
-						al.indexByConn[record.ConnectorID] = append(al.indexByConn[record.ConnectorID], &record)
+
+					if record.SourceID != "" {
+						al.indexBySource[record.SourceID] = append(al.indexBySource[record.SourceID], &record)
 					}
+
+					if record.TargetID != "" {
+						al.indexByTarget[record.TargetID] = append(al.indexByTarget[record.TargetID], &record)
+					}
+
+					al.indexByEventType[record.EventType] = append(al.indexByEventType[record.EventType], &record)
+
+					// 更新哈希链
+					if record.PrevHash != "" {
+						al.lastRecordHash = record.Hash
+					}
+					al.mu.Unlock()
 				}
 			}
 			lines = []byte{}
@@ -620,6 +776,7 @@ func (al *AuditLog) transmitEvidenceViaChannel(record *EvidenceRecord) error {
 }
 
 // sendEvidenceToChannel 将存证记录发送到指定的频道
+// 内核存证通过频道传输，仅用于分布式存储，不涉及外部存证连接器
 func (al *AuditLog) sendEvidenceToChannel(channelID string, record *EvidenceRecord) error {
 	cm, ok := al.channelManager.(*circulation.ChannelManager)
 	if !ok {
@@ -633,7 +790,6 @@ func (al *AuditLog) sendEvidenceToChannel(channelID string, record *EvidenceReco
 
 	// 检查频道是否已激活
 	if channel.Status != circulation.ChannelStatusActive {
-		// 频道未激活，跳过频道传输（证据已存储在数据库中）
 		log.Printf("ℹ️ Channel %s is not active (status: %s), skipping evidence transmission", channelID, channel.Status)
 		return nil
 	}
@@ -644,52 +800,18 @@ func (al *AuditLog) sendEvidenceToChannel(channelID string, record *EvidenceReco
 		return fmt.Errorf("failed to marshal evidence record: %w", err)
 	}
 
-	// 创建数据包
-	sequenceNumber := int64(len(al.records)) // 使用记录总数作为序列号
-
-	// 根据存证配置确定发送目标
-	var targetIDs []string
-	if channel.EvidenceConfig != nil {
-		switch channel.EvidenceConfig.Mode {
-		case circulation.EvidenceModeExternal:
-			// 外部存证：只发送给外部存证连接器
-			if channel.EvidenceConfig.ConnectorID != "" {
-				targetIDs = []string{channel.EvidenceConfig.ConnectorID}
-			} else {
-				return fmt.Errorf("external evidence mode requires connector ID")
-			}
-		case circulation.EvidenceModeInternal:
-			// 内部存证：广播给所有订阅者（用于分布式存储）
-			targetIDs = []string{}
-		case circulation.EvidenceModeHybrid:
-			// 混合存证：发送给所有订阅者（包括外部存证连接器）
-			targetIDs = []string{}
-		default:
-			// 默认广播
-			targetIDs = []string{}
-		}
-	} else {
-		// 没有存证配置，广播给所有订阅者
-		targetIDs = []string{}
-	}
-
-	// 确定发送者ID：优先使用原始连接器，但如果不是发送方则使用创建者
-	senderID := record.ConnectorID
-	if !channel.CanSend(senderID) {
-		// 如果原始连接器不是发送方，使用频道创建者作为发送者
-		senderID = channel.CreatorID
-		log.Printf("ℹ️ Using channel creator %s as sender for evidence (original sender %s is not authorized)", senderID, record.ConnectorID)
-	}
+	// 创建数据包（广播给所有订阅者）
+	sequenceNumber := int64(len(al.records))
 
 	packet := &circulation.DataPacket{
 		ChannelID:      channelID,
 		SequenceNumber: sequenceNumber,
 		Payload:        recordData,
-		Signature:      "", // 存证数据由系统生成，暂时不需要签名
+		Signature:      "",
 		Timestamp:      record.Timestamp.Unix(),
-		SenderID:       senderID,
-		TargetIDs:      targetIDs, // 根据存证模式确定发送目标
-		MessageType:    circulation.MessageTypeEvidence, // 设置为存证消息类型
+		SenderID:       "kernel", // 内核作为发送者
+		TargetIDs:      []string{}, // 广播给所有订阅者
+		MessageType:    circulation.MessageTypeEvidence,
 	}
 
 	// 发送到频道

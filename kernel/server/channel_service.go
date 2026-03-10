@@ -197,13 +197,10 @@ func (s *ChannelServiceServer) notifyChannelCreated(channel *circulation.Channel
 	// 添加存证配置（如果有）
 	if channel.EvidenceConfig != nil {
 		notification.EvidenceConfig = &pb.EvidenceConfig{
-			Mode:           string(channel.EvidenceConfig.Mode),
-			Strategy:       string(channel.EvidenceConfig.Strategy),
-			ConnectorId:    channel.EvidenceConfig.ConnectorID,
-			BackupEnabled:  channel.EvidenceConfig.BackupEnabled,
-			RetentionDays:  int32(channel.EvidenceConfig.RetentionDays),
-			CompressData:   channel.EvidenceConfig.CompressData,
-			CustomSettings: channel.EvidenceConfig.CustomSettings,
+			Mode:          string(channel.EvidenceConfig.Mode),
+			Strategy:      string(channel.EvidenceConfig.Strategy),
+			RetentionDays: int32(channel.EvidenceConfig.RetentionDays),
+			CompressData:  channel.EvidenceConfig.CompressData,
 		}
 	}
 
@@ -460,18 +457,14 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 		for _, receiverID := range req.ReceiverIds {
 			allowed, reason := s.policyEngine.CheckPermission(senderID, receiverID)
 			if !allowed {
-				s.auditLog.SubmitEvidence(
-					creatorID,
-					evidence.EventTypePolicyViolation,
-					"",
-					"",
-					map[string]string{
-						"sender":   senderID,
-						"receiver": receiverID,
-						"reason":   reason,
-						"context":  "channel_proposal",
-					},
-				)
+			s.auditLog.SubmitBasicEvidence(
+				creatorID,
+				evidence.EventTypePermissionChange,
+				"",
+				"",
+				evidence.DirectionInternal,
+				senderID,
+			)
 				return &pb.ProposeChannelResponse{
 					Success: false,
 					Message: fmt.Sprintf("permission denied: %s cannot send data to %s: %s", senderID, receiverID, reason),
@@ -487,17 +480,14 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 	}
 
 	// 创建频道提议
-	// 转换存证配置
+	// 转换存证配置（仅支持内核内置存证）
 	var evidenceConfig *circulation.EvidenceConfig
 	if req.EvidenceConfig != nil {
 		evidenceConfig = &circulation.EvidenceConfig{
-			Mode:           circulation.EvidenceMode(req.EvidenceConfig.Mode),
-			Strategy:       circulation.EvidenceStrategy(req.EvidenceConfig.Strategy),
-			ConnectorID:    req.EvidenceConfig.ConnectorId,
-			BackupEnabled:  req.EvidenceConfig.BackupEnabled,
-			RetentionDays:  int(req.EvidenceConfig.RetentionDays),
-			CompressData:   req.EvidenceConfig.CompressData,
-			CustomSettings: req.EvidenceConfig.CustomSettings,
+			Mode:          circulation.EvidenceMode(req.EvidenceConfig.Mode),
+			Strategy:      circulation.EvidenceStrategy(req.EvidenceConfig.Strategy),
+			RetentionDays: int(req.EvidenceConfig.RetentionDays),
+			CompressData:  req.EvidenceConfig.CompressData,
 		}
 	}
 
@@ -521,20 +511,32 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 	}
 
 	// 记录审计日志
-	s.auditLog.SubmitEvidence(
-		creatorID,
-		evidence.EventTypeChannelCreated, // 使用相同的审计类型，但添加上下文
+	// 确定目标ID（第一个接收方的内核部分）
+	targetID := ""
+	if len(req.ReceiverIds) > 0 {
+		targetID = req.ReceiverIds[0]
+	}
+	// 如果是跨内核频道，提取目标内核ID
+	if strings.Contains(targetID, ":") {
+		parts := strings.Split(targetID, ":")
+		if len(parts) >= 2 {
+			targetID = parts[0] // 目标内核ID
+		}
+	}
+
+	// 获取当前内核ID作为source
+	sourceID := ""
+	if s.multiKernelManager != nil && s.multiKernelManager.config != nil {
+		sourceID = s.multiKernelManager.config.KernelID
+	}
+
+	s.auditLog.SubmitBasicEvidence(
+		sourceID,
+		evidence.EventTypeChannelCreated,
 		channel.ChannelID,
 		channel.ChannelProposal.ProposalID,
-		map[string]string{
-			"senders":      fmt.Sprintf("%v", req.SenderIds),
-			"receivers":    fmt.Sprintf("%v", req.ReceiverIds),
-			"data_topic":   req.DataTopic,
-			"channel_type": "unified", // 统一频道架构
-			"encrypted":    fmt.Sprintf("%v", encrypted),
-			"reason":       req.Reason,
-			"context":      "channel_proposal",
-		},
+		evidence.DirectionInternal,
+		targetID,
 	)
 
 	// 发送提议通知给相关方
@@ -714,16 +716,30 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 		}
 	}
 
-	// 记录审计日志
-	s.auditLog.SubmitEvidence(
-		req.AccepterId,
-		evidence.EventTypeChannelCreated, // 频道正式创建
+	// 记录审计日志 - source=当前内核, target=创建者所在内核
+	sourceID := ""
+	targetID := ""
+	if s.multiKernelManager != nil && s.multiKernelManager.config != nil {
+		sourceID = s.multiKernelManager.config.KernelID
+	}
+	// target 是频道创建者所在内核
+	if channel.CreatorID != "" {
+		if strings.Contains(channel.CreatorID, ":") {
+			parts := strings.Split(channel.CreatorID, ":")
+			targetID = parts[0]
+		} else {
+			// 本地 connector 创建，target 是当前内核
+			targetID = sourceID
+		}
+	}
+
+	s.auditLog.SubmitBasicEvidence(
+		sourceID,
+		evidence.EventTypeChannelCreated,
 		req.ChannelId,
 		req.ProposalId,
-		map[string]string{
-			"accepter": req.AccepterId,
-			"context":  "channel_accepted",
-		},
+		evidence.DirectionInternal,
+		targetID,
 	)
 
 	// 检查是否所有参与方都已确认
@@ -831,13 +847,10 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 			// 添加存证配置（如果有）
 			if channel.EvidenceConfig != nil {
 				notification.EvidenceConfig = &pb.EvidenceConfig{
-					Mode:           string(channel.EvidenceConfig.Mode),
-					Strategy:       string(channel.EvidenceConfig.Strategy),
-					ConnectorId:    channel.EvidenceConfig.ConnectorID,
-					BackupEnabled:  channel.EvidenceConfig.BackupEnabled,
-					RetentionDays:  int32(channel.EvidenceConfig.RetentionDays),
-					CompressData:   channel.EvidenceConfig.CompressData,
-					CustomSettings: channel.EvidenceConfig.CustomSettings,
+					Mode:          string(channel.EvidenceConfig.Mode),
+					Strategy:      string(channel.EvidenceConfig.Strategy),
+					RetentionDays: int32(channel.EvidenceConfig.RetentionDays),
+					CompressData:  channel.EvidenceConfig.CompressData,
 				}
 			}
 
@@ -1035,16 +1048,13 @@ func (s *ChannelServiceServer) RejectChannelProposal(ctx context.Context, req *p
 	}
 
 	// 记录审计日志
-	s.auditLog.SubmitEvidence(
+	s.auditLog.SubmitBasicEvidence(
 		req.RejecterId,
-		evidence.EventTypeChannelClosed, // 频道被拒绝，相当于关闭
+		evidence.EventTypeChannelClosed,
 		req.ChannelId,
 		req.ProposalId,
-		map[string]string{
-			"rejecter": req.RejecterId,
-			"reason":   req.Reason,
-			"context":  "channel_rejected",
-		},
+		evidence.DirectionInternal,
+		req.RejecterId,
 	)
 
 	// 异步通知频道创建者频道被拒绝
@@ -1089,31 +1099,49 @@ func (s *ChannelServiceServer) RejectChannelProposal(ctx context.Context, req *p
 // StreamData 处理数据流推送
 func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataServer) error {
 	ctx := stream.Context()
-	var senderID string
+		var senderID string
 	var senderIDWithKernel string // 带有 kernel 前缀的 senderID，用于跨内核存证
 	var channelID string
 	var dataHashAccumulator []byte
-	var flowID string      // 业务流程ID，用于跟踪完整的数据传输过程
-	var isCrossKernel bool // 标记是否是跨内核频道
+	var flowID string                 // 业务流程ID，用于跟踪完整的数据传输过程
+	var isCrossKernel bool            // 标记是否是跨内核频道
+	var receiverIDs []string         // 接收方ID列表，用于存证
+	var targetKernelID string         // 目标内核ID（跨内核时）
 
 	for {
 		packet, err := stream.Recv()
 		if err == io.EOF {
 			// 流结束，记录传输完成
 			if channelID != "" && senderID != "" && flowID != "" {
-				log.Printf("🔄 Recording TRANSFER_END for channel %s, sender %s, flow: %s", channelID, senderIDWithKernel, flowID)
+				log.Printf("🔄 Recording DATA_SEND complete for channel %s, sender %s, flow: %s", channelID, senderID, flowID)
 				finalHash := sha256.Sum256(dataHashAccumulator)
-				if _, err := s.auditLog.SubmitEvidenceWithFlowID(
-					flowID,
-					senderIDWithKernel, // 使用带有 kernel 前缀的 senderID
-					evidence.EventTypeTransferEnd,
-					channelID,
-					hex.EncodeToString(finalHash[:]),
-					map[string]string{
-						"packet_count": fmt.Sprintf("%d", len(dataHashAccumulator)/32),
-					},
-				); err != nil {
-					log.Printf("⚠ Failed to submit TRANSFER_END evidence: %v", err)
+
+				// 计算 target_id（与 DATA_SEND 相同的逻辑）
+				targetID := ""
+				if isCrossKernel && targetKernelID != "" {
+					targetID = targetKernelID
+				} else if len(receiverIDs) > 0 {
+					targetID = receiverIDs[0]
+				}
+
+				// 获取当前内核ID
+				currentKernelID := ""
+				if s.multiKernelManager != nil && s.multiKernelManager.config != nil {
+					currentKernelID = s.multiKernelManager.config.KernelID
+				}
+
+				// 记录跨内核传输完成存证：kernel -> remote kernel (DATA_SEND)
+				if isCrossKernel && targetKernelID != "" {
+					if _, err := s.auditLog.SubmitBasicEvidence(
+						currentKernelID,
+						evidence.EventTypeDataSend,
+						channelID,
+						hex.EncodeToString(finalHash[:]),
+						evidence.DirectionInternal,
+						targetID,
+					); err != nil {
+						log.Printf("⚠ Failed to submit cross-kernel DATA_SEND complete evidence: %v", err)
+					}
 				}
 			}
 			return nil
@@ -1146,16 +1174,27 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				return fmt.Errorf("sender %s is not a participant of this channel", senderID)
 			}
 
-			// 检查是否是跨内核频道
-			isCrossKernel = false
-			senderIDWithKernel = senderID
-			for _, receiverID := range channel.ReceiverIDs {
-				if strings.Contains(receiverID, ":") {
-					// 存在远端接收者，这是跨内核频道
-					isCrossKernel = true
-					break
+		// 检查是否是跨内核频道
+		isCrossKernel = false
+		senderIDWithKernel = senderID
+		targetKernelID = ""
+
+		// 获取接收方ID列表
+		receiverIDs = channel.ReceiverIDs
+
+		for _, receiverID := range channel.ReceiverIDs {
+			if strings.Contains(receiverID, ":") {
+				// 存在远端接收者，这是跨内核频道
+				isCrossKernel = true
+				// 提取目标内核ID
+				parts := strings.Split(receiverID, ":")
+				if len(parts) >= 2 {
+					targetKernelID = parts[0]
 				}
+				break
 			}
+		}
+		if !isCrossKernel {
 			for _, senderIDInChannel := range channel.SenderIDs {
 				if strings.Contains(senderIDInChannel, ":") {
 					// 存在远端发送者，这是跨内核频道
@@ -1163,6 +1202,7 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 					break
 				}
 			}
+		}
 
 			// 如果是跨内核频道，构建带有 kernel 前缀的 senderID
 			if isCrossKernel && s.multiKernelManager != nil && s.multiKernelManager.config != nil {
@@ -1171,34 +1211,88 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				log.Printf("🔄 Cross-kernel channel detected, using senderIDWithKernel=%s", senderIDWithKernel)
 			}
 
+			// 获取当前内核ID
+			currentKernelID := ""
+			if s.multiKernelManager != nil && s.multiKernelManager.config != nil {
+				currentKernelID = s.multiKernelManager.config.KernelID
+			}
+
+			// 记录存证：connector -> kernel (DATA_SEND)
+			// 与频道发送方连接器相关，记 DATA_SEND
+			if _, err := s.auditLog.SubmitBasicEvidence(
+				senderID, // source: connector-A (发送方)
+				evidence.EventTypeDataSend,
+				channelID,
+				"",
+				evidence.DirectionInternal,
+				currentKernelID, // target: kernel-1
+			); err != nil {
+				log.Printf("⚠ Failed to submit connector->kernel DATA_SEND evidence: %v", err)
+			}
+
 			// 生成业务流程ID（用于跟踪完整的数据传输过程）
 			flowID = uuid.New().String()
 
-			// 记录传输开始
-			targetsStr := ""
+			// 记录跨内核转发
+			targetID := "" // 目标ID（直接下一跳）
+
 			if len(packet.TargetIds) > 0 {
-				targetsStr = fmt.Sprintf("%v", packet.TargetIds)
+				// 使用第一个目标作为 target_id
+				targetID = packet.TargetIds[0]
 			} else {
-				targetsStr = "broadcast"
+				// 广播模式下，使用所有接收方
+				if len(receiverIDs) > 0 {
+					targetID = receiverIDs[0]
+				}
 			}
 
-			// 生成业务流程ID
-			flowID = uuid.New().String()
+			// 如果是跨内核频道，target 是目标内核
+			if isCrossKernel && targetKernelID != "" {
+				targetID = targetKernelID
+				log.Printf("🔄 Cross-kernel transfer, setting target_id to: %s", targetID)
+			}
 
-			log.Printf("🔄 Recording TRANSFER_START for channel %s, sender %s, flow: %s", channelID, senderIDWithKernel, flowID)
-			if _, err := s.auditLog.SubmitEvidenceWithFlowID(
-				flowID,
-				senderIDWithKernel, // 使用带有 kernel 前缀的 senderID
-				evidence.EventTypeTransferStart,
+			// 记录存证：kernel -> remote kernel (DATA_SEND)
+			// 当前内核是发送方，目标内核是接收方
+			log.Printf("🔄 Recording DATA_SEND for channel %s, sender %s, target %s, flow: %s", channelID, currentKernelID, targetID, flowID)
+			if _, err := s.auditLog.SubmitBasicEvidence(
+				currentKernelID, // source: kernel-1 (发送方)
+				evidence.EventTypeDataSend,
 				channelID,
 				"",
-				map[string]string{
-					"targets": targetsStr,
-				},
+				evidence.DirectionInternal,
+				targetID, // target: kernel-2 (接收方)
 			); err != nil {
-				log.Printf("⚠ Failed to submit TRANSFER_START evidence: %v", err)
+				log.Printf("⚠ Failed to submit kernel->remote DATA_SEND evidence: %v", err)
 			}
 			log.Printf("🔍 DEBUG StreamData: after SubmitEvidence, about to get channel")
+
+			// 记录存证：kernel -> 本地接收方连接器 (DATA_RECEIVE)
+			// 与频道接收方连接器相关，记 DATA_RECEIVE（包括本内核上的 connector-B 等）
+			for _, receiverID := range receiverIDs {
+				// 仅处理本内核上的接收者：
+				// - 裸 ID（本地 connector）
+				// - 或 currentKernelID:connectorID 格式
+				localConnectorID := receiverID
+				if strings.Contains(receiverID, ":") {
+					parts := strings.SplitN(receiverID, ":", 2)
+					if len(parts) < 2 || parts[0] != currentKernelID {
+						continue
+					}
+					localConnectorID = parts[1]
+				}
+
+			if _, err := s.auditLog.SubmitBasicEvidence(
+				currentKernelID,               // source: 当前内核
+				evidence.EventTypeDataReceive, // 与接收方连接器相关
+				channelID,
+				"",
+				evidence.DirectionInternal,
+				localConnectorID, // target: 本地接收方 connector
+			); err != nil {
+					log.Printf("⚠ Failed to submit kernel->local-connector DATA_RECEIVE evidence: %v", err)
+				}
+			}
 		}
 
 		// 获取频道
@@ -1307,13 +1401,10 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 			// 添加存证配置（如果有）
 			if channel.EvidenceConfig != nil {
 				notification.EvidenceConfig = &pb.EvidenceConfig{
-					Mode:           string(channel.EvidenceConfig.Mode),
-					Strategy:       string(channel.EvidenceConfig.Strategy),
-					ConnectorId:    channel.EvidenceConfig.ConnectorID,
-					BackupEnabled:  channel.EvidenceConfig.BackupEnabled,
-					RetentionDays:  int32(channel.EvidenceConfig.RetentionDays),
-					CompressData:   channel.EvidenceConfig.CompressData,
-					CustomSettings: channel.EvidenceConfig.CustomSettings,
+					Mode:          string(channel.EvidenceConfig.Mode),
+					Strategy:      string(channel.EvidenceConfig.Strategy),
+					RetentionDays: int32(channel.EvidenceConfig.RetentionDays),
+					CompressData:  channel.EvidenceConfig.CompressData,
 				}
 			}
 
@@ -1387,14 +1478,13 @@ func (s *ChannelServiceServer) CloseChannel(ctx context.Context, req *pb.CloseCh
 	}
 
 	// 记录频道关闭
-	s.auditLog.SubmitEvidence(
+	s.auditLog.SubmitBasicEvidence(
 		req.RequesterId,
 		evidence.EventTypeChannelClosed,
 		req.ChannelId,
 		"",
-		map[string]string{
-			"closed_by": req.RequesterId,
-		},
+		evidence.DirectionInternal,
+		req.ChannelId,
 	)
 
 	return &pb.CloseChannelResponse{
@@ -2177,17 +2267,13 @@ func (s *ChannelServiceServer) RequestPermissionChange(ctx context.Context, req 
 		eventType = evidence.EventTypePermissionRevoked
 	}
 
-	s.auditLog.SubmitEvidence(
+	s.auditLog.SubmitBasicEvidence(
 		req.RequesterId,
 		eventType,
 		req.ChannelId,
 		request.RequestID,
-		map[string]string{
-			"change_type": req.ChangeType,
-			"target_id":   req.TargetId,
-			"reason":      req.Reason,
-			"context":     "permission_change_request",
-		},
+		evidence.DirectionInternal,
+		req.TargetId,
 	)
 
 	// 注意：不需要手动同步到远程内核，因为 broadcastPermissionRequest 会自动处理跨内核转发
@@ -2314,15 +2400,21 @@ func (s *ChannelServiceServer) ApprovePermissionChange(ctx context.Context, req 
 		}, nil
 	}
 
+	// 获取权限请求信息用于存证
+	permRequest := channel.GetPermissionRequestByID(req.RequestId)
+	targetID := ""
+	if permRequest != nil {
+		targetID = permRequest.TargetID
+	}
+
 	// 异步记录审计日志，避免阻塞 gRPC 响应
-	go s.auditLog.SubmitEvidence(
+	go s.auditLog.SubmitBasicEvidence(
 		req.ApproverId,
 		evidence.EventTypePermissionGranted,
 		req.ChannelId,
 		req.RequestId,
-		map[string]string{
-			"context": "permission_change_approved",
-		},
+		evidence.DirectionInternal,
+		targetID,
 	)
 
 	return &pb.ApprovePermissionChangeResponse{
@@ -2372,16 +2464,13 @@ func (s *ChannelServiceServer) RequestChannelSubscription(ctx context.Context, r
 	}
 
 	// 记录审计日志
-	s.auditLog.SubmitEvidence(
+	s.auditLog.SubmitBasicEvidence(
 		req.SubscriberId,
-		evidence.EventTypePermissionRequest, // 复用权限请求事件类型
+		evidence.EventTypePermissionRequest,
 		req.ChannelId,
 		request.RequestID,
-		map[string]string{
-			"action":         "subscription_request",
-			"requested_role": req.Role,
-			"reason":         req.Reason,
-		},
+		evidence.DirectionInternal,
+		req.ChannelId,
 	)
 
 	return &pb.RequestChannelSubscriptionResponse{
@@ -2420,15 +2509,13 @@ func (s *ChannelServiceServer) ApproveChannelSubscription(ctx context.Context, r
 	}
 
 	// 记录审计日志
-	s.auditLog.SubmitEvidence(
+	s.auditLog.SubmitBasicEvidence(
 		req.ApproverId,
-		evidence.EventTypePermissionGranted, // 复用权限批准事件类型
+		evidence.EventTypePermissionGranted,
 		req.ChannelId,
 		req.RequestId,
-		map[string]string{
-			"action":     "subscription_approved",
-			"subscriber": subscriberID,
-		},
+		evidence.DirectionInternal,
+		subscriberID,
 	)
 
 	// 发送频道更新通知给新订阅者
@@ -2472,15 +2559,23 @@ func (s *ChannelServiceServer) RejectChannelSubscription(ctx context.Context, re
 	}
 
 	// 记录审计日志
-	s.auditLog.SubmitEvidence(
+	// 获取被拒绝的订阅者ID
+	rejectedSubscriber := ""
+	requestID := req.RequestId // pb 请求中的 RequestId
+	for _, permReq := range channel.GetPermissionRequests() {
+		if permReq.RequestID == requestID {
+			rejectedSubscriber = permReq.RequesterID
+			break
+		}
+	}
+
+	s.auditLog.SubmitBasicEvidence(
 		req.ApproverId,
-		evidence.EventTypePermissionDenied, // 复用权限拒绝事件类型
+		evidence.EventTypePermissionDenied,
 		req.ChannelId,
 		req.RequestId,
-		map[string]string{
-			"action": "subscription_rejected",
-			"reason": req.Reason,
-		},
+		evidence.DirectionInternal,
+		rejectedSubscriber,
 	)
 
 	return &pb.RejectChannelSubscriptionResponse{
@@ -2543,16 +2638,21 @@ func (s *ChannelServiceServer) RejectPermissionChange(ctx context.Context, req *
 		}, nil
 	}
 
+	// 获取权限请求信息用于存证
+	permRequest := channel.GetPermissionRequestByID(req.RequestId)
+	targetID := ""
+	if permRequest != nil {
+		targetID = permRequest.TargetID
+	}
+
 	// 记录审计日志
-	s.auditLog.SubmitEvidence(
+	s.auditLog.SubmitBasicEvidence(
 		req.ApproverId,
 		evidence.EventTypePermissionDenied,
 		req.ChannelId,
 		req.RequestId,
-		map[string]string{
-			"reason":  req.Reason,
-			"context": "permission_change_rejected",
-		},
+		evidence.DirectionInternal,
+		targetID,
 	)
 
 	return &pb.RejectPermissionChangeResponse{

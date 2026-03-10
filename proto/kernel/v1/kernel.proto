@@ -51,8 +51,9 @@ message RegisterKernelRequest {
   int32 port = 3;                // 内核端口
   string public_key = 4;         // 内核公钥
   bytes ca_certificate = 7;      // CA证书（PEM格式）
-  map<string, string> metadata = 5; // 元数据
   int64 timestamp = 6;
+  bool is_interconnect_request = 8;  // 是否为互联请求
+  bool is_interconnect_approve = 9;  // 是否为互联批准通知
 }
 
 message RegisterKernelResponse {

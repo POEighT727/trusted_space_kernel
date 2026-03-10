@@ -53,12 +53,10 @@ func NewChannelConfigManager(configDir string) (*ChannelConfigManager, error) {
 		configDir: configDir,
 		configs:   make(map[string]*ChannelConfigFile),
 		defaultConfig: &EvidenceConfig{
-			Mode:           EvidenceModeNone,
-			Strategy:       EvidenceStrategyAll,
-			BackupEnabled:  false,
-			RetentionDays:  30,
-			CompressData:   true,
-			CustomSettings: make(map[string]string),
+			Mode:          EvidenceModeNone,
+			Strategy:      EvidenceStrategyAll,
+			RetentionDays: 30,
+			CompressData:  true,
 		},
 	}
 
@@ -254,17 +252,10 @@ func (cm *ChannelConfigManager) GetDefaultEvidenceConfig() *EvidenceConfig {
 
 	// 返回配置的副本以避免外部修改
 	defaultConfig := &EvidenceConfig{
-		Mode:           cm.defaultConfig.Mode,
-		Strategy:       cm.defaultConfig.Strategy,
-		ConnectorID:    cm.defaultConfig.ConnectorID,
-		BackupEnabled:  cm.defaultConfig.BackupEnabled,
-		RetentionDays:  cm.defaultConfig.RetentionDays,
-		CompressData:   cm.defaultConfig.CompressData,
-		CustomSettings: make(map[string]string),
-	}
-
-	for k, v := range cm.defaultConfig.CustomSettings {
-		defaultConfig.CustomSettings[k] = v
+		Mode:          cm.defaultConfig.Mode,
+		Strategy:      cm.defaultConfig.Strategy,
+		RetentionDays: cm.defaultConfig.RetentionDays,
+		CompressData:  cm.defaultConfig.CompressData,
 	}
 
 	return defaultConfig
@@ -303,9 +294,9 @@ func (cm *ChannelConfigManager) ValidateEvidenceConfig(config *EvidenceConfig) e
 		return nil // nil配置是允许的
 	}
 
-	// 验证存证方式
+	// 验证存证方式（仅支持 none 和 internal）
 	switch config.Mode {
-	case EvidenceModeNone, EvidenceModeInternal, EvidenceModeExternal, EvidenceModeHybrid:
+	case EvidenceModeNone, EvidenceModeInternal:
 		// 有效的存证方式
 	default:
 		return fmt.Errorf("invalid evidence mode: %s", config.Mode)
@@ -317,13 +308,6 @@ func (cm *ChannelConfigManager) ValidateEvidenceConfig(config *EvidenceConfig) e
 		// 有效的存证策略
 	default:
 		return fmt.Errorf("invalid evidence strategy: %s", config.Strategy)
-	}
-
-	// 如果使用外部存证连接器，检查连接器ID
-	if config.Mode == EvidenceModeExternal || config.Mode == EvidenceModeHybrid {
-		if config.ConnectorID == "" {
-			return fmt.Errorf("connector ID is required for external evidence mode")
-		}
 	}
 
 	// 验证保留天数

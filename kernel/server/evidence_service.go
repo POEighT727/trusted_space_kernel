@@ -57,7 +57,6 @@ func (s *EvidenceServiceServer) SubmitEvidence(ctx context.Context, req *pb.Evid
 		eventType,
 		req.ChannelId,
 		req.DataHash,
-		req.Metadata,
 	)
 	if err != nil {
 		return &pb.EvidenceResponse{
@@ -160,7 +159,6 @@ func (s *EvidenceServiceServer) QueryEvidence(ctx context.Context, req *pb.Query
 				DataHash:    record.DataHash,
 				Timestamp:   record.Timestamp.Format(time.RFC3339),
 				Signature:   record.Signature,
-				Metadata:    record.Metadata,
 			},
 			StoredTimestamp: record.Timestamp.Unix(),
 		}

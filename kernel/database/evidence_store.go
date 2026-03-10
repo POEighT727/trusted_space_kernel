@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -20,10 +19,12 @@ type EvidenceStore interface {
 	Update(record *evidence.EvidenceRecord) error
 	Delete(id int64) error
 	Count(filter interface{}) (int64, error)
-	GetByTxID(txID string) ([]*evidence.EvidenceRecord, error)
+	GetByEventID(eventID string) (*evidence.EvidenceRecord, error)
 	GetByChannel(channelID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error)
-	GetByConnector(connectorID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error)
-	GetByChannelAndConnector(channelID, connectorID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error)
+	GetBySource(sourceID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error)
+	GetByTarget(targetID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error)
+	GetByDirection(direction evidence.EvidenceDirection, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error)
+	GetByEventType(eventType evidence.EventType, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error)
 	VerifyRecord(record *evidence.EvidenceRecord) error
 	Close() error
 }
@@ -40,27 +41,22 @@ func NewMySQLEvidenceStore(db *sql.DB) *MySQLEvidenceStore {
 
 // Store 存储证据记录
 func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
-	metadataJSON, err := json.Marshal(record.Metadata)
-	if err != nil {
-		return fmt.Errorf("failed to marshal metadata: %w", err)
-	}
-
 	query := `
 		INSERT INTO evidence_records
-		(tx_id, connector_id, event_type, channel_id, data_hash, signature, timestamp, metadata, record_hash, event_id)
+		(event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, signature, hash, prev_hash)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-	_, err = s.db.Exec(query,
-		record.TxID,
-		record.ConnectorID,
+	_, err := s.db.Exec(query,
+		record.EventID,
 		string(record.EventType),
+		record.Timestamp,
+		record.SourceID,
+		record.TargetID,
 		record.ChannelID,
 		record.DataHash,
 		record.Signature,
-		record.Timestamp,
-		string(metadataJSON),
 		record.Hash,
-		record.EventID,
+		record.PrevHash,
 	)
 
 	if err != nil {
@@ -73,26 +69,20 @@ func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 // GetByID 根据ID获取证据记录
 func (s *MySQLEvidenceStore) GetByID(id int64) (*evidence.EvidenceRecord, error) {
 	query := `
-		SELECT id, tx_id, connector_id, event_type, channel_id, data_hash, signature, timestamp, metadata, record_hash, event_id
+		SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, signature, hash, prev_hash
 		FROM evidence_records WHERE id = ?`
 
 	row := s.db.QueryRow(query, id)
 
 	record := &evidence.EvidenceRecord{}
-	var metadataStr string
 	var dbID int64
 
-	err := row.Scan(&dbID, &record.TxID, &record.ConnectorID, &record.EventType,
-		&record.ChannelID, &record.DataHash, &record.Signature, &record.Timestamp,
-		&metadataStr, &record.Hash, &record.EventID)
+	err := row.Scan(&dbID, &record.EventID, &record.EventType, &record.Timestamp,
+		&record.SourceID, &record.TargetID, &record.ChannelID,
+		&record.DataHash, &record.Signature, &record.Hash, &record.PrevHash)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan evidence record: %w", err)
-	}
-
-	// 解析metadata
-	if err := json.Unmarshal([]byte(metadataStr), &record.Metadata); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}
 
 	return record, nil
@@ -107,17 +97,21 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 	var conditions []string
 	var args []interface{}
 
-	if evidenceFilter.TxID != "" {
-		conditions = append(conditions, "tx_id = ?")
-		args = append(args, evidenceFilter.TxID)
-	}
-	if evidenceFilter.ConnectorID != "" {
-		conditions = append(conditions, "connector_id = ?")
-		args = append(args, evidenceFilter.ConnectorID)
+	if evidenceFilter.EventID != "" {
+		conditions = append(conditions, "event_id = ?")
+		args = append(args, evidenceFilter.EventID)
 	}
 	if evidenceFilter.EventType != "" {
 		conditions = append(conditions, "event_type = ?")
 		args = append(args, evidenceFilter.EventType)
+	}
+	if evidenceFilter.SourceID != "" {
+		conditions = append(conditions, "source_id = ?")
+		args = append(args, evidenceFilter.SourceID)
+	}
+	if evidenceFilter.TargetID != "" {
+		conditions = append(conditions, "target_id = ?")
+		args = append(args, evidenceFilter.TargetID)
 	}
 	if evidenceFilter.ChannelID != "" {
 		conditions = append(conditions, "channel_id = ?")
@@ -146,7 +140,7 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 	}
 
 	query := fmt.Sprintf(`
-		SELECT tx_id, connector_id, event_type, channel_id, data_hash, signature, timestamp, metadata, record_hash, event_id
+		SELECT event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, signature, hash, prev_hash
 		FROM evidence_records %s ORDER BY timestamp DESC %s`,
 		whereClause, limitClause)
 
@@ -159,18 +153,12 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 	var records []*evidence.EvidenceRecord
 	for rows.Next() {
 		record := &evidence.EvidenceRecord{}
-		var metadataStr string
 
-		err := rows.Scan(&record.TxID, &record.ConnectorID, &record.EventType,
-			&record.ChannelID, &record.DataHash, &record.Signature, &record.Timestamp,
-			&metadataStr, &record.Hash, &record.EventID)
+		err := rows.Scan(&record.EventID, &record.EventType, &record.Timestamp,
+			&record.SourceID, &record.TargetID, &record.ChannelID,
+			&record.DataHash, &record.Signature, &record.Hash, &record.PrevHash)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan evidence record: %w", err)
-		}
-
-		// 解析metadata
-		if err := json.Unmarshal([]byte(metadataStr), &record.Metadata); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
 		}
 
 		records = append(records, record)
@@ -181,29 +169,23 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 
 // Update 更新证据记录
 func (s *MySQLEvidenceStore) Update(record *evidence.EvidenceRecord) error {
-	metadataJSON, err := json.Marshal(record.Metadata)
-	if err != nil {
-		return fmt.Errorf("failed to marshal metadata: %w", err)
-	}
-
 	query := `
 		UPDATE evidence_records
-		SET connector_id = ?, event_type = ?, channel_id = ?, data_hash = ?,
-		    signature = ?, timestamp = ?, metadata = ?, record_hash = ?, event_id = ?
-		WHERE tx_id = ? AND event_type = ?`
+		SET event_type = ?, timestamp = ?, source_id = ?, target_id = ?,
+		    channel_id = ?, data_hash = ?, signature = ?, hash = ?, prev_hash = ?
+		WHERE event_id = ?`
 
-	_, err = s.db.Exec(query,
-		record.ConnectorID,
+	_, err := s.db.Exec(query,
 		string(record.EventType),
+		record.Timestamp,
+		record.SourceID,
+		record.TargetID,
 		record.ChannelID,
 		record.DataHash,
 		record.Signature,
-		record.Timestamp,
-		string(metadataJSON),
 		record.Hash,
+		record.PrevHash,
 		record.EventID,
-		record.TxID,
-		string(record.EventType),
 	)
 
 	if err != nil {
@@ -229,17 +211,21 @@ func (s *MySQLEvidenceStore) Count(filter interface{}) (int64, error) {
 	var conditions []string
 	var args []interface{}
 
-	if evidenceFilter.TxID != "" {
-		conditions = append(conditions, "tx_id = ?")
-		args = append(args, evidenceFilter.TxID)
-	}
-	if evidenceFilter.ConnectorID != "" {
-		conditions = append(conditions, "connector_id = ?")
-		args = append(args, evidenceFilter.ConnectorID)
+	if evidenceFilter.EventID != "" {
+		conditions = append(conditions, "event_id = ?")
+		args = append(args, evidenceFilter.EventID)
 	}
 	if evidenceFilter.EventType != "" {
 		conditions = append(conditions, "event_type = ?")
 		args = append(args, evidenceFilter.EventType)
+	}
+	if evidenceFilter.SourceID != "" {
+		conditions = append(conditions, "source_id = ?")
+		args = append(args, evidenceFilter.SourceID)
+	}
+	if evidenceFilter.TargetID != "" {
+		conditions = append(conditions, "target_id = ?")
+		args = append(args, evidenceFilter.TargetID)
 	}
 	if evidenceFilter.ChannelID != "" {
 		conditions = append(conditions, "channel_id = ?")
@@ -270,10 +256,25 @@ func (s *MySQLEvidenceStore) Count(filter interface{}) (int64, error) {
 	return count, nil
 }
 
-// GetByTxID 根据事务ID获取证据记录
-func (s *MySQLEvidenceStore) GetByTxID(txID string) ([]*evidence.EvidenceRecord, error) {
-	filter := evidence.EvidenceFilter{TxID: txID}
-	return s.Query(filter)
+// GetByEventID 根据事件ID获取证据记录
+func (s *MySQLEvidenceStore) GetByEventID(eventID string) (*evidence.EvidenceRecord, error) {
+	query := `SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, signature, hash, prev_hash
+		FROM evidence_records WHERE event_id = ?`
+
+	row := s.db.QueryRow(query, eventID)
+
+	record := &evidence.EvidenceRecord{}
+	var dbID int64
+
+	err := row.Scan(&dbID, &record.EventID, &record.EventType, &record.Timestamp,
+		&record.SourceID, &record.TargetID, &record.ChannelID,
+		&record.DataHash, &record.Signature, &record.Hash, &record.PrevHash)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan evidence record: %w", err)
+	}
+
+	return record, nil
 }
 
 // GetByChannel 根据频道获取证据记录
@@ -286,30 +287,48 @@ func (s *MySQLEvidenceStore) GetByChannel(channelID string, startTime, endTime *
 	return s.Query(filter)
 }
 
-// GetByConnector 根据连接器获取证据记录
-func (s *MySQLEvidenceStore) GetByConnector(connectorID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error) {
+// GetBySource 根据来源获取证据记录
+func (s *MySQLEvidenceStore) GetBySource(sourceID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error) {
 	filter := evidence.EvidenceFilter{
-		ConnectorID: connectorID,
-		StartTime:   startTime,
-		EndTime:     endTime,
+		SourceID: sourceID,
+		StartTime: startTime,
+		EndTime:   endTime,
 	}
 	return s.Query(filter)
 }
 
-// GetByChannelAndConnector 根据频道和连接器获取证据记录
-func (s *MySQLEvidenceStore) GetByChannelAndConnector(channelID, connectorID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error) {
+// GetByTarget 根据目标获取证据记录
+func (s *MySQLEvidenceStore) GetByTarget(targetID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error) {
 	filter := evidence.EvidenceFilter{
-		ChannelID:   channelID,
-		ConnectorID: connectorID,
-		StartTime:   startTime,
-		EndTime:     endTime,
+		TargetID: targetID,
+		StartTime: startTime,
+		EndTime:   endTime,
+	}
+	return s.Query(filter)
+}
+
+// GetByDirection 根据方向获取证据记录
+func (s *MySQLEvidenceStore) GetByDirection(direction evidence.EvidenceDirection, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error) {
+	filter := evidence.EvidenceFilter{
+		Direction: string(direction),
+		StartTime: startTime,
+		EndTime:   endTime,
+	}
+	return s.Query(filter)
+}
+
+// GetByEventType 根据事件类型获取证据记录
+func (s *MySQLEvidenceStore) GetByEventType(eventType evidence.EventType, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error) {
+	filter := evidence.EvidenceFilter{
+		EventType: string(eventType),
+		StartTime: startTime,
+		EndTime:   endTime,
 	}
 	return s.Query(filter)
 }
 
 // VerifyRecord 验证证据记录
 func (s *MySQLEvidenceStore) VerifyRecord(record *evidence.EvidenceRecord) error {
-	// 计算记录哈希并验证
 	calculatedHash := s.calculateRecordHash(record)
 	if calculatedHash != record.Hash {
 		return fmt.Errorf("hash mismatch: expected=%s, got=%s", record.Hash, calculatedHash)
@@ -319,25 +338,19 @@ func (s *MySQLEvidenceStore) VerifyRecord(record *evidence.EvidenceRecord) error
 
 // calculateRecordHash 计算记录哈希
 func (s *MySQLEvidenceStore) calculateRecordHash(record *evidence.EvidenceRecord) string {
-	// 实现哈希计算逻辑，包含event_id
-	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%d|%s",
-		record.TxID,
-		record.ConnectorID,
+	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%d|%s",
+		record.EventID,
 		record.EventType,
+		record.SourceID,
+		record.TargetID,
+		record.Direction,
 		record.ChannelID,
 		record.DataHash,
 		record.Signature,
 		record.Timestamp.Unix(),
-		record.EventID,
+		record.PrevHash,
 	)
 
-	// 如果有metadata，包含在哈希中
-	if len(record.Metadata) > 0 {
-		metadataJSON, _ := json.Marshal(record.Metadata)
-		data += "|" + string(metadataJSON)
-	}
-
-	// 使用SHA256计算哈希
 	hash := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(hash[:])
 }

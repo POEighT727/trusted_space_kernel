@@ -1,65 +1,178 @@
-# 可信数据空间内核 (Trusted Data Space Kernel)
+# Trusted Data Space Kernel (可信数据空间内核)
 
-基于"内核+外延"设计原则的可信数据空间内核架构实现。
+A standardized, lightweight core component for Trusted Data Space, implementing the "Kernel + Extension" architecture design.
 
-## 📋 架构概览
+[![Go Version](https://img.shields.io/badge/Go-1.21%2B-blue)](https://go.dev/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-本项目实现了一个**标准化、轻量级的可信数据空间内核**，包含以下核心组件：
+## Overview
 
-### 核心内核层 (Kernel Layer)
+This project implements a **standardized, lightweight Trusted Data Space Kernel** with the following core components:
 
-1. **安全认证模块 (Security Hub)**
-   - 内部 CA：证书签发与撤销
-   - mTLS 终结：基于 TLS 1.3 的双向认证
+### Core Kernel Layer
 
-2. **管控模块 (Control Plane)**
-   - 身份注册表：维护连接器信息
-   - 权限策略引擎：基于策略验证请求合法性
+1. **Security Module**
+   - Internal CA: Certificate issuance and revocation
+   - mTLS Termination: TLS 1.3 based mutual authentication
 
-3. **流通调度模块 (Circulation Plane)**
-   - 频道管理：管理数据传输通道
-   - 数据中转：提供加密数据流中转
+2. **Control Module**
+   - Identity Registry: Manages connector information
+   - Policy Engine: Validates request legitimacy based on policies
 
-4. **存证模块 (Evidence Plane)**
-   - 溯源日志：记录所有关键事件的哈希
-   - 链式存储：确保审计日志不可篡改
+3. **Circulation Module**
+   - Channel Management: Manages data transmission channels
+   - Data Relay: Provides encrypted data streaming relay
 
-### 实体外延层 (Extension Layer)
+4. **Evidence Module**
+   - Audit Logging: Records hashes of all critical events
+   - Chain Storage: Ensures audit logs are tamper-proof
 
-- **连接器 (Connector)**：作为实体进入数据空间的网关，通过标准 gRPC 接口与内核交互
+### Extension Layer
 
-## 🚀 快速开始
+- **Connector**: Acts as the gateway for entities to enter the data space, interacting with the kernel via standard gRPC interfaces
 
-### 前置要求
+---
+
+## Core Concepts
+
+- **Kernel Standardization**: The kernel is a standardized "operating system" providing unified interface specifications
+- **Extension Flexibility**: Connectors as extension components can flexibly adapt to various business scenarios
+- **Interoperability**: Standard gRPC interfaces enable cross-organization and cross-system interoperability
+- **Security Foundation**: Zero-trust security architecture based on mTLS
+
+---
+
+## Architecture
+
+### Overall Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Trusted Data Space                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│    Organization-A                   Organization-B              Organization-C│
+│  ┌─────────────┐               ┌─────────────┐               ┌───────────┐ │
+│  │   Kernel   │◄─────────────►│   Kernel   │◄─────────────►│   Kernel  │ │
+│  │ kernel-1   │    mTLS      │ kernel-2   │    mTLS      │ kernel-3  │ │
+│  │ :50051     │               │ :50051     │               │ :50051    │ │
+│  │ :50053     │               │ :50053     │               │ :50053    │ │
+│  └──────┬──────┘               └──────┬──────┘               └─────┬─────┘ │
+│         │                              │                              │       │
+│    ┌────┴────┐                    ┌────┴────┐                    ┌────┴────┐  │
+│    │Connector │                    │Connector │                    │Connector │  │
+│    │  A1     │                    │  B1     │                    │  C1     │  │
+│    │  A2     │                    │  B2     │                    │  C2     │  │
+│    └─────────┘                    └─────────┘                    └─────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Event Types
+
+### Authentication Events
+| Event Type | Description |
+|-----------|-------------|
+| AUTH_SUCCESS | Connector authentication successful |
+| AUTH_FAILED | Connector authentication failed |
+| AUTH_TIMEOUT | Authentication timeout |
+
+### Interconnection Events
+| Event Type | Description |
+|-----------|-------------|
+| INTERCONNECT_REQUESTED | Kernel interconnection request initiated |
+| INTERCONNECT_APPROVED | Interconnection request approved |
+| INTERCONNECT_REJECTED | Interconnection request rejected |
+| INTERCONNECT_CLOSED | Interconnection closed |
+
+### Channel Management Events
+| Event Type | Description |
+|-----------|-------------|
+| CHANNEL_PROPOSED | Channel proposal created |
+| CHANNEL_ACCEPTED | Channel proposal accepted |
+| CHANNEL_REJECTED | Channel proposal rejected |
+| CHANNEL_CREATED | Channel officially created |
+| CHANNEL_CLOSED | Channel closed |
+| CHANNEL_SUBSCRIBED | Channel subscribed |
+| CHANNEL_UNSUBSCRIBED | Channel unsubscribed |
+
+### Data Transfer Events
+| Event Type | Description |
+|-----------|-------------|
+| DATA_SEND | Data sent (connector→kernel or kernel→kernel) |
+| DATA_RECEIVE | Data received (kernel→connector or kernel→kernel) |
+
+### Permission Management Events
+| Event Type | Description |
+|-----------|-------------|
+| PERMISSION_REQUESTED | Permission change requested |
+| PERMISSION_GRANTED | Permission granted |
+| PERMISSION_REJECTED | Permission rejected |
+| PERMISSION_REVOKED | Permission revoked |
+
+---
+
+## Typical Data Flow Scenarios
+
+### Scenario 1: Single Kernel Data Transfer
+
+```
+connector-A ──────► kernel-1 ──────► connector-B
+
+Evidence Records:
+1. DATA_SEND: connector-A → kernel-1
+2. DATA_RECEIVE: kernel-1 → connector-B
+```
+
+### Scenario 2: Cross-Kernel Data Transfer (Two Hops)
+
+```
+connector-A ──► kernel-1 ──► kernel-2 ──► connector-U
+
+Evidence Records:
+1. DATA_SEND: connector-A → kernel-1         (local send)
+2. DATA_SEND: kernel-1 → kernel-2           (cross-kernel forward)
+3. DATA_RECEIVE: kernel-1 → kernel-2        (arrived at target kernel)
+4. DATA_RECEIVE: kernel-2 → connector-U     (delivered to receiver)
+```
+
+---
+
+## Quick Start
+
+### Prerequisites
 
 - Go 1.21+
 - Protocol Buffers compiler (protoc)
-- OpenSSL（用于生成测试证书）
-- Make（可选，用于简化构建）
+- OpenSSL (for generating test certificates)
+- Make (optional, for simplified building)
+- MySQL 5.7+ (optional, file storage is used by default)
 
-### 安装步骤
+### Installation Steps
 
-#### 1. 克隆并安装依赖
+#### 1. Clone and Install Dependencies
 
 ```bash
 git clone <repository-url>
-cd trusted-data-space-kernel
+cd trusted-space-kernel
 
-# 安装 Go 依赖
+# Install Go dependencies
 go mod download
 
-# 安装 protoc 插件
+# Install protoc plugins
 go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 ```
 
-#### 2. 生成 Protobuf 代码
+#### 2. Generate Protobuf Code
 
 ```bash
 make proto
 ```
 
-或手动执行：
+Or manually:
 
 ```bash
 mkdir -p api/v1
@@ -68,7 +181,7 @@ protoc --go_out=. --go_opt=paths=source_relative \
     proto/kernel/v1/*.proto
 ```
 
-#### 3. 生成测试证书
+#### 3. Generate Test Certificates
 
 **Linux/Mac:**
 
@@ -83,34 +196,34 @@ chmod +x scripts/gen_certs.sh
 .\scripts\gen_certs.ps1
 ```
 
-#### 4. 创建日志目录
+#### 4. Create Log Directory
 
 ```bash
 mkdir -p logs
 ```
 
-#### 5. 编译内核和连接器
+#### 5. Build Kernel and Connector
 
 ```bash
 make all
 ```
 
-或手动编译：
+Or manually:
 
 ```bash
-go build -o bin/kernel ./kernel/cmd
-go build -o bin/connector ./connector/cmd
+go build -o bin/kernel.exe ./kernel/cmd
+go build -o bin/connector.exe ./connector/cmd
 ```
 
-### 运行示例
+### Running Examples
 
-#### 终端 1：启动内核
+#### Terminal 1: Start Kernel
 
 ```bash
-./bin/kernel -config config/kernel.yaml
+./bin/kernel.exe --config config/kernel.yaml
 ```
 
-输出应包含：
+Output should include:
 
 ```
 ✓ Registry initialized
@@ -122,139 +235,415 @@ go build -o bin/connector ./connector/cmd
 🚀 Trusted Data Space Kernel started on 0.0.0.0:50051
 ```
 
-#### 终端 2：启动接收方连接器（Connector B）
+#### Terminal 2: Start Connector
 
 ```bash
-./bin/connector -config config/connector-B.yaml -mode receiver -channel <channel-id>
+./bin/connector.exe --config config/connector.yaml
 ```
 
-**注意**：第一次运行时，你需要先启动发送方以获取 channel ID。
+The connector will automatically register and obtain a certificate on first run.
 
-#### 终端 3：启动发送方连接器（Connector A）
+---
+
+## Interactive Commands
+
+### Kernel Commands
 
 ```bash
-./bin/connector -config config/connector.yaml -mode sender -receiver connector-B
+# View status
+status
+
+# List connectors
+connectors or cs
+
+# List channels
+channels or ch
+
+# List known kernels
+kernels or ks
+
+# Connect to another kernel
+connect-kernel <kernel_id> <address> <port>
+# Example: connect-kernel kernel-2 192.168.202.136 50053
+
+# Approve interconnection request
+approve-request <request_id>
+
+# List pending requests
+pending-requests
+
+# Disconnect kernel
+disconnect-kernel <kernel_id>
+
+# Multi-hop routes
+routes, rt                    # List all routes
+load-route <filename>         # Load route configuration
+connect-route <route_name>    # Connect to specified route
+route-info <route_name>       # View route details
+
+# Exit
+exit or quit
 ```
 
-发送方会：
-1. 创建到 connector-B 的频道
-2. 发送测试数据
-3. 提交存证记录
-4. 关闭频道
+### Connector Commands
 
-#### 完整演示流程
+```bash
+# List connectors
+list or ls
 
-1. 启动内核（终端 1）
-2. 启动发送方并记录显示的 `channel-id`（终端 3）
-3. 使用该 `channel-id` 启动接收方（终端 2）
-4. 观察数据流转和存证记录
+# View connector info
+info <connector_id>
 
-## 📡 接口定义
+# Create channel (proposal)
+create --config <config_file>
+create --sender <sender_ids> --receiver <receiver_ids> --reason <reason>
 
-### Identity Service（身份与准入服务）
+# Accept channel proposal
+accept <channel_id> <proposal_id>
+
+# Reject channel proposal
+reject <channel_id> <proposal_id> --reason <reason>
+
+# Send data
+sendto <channel_id> [file_path]
+# Example: sendto <channel-id>
+#         (enter data, press Enter to send, type END to finish)
+
+# Subscribe to channel
+subscribe <channel_id>
+
+# View joined channels
+channels or ch
+
+# Query evidence records
+query-evidence --channel <channel_id>
+query-evidence --connector <connector_id>
+query-evidence --flow <flow_id>
+
+# Permission management
+request-permission <channel_id> <change_type> <target_id> <reason>
+approve-permission <channel_id> <request_id>
+reject-permission <channel_id> <request_id> <reason>
+list-permissions <channel_id>
+
+# Set status
+status [active|inactive|closed]
+
+# Help
+help
+```
+
+---
+
+## Demo: Cross-Kernel Data Transfer
+
+### 1. Environment Setup
+
+```
+┌─────────────────────┐          ┌─────────────────────┐
+│   kernel-1          │          │   kernel-2          │
+│   192.168.31.155    │◄────────►│   192.168.202.136  │
+│   (Windows)         │   mTLS   │   (Linux VM)       │
+└─────────┬───────────┘          └─────────┬───────────┘
+          │                              │
+    connector-A                    connector-U
+```
+
+### 2. Start Services
+
+```bash
+# Start kernel-1 (Windows)
+.\bin\kernel.exe --config .\config\kernel.yaml
+
+# Start kernel-2 (Linux)
+./bin/kernel.exe --config config/kernel.yaml
+```
+
+### 3. Establish Kernel Interconnection
+
+```bash
+# On kernel-1
+connect-kernel kernel-2 192.168.202.136 50053
+
+# On kernel-2
+approve-request <request_id>
+```
+
+### 4. Connectors Join
+
+```bash
+# On kernel-1
+.\bin\connector.exe --config .\config\connector-A.yaml
+
+# On kernel-2
+./bin/connector.exe --config config/connector-U.yaml
+```
+
+### 5. Create Cross-Kernel Channel
+
+```bash
+# On connector-A
+create --sender connector-A --receiver kernel-2:connector-U --reason "Test data transfer"
+
+# On connector-U
+accept <channel_id> <proposal_id>
+```
+
+### 6. Send Data
+
+```bash
+# On connector-A
+sendto <channel_id>
+# Enter data content
+# Type END to finish sending
+```
+
+### 7. View Evidence Records
+
+```bash
+# Query on kernel
+query-evidence --channel <channel_id>
+```
+
+---
+
+## Evidence Record Examples
+
+When connector-A sends "hello" data to connector-U through a cross-kernel channel, the following evidence records are generated:
+
+### kernel-1 Evidence Records
+
+| Event Type | source_id | target_id | Description |
+|-----------|-----------|-----------|-------------|
+| AUTH_SUCCESS | connector-A | kernel-1 | Connector authentication successful |
+| INTERCONNECT_REQUESTED | kernel-1 | kernel-2 | Kernel interconnection initiated |
+| CHANNEL_CREATED | kernel-1 | kernel-1 | Channel created successfully |
+| DATA_SEND | connector-A | kernel-1 | connector-A sends data to kernel |
+| DATA_SEND | kernel-1 | kernel-2 | Kernel forwards to target kernel |
+| DATA_SEND | kernel-1 | kernel-2 | Forward completion confirmed (with data_hash) |
+
+### kernel-2 Evidence Records
+
+| Event Type | source_id | target_id | Description |
+|-----------|-----------|-----------|-------------|
+| AUTH_SUCCESS | connector-U | kernel-2 | Connector authentication successful |
+| INTERCONNECT_APPROVED | kernel-2 | kernel-1 | Interconnection request approved |
+| CHANNEL_CREATED | kernel-2 | kernel-2 | Channel created successfully |
+| DATA_RECEIVE | kernel-1 | kernel-2 | Data received from kernel-1 |
+| DATA_RECEIVE | kernel-2 | connector-U | Delivered to target connector |
+
+---
+
+## Port Configuration
+
+Each kernel uses three ports for communication:
+
+| Port | Purpose | Description |
+|------|---------|-------------|
+| 50051 | Main Service | Provides IdentityService, ChannelService, EvidenceService |
+| 50052 | Bootstrap | Used for connector certificate application during first registration |
+| 50053 | Kernel-to-Kernel | Used for kernel interconnection (P2P communication) |
+
+---
+
+## gRPC Service Interfaces
+
+### 1. IdentityService
 
 ```protobuf
 service IdentityService {
-  rpc Register (RegisterRequest) returns (RegisterResponse);
-  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc DiscoverConnectors(DiscoverRequest) returns (DiscoverResponse);
+  rpc DiscoverCrossKernelConnectors(CrossKernelDiscoverRequest) returns (CrossKernelDiscoverResponse);
+  rpc GetConnectorInfo(GetConnectorInfoRequest) returns (GetConnectorInfoResponse);
+  rpc SetConnectorStatus(SetConnectorStatusRequest) returns (SetConnectorStatusResponse);
+  rpc RegisterConnector(RegisterConnectorRequest) returns (RegisterConnectorResponse);
 }
 ```
 
-### Channel Service（流通与频道服务）
+### 2. ChannelService
 
 ```protobuf
 service ChannelService {
-  rpc CreateChannel (CreateChannelRequest) returns (CreateChannelResponse);
-  rpc StreamData (stream DataPacket) returns (stream TransferStatus);
-  rpc SubscribeData (SubscribeRequest) returns (stream DataPacket);
-  rpc CloseChannel (CloseChannelRequest) returns (CloseChannelResponse);
-  rpc GetChannelInfo (GetChannelInfoRequest) returns (GetChannelInfoResponse);
-  rpc ListChannels (ListChannelsRequest) returns (ListChannelsResponse);
+  rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
+  rpc StreamData(stream DataPacket) returns (stream TransferStatus);
+  rpc SubscribeData(SubscribeRequest) returns (stream DataPacket);
+  rpc CloseChannel(CloseChannelRequest) returns (CloseChannelResponse);
+  rpc GetChannelInfo(GetChannelInfoRequest) returns (GetChannelInfoResponse);
+
+  // Negotiation
+  rpc ProposeChannel(ProposeChannelRequest) returns (ProposeChannelResponse);
+  rpc AcceptChannelProposal(AcceptChannelProposalRequest) returns (AcceptChannelProposalResponse);
+  rpc RejectChannelProposal(RejectChannelProposalRequest) returns (RejectChannelProposalResponse);
+
+  // Subscription
+  rpc RequestChannelSubscription(RequestChannelSubscriptionRequest) returns (RequestChannelSubscriptionResponse);
+  rpc ApproveChannelSubscription(ApproveChannelSubscriptionRequest) returns (ApproveChannelSubscriptionResponse);
+  rpc RejectChannelSubscription(RejectChannelSubscriptionRequest) returns (RejectChannelSubscriptionResponse);
+
+  // Permission
+  rpc RequestPermissionChange(RequestPermissionChangeRequest) returns (RequestPermissionChangeResponse);
+  rpc ApprovePermissionChange(ApprovePermissionChangeRequest) returns (ApprovePermissionChangeResponse);
+  rpc RejectPermissionChange(RejectPermissionChangeRequest) returns (RejectPermissionChangeResponse);
 }
 ```
 
-### Evidence Service（存证溯源服务）
+### 3. EvidenceService
 
 ```protobuf
 service EvidenceService {
-  rpc SubmitEvidence (EvidenceRequest) returns (EvidenceResponse);
-  rpc QueryEvidence (QueryRequest) returns (QueryResponse);
-  rpc VerifyEvidence (VerifyEvidenceRequest) returns (VerifyEvidenceResponse);
+  rpc SubmitEvidence(EvidenceRequest) returns (EvidenceResponse);
+  rpc QueryEvidence(QueryRequest) returns (QueryResponse);
+  rpc VerifyEvidenceSignature(VerifySignatureRequest) returns (VerifySignatureResponse);
 }
 ```
 
-完整的 Protocol Buffers 定义见 `proto/kernel/v1/` 目录。
+### 4. KernelService
 
-## 🔐 安全机制
-
-### mTLS 双向认证
-
-- 所有连接器必须持有由内部 CA 签发的有效 X.509 证书
-- 使用 TLS 1.3 进行加密通信
-- 连接器 ID 必须与证书 CN（Common Name）字段匹配
-
-### 权限策略引擎
-
-支持细粒度的访问控制：
-
-```go
-// 示例：允许 connector-A 向 connector-B 发送数据
-policyEngine.AddRule(&PolicyRule{
-    SenderID:   "connector-A",
-    ReceiverID: "connector-B",
-    Allowed:    true,
-})
+```protobuf
+service KernelService {
+  rpc RegisterKernel(RegisterKernelRequest) returns (RegisterKernelResponse);
+  rpc KernelHeartbeat(KernelHeartbeatRequest) returns (KernelHeartbeatResponse);
+  rpc DiscoverKernels(DiscoverKernelsRequest) returns (DiscoverKernelsResponse);
+  rpc SyncKnownKernels(SyncKnownKernelsRequest) returns (SyncKnownKernelsResponse);
+  rpc CreateCrossKernelChannel(CreateCrossKernelChannelRequest) returns (CreateCrossKernelChannelResponse);
+  rpc ForwardData(ForwardDataRequest) returns (ForwardDataResponse);
+  rpc GetCrossKernelChannelInfo(GetCrossKernelChannelInfoRequest) returns (GetCrossKernelChannelInfoResponse);
+  rpc SyncConnectorInfo(SyncConnectorInfoRequest) returns (SyncConnectorInfoResponse);
+}
 ```
 
-### 控制消息系统
+---
 
-支持频道运行时的权限和配置管理：
-- **权限变更请求**：动态调整频道参与者权限
-- **频道提议**：多方协商创建频道
-- **状态同步**：实时同步频道状态变化
+## Evidence Chain Structure
 
-### 存证溯源
-
-所有关键操作自动记录并签名，确保不可抵赖：
-- `CHANNEL_CREATED/CLOSED`：频道生命周期
-- `TRANSFER_START/END`：数据传输过程
-- `AUTH_SUCCESS/FAIL`：认证结果
-- `PERMISSION_REQUEST/GRANTED`：权限变更
-- `CONNECTOR_REGISTERED/ONLINE/OFFLINE`：连接器状态
-
-支持文件存储和数据库存储两种后端。
-
-## 📂 项目结构
+Each evidence record uses a chain structure:
 
 ```
-.
-├── proto/                    # Protocol Buffer 定义
-│   └── kernel/v1/
-│       ├── identity.proto
-│       ├── channel.proto
-│       └── evidence.proto
-├── kernel/                   # 内核实现
-│   ├── cmd/                  # 内核主程序
-│   ├── server/               # gRPC 服务实现
-│   ├── security/             # 安全认证模块
-│   ├── control/              # 管控模块
-│   ├── circulation/          # 流通调度模块
-│   └── evidence/             # 存证模块
-├── connector/                # 连接器实现
-│   ├── cmd/                  # 连接器主程序
-│   └── client/               # 连接器客户端库
-├── config/                   # 配置文件
-├── scripts/                  # 工具脚本
-├── certs/                    # 证书目录（生成后）
-├── logs/                     # 日志目录
-├── Makefile
-├── go.mod
-└── README.md
+Record N:
+{
+  EventID: "uuid",
+  EventType: "DATA_SEND",
+  SourceID: "connector-A",
+  TargetID: "kernel-1",
+  ChannelID: "channel-uuid",
+  DataHash: "sha256(...)",
+  Signature: "RSA signature",
+  Hash: "sha256(this record)",
+  PrevHash: "hash of Record N-1"
+}
+    │
+    ↓ Link
+Record N+1:
+{
+  PrevHash: "hash of Record N",  ← Points to previous
+  Hash: "sha256(this record)"
+}
 ```
 
-## 🔧 配置说明
+### Evidence Fields
 
-### 内核配置 (`config/kernel.yaml`)
+| Field | Description |
+|-------|-------------|
+| event_id | Unique event identifier (UUID) |
+| event_type | Event type |
+| timestamp | Timestamp (microsecond precision) |
+| source_id | Event source (connector or kernel) |
+| target_id | Target ID (next hop) |
+| channel_id | Associated channel ID |
+| data_hash | Data hash (optional) |
+| signature | Kernel digital signature |
+| hash | Record content hash |
+| prev_hash | Previous record's hash (hash chain) |
+| metadata | Extended metadata (JSON) |
+
+---
+
+## Security Features
+
+| Layer | Mechanism |
+|-------|-----------|
+| Transport | TLS 1.3 Encryption |
+| Authentication | mTLS Mutual Authentication |
+| Authorization | Policy Engine Fine-grained Control |
+| Audit | Full Evidence Recording |
+
+---
+
+## Project Structure
+
+```
+trusted_space_kernel/
+├── bin/                        # Compiled executables
+│   ├── kernel.exe              # Kernel executable
+│   └── connector.exe           # Connector executable
+├── certs/                      # Certificate directory
+│   ├── ca.crt                  # CA root certificate
+│   ├── kernel.crt              # Kernel certificate
+│   └── ...
+├── channel_configs/            # Channel configuration directory
+├── channels/                   # Channel data directory
+├── config/                     # Configuration files
+│   ├── kernel.yaml            # Kernel configuration
+│   ├── connector.yaml          # Connector configuration
+│   └── ...
+├── connector/                  # Connector implementation
+│   ├── cmd/
+│   │   └── main.go             # Connector entry
+│   └── client/
+│       └── connector.go        # Connector client
+├── docs/                       # Documentation
+│   ├── CORE.md                # Core module documentation
+│   └── MULTI_KERNEL_NETWORK.md # Multi-kernel network documentation
+├── kernel/                     # Kernel implementation
+│   ├── bin/
+│   ├── circulation/            # Circulation module
+│   │   ├── channel_manager.go  # Channel manager
+│   │   └── channel_config.go  # Channel configuration
+│   ├── cmd/
+│   │   └── main.go            # Kernel entry
+│   ├── control/                # Control module
+│   │   ├── policy.go           # Policy engine
+│   │   └── registry.go        # Identity registry
+│   ├── database/               # Database module
+│   │   ├── evidence_store.go   # Evidence storage
+│   │   └── mysql.go           # MySQL support
+│   ├── evidence/              # Evidence module
+│   │   └── audit_log.go       # Audit log
+│   ├── security/              # Security module
+│   │   ├── ca.go              # CA certificate management
+│   │   ├── mtls.go            # mTLS configuration
+│   │   └── signing.go         # Digital signature
+│   └── server/                 # gRPC services
+│       ├── channel_service.go  # Channel service
+│       ├── identity_service.go # Identity service
+│       ├── evidence_service.go # Evidence service
+│       ├── kernel_service.go   # Kernel service
+│       ├── multi_kernel_manager.go    # Multi-kernel manager
+│       └── multi_hop_config.go        # Multi-hop configuration
+├── kernel_configs/             # Multi-hop route configuration
+├── proto/                      # Protocol Buffers definitions
+│   └── kernel/
+│       └── v1/
+│           ├── kernel.proto    # Kernel-to-kernel communication
+│           ├── channel.proto   # Channel service
+│           ├── identity.proto  # Identity service
+│           └── evidence.proto  # Evidence service
+├── scripts/                    # Script tools
+│   ├── gen_certs.sh/ps1       # Certificate generation
+│   ├── quick_start.sh/ps1     # Quick start
+│   └── package_all.sh/ps1     # Packaging tool
+├── go.mod                      # Go module definition
+├── go.sum                      # Dependency checksum
+└── Makefile                    # Build script
+```
+
+---
+
+## Configuration
+
+### Kernel Configuration (config/kernel.yaml)
 
 ```yaml
 server:
@@ -271,16 +660,15 @@ evidence:
   log_file_path: "logs/audit.log"
 
 policy:
-  default_allow: true  # 默认策略
+  default_allow: true
 ```
 
-### 连接器配置 (`config/connector.yaml`)
+### Connector Configuration (config/connector.yaml)
 
 ```yaml
 connector:
   id: "connector-A"
   entity_type: "data_source"
-  public_key: "mock_public_key_abc123"
 
 kernel:
   address: "localhost"
@@ -293,113 +681,92 @@ security:
   server_name: "trusted-data-space-kernel"
 ```
 
-## 🧪 开发指南
+---
 
-### 添加新的连接器
+## Build and Package
 
-1. 复制并修改配置文件：
-
-```bash
-cp config/connector.yaml config/connector-C.yaml
-```
-
-2. 修改 `connector_id` 为 `connector-C`
-
-3. 生成证书（已在 `gen_certs.sh` 中包含）
-
-4. 启动连接器：
+### Build
 
 ```bash
-./bin/connector -config config/connector-C.yaml -mode sender -receiver connector-A
+# Build kernel
+make build-kernel
+
+# Build connector
+make build-connector
+
+# Build all
+make build
 ```
 
-### 自定义权限策略
+### Package
 
-在 `kernel/control/policy.go` 的 `LoadDefaultRules()` 中添加规则：
+```bash
+# Linux/Mac
+./scripts/package_all.sh 1.0.0 linux-amd64 all
 
-```go
-pe.AddRule(&PolicyRule{
-    SenderID:   "connector-C",
-    ReceiverID: "connector-A",
-    DataTopics: []string{"sensitive-data"},
-    Allowed:    true,
-})
+# Windows
+.\scripts\package_all.ps1 -Version 1.0.0 -Platform windows-amd64 -Target all
 ```
-
-### 查询存证记录
-
-使用连接器的 `QueryEvidence` 方法：
-
-```go
-records, err := connector.QueryEvidence(channelID, "", 100)
-for _, record := range records {
-    log.Printf("Event: %s, Hash: %s", 
-        record.Evidence.EventType, 
-        record.Evidence.DataHash)
-}
-```
-
-## 🔧 核心功能特性
-
-### 连接器功能
-- **文件传输**：支持大文件分块传输，带进度显示和完整性验证
-- **实时发送器**：支持流式数据持续发送
-- **连接器发现**：可发现和查询其他连接器信息
-- **频道管理**：完整的频道生命周期管理
-
-### 数据传输
-- **并发处理**：支持多个连接器同时连接
-- **流式传输**：基于 gRPC 双向流的高效数据传输
-- **缓冲队列**：每个频道 1000 个数据包的缓冲
-- **自动清理**：定期清理不活跃的频道和离线连接器
-
-### 配置管理
-- **频道配置**：支持通过配置文件创建和管理频道
-- **证书管理**：自动化证书注册和分发
-- **权限策略**：灵活的访问控制规则配置
-
-## 🛡️ 生产部署建议
-
-1. **证书管理**
-   - 使用正式的 PKI 基础设施
-   - 定期轮换证书
-   - 实现证书吊销列表（CRL）
-
-2. **日志存储**
-   - 将审计日志持久化到分布式存储
-   - 考虑集成区块链进行存证
-
-3. **高可用性**
-   - 部署多个内核实例
-   - 使用负载均衡器
-   - 实现故障转移机制
-
-4. **监控告警**
-   - 集成 Prometheus/Grafana
-   - 监控连接器在线状态
-   - 告警异常认证尝试
-
-5. **安全加固**
-   - 启用防火墙规则
-   - 实施 IP 白名单
-   - 定期安全审计
-
-## 📝 许可证
-
-本项目为示例实现，仅供学习和研究使用。
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-## 📧 联系方式
-
-如有问题或建议，请通过以下方式联系：
-
-- Issue Tracker: [GitHub Issues]
-- Email: [your-email]
 
 ---
 
-**注意**：本项目生成的证书仅用于测试目的，请勿在生产环境中使用。
+## Troubleshooting
 
+| Scenario | Solution |
+|----------|----------|
+| Connection lost | Heartbeat detection, update status, retain info for reconnect |
+| Certificate error | Check certificate path, validity, CA signature |
+| Permission denied | Check ACL policy configuration |
+| Evidence failure | Auto-fallback to file storage |
+| Cross-kernel forward failure | Retry mechanism, retain original data |
+
+---
+
+## Production Deployment Recommendations
+
+1. **Certificate Management**
+   - Use formal PKI infrastructure
+   - Regularly rotate certificates
+   - Implement Certificate Revocation List (CRL)
+
+2. **Log Storage**
+   - Persist audit logs to distributed storage
+   - Consider blockchain integration for evidence
+
+3. **High Availability**
+   - Deploy multiple kernel instances
+   - Use load balancer
+   - Implement failover mechanism
+
+4. **Monitoring and Alerting**
+   - Integrate Prometheus/Grafana
+   - Monitor connector online status
+   - Alert on abnormal authentication attempts
+
+5. **Security Hardening**
+   - Enable firewall rules
+   - Implement IP whitelist
+   - Regular security audits
+
+---
+
+## License
+
+MIT License - See LICENSE file
+
+---
+
+## Contributing
+
+Welcome to submit Issues and Pull Requests!
+
+---
+
+## Contact
+
+- Project Maintainer: [Your Name]
+- Email: [your@email.com]
+
+---
+
+**Note**: The certificates generated by this project are for testing purposes only. Do not use in production environments.

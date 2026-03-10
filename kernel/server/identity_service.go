@@ -45,7 +45,7 @@ func NewIdentityServiceServer(registry *control.Registry, auditLog *evidence.Aud
 // Handshake 处理连接器握手
 func (s *IdentityServiceServer) Handshake(ctx context.Context, req *pb.HandshakeRequest) (*pb.HandshakeResponse, error) {
 	// 从证书中提取 connector_id
-	certID, err := security.ExtractConnectorIDFromContext(ctx)
+	_, err := security.ExtractConnectorIDFromContext(ctx)
 	if err != nil {
 		// 记录认证失败
 		s.auditLog.SubmitEvidence(
@@ -53,7 +53,6 @@ func (s *IdentityServiceServer) Handshake(ctx context.Context, req *pb.Handshake
 			evidence.EventTypeAuthFail,
 			"",
 			"",
-			map[string]string{"error": err.Error()},
 		)
 		
 		return &pb.HandshakeResponse{
@@ -69,7 +68,6 @@ func (s *IdentityServiceServer) Handshake(ctx context.Context, req *pb.Handshake
 			evidence.EventTypeAuthFail,
 			"",
 			"",
-			map[string]string{"error": "connector ID mismatch"},
 		)
 		
 		return &pb.HandshakeResponse{
@@ -102,10 +100,6 @@ func (s *IdentityServiceServer) Handshake(ctx context.Context, req *pb.Handshake
 		evidence.EventTypeAuthSuccess,
 		"",
 		"",
-		map[string]string{
-			"entity_type": req.EntityType,
-			"cert_cn":     certID,
-		},
 	)
 
 	// 检查是否是重启恢复，如果是则发送频道恢复通知
@@ -162,13 +156,10 @@ func (s *IdentityServiceServer) sendChannelRecoveryNotifications(connectorID str
 					// 添加存证配置（如果有）
 					if channel.EvidenceConfig != nil {
 						notification.EvidenceConfig = &pb.EvidenceConfig{
-							Mode:           string(channel.EvidenceConfig.Mode),
-							Strategy:       string(channel.EvidenceConfig.Strategy),
-							ConnectorId:    channel.EvidenceConfig.ConnectorID,
-							BackupEnabled:  channel.EvidenceConfig.BackupEnabled,
-							RetentionDays:  int32(channel.EvidenceConfig.RetentionDays),
-							CompressData:   channel.EvidenceConfig.CompressData,
-							CustomSettings: channel.EvidenceConfig.CustomSettings,
+							Mode:          string(channel.EvidenceConfig.Mode),
+							Strategy:      string(channel.EvidenceConfig.Strategy),
+							RetentionDays: int32(channel.EvidenceConfig.RetentionDays),
+							CompressData:  channel.EvidenceConfig.CompressData,
 						}
 					}
 
@@ -443,10 +434,6 @@ func (s *IdentityServiceServer) RegisterConnector(ctx context.Context, req *pb.R
 		evidence.EventTypeConnectorRegistered,
 		"",
 		"",
-		map[string]string{
-			"entity_type": req.EntityType,
-			"has_config":  fmt.Sprintf("%v", req.ConfigYaml != ""),
-		},
 	)
 
 	return &pb.RegisterConnectorResponse{
@@ -516,10 +503,6 @@ func (s *IdentityServiceServer) SetConnectorStatus(ctx context.Context, req *pb.
 		evidence.EventTypeConnectorStatusChanged,
 		"",
 		"",
-		map[string]string{
-			"previous_status": previousStatus,
-			"new_status":       req.Status,
-		},
 	)
 
 	return &pb.SetConnectorStatusResponse{
