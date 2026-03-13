@@ -1099,14 +1099,14 @@ func (s *ChannelServiceServer) RejectChannelProposal(ctx context.Context, req *p
 // StreamData 处理数据流推送
 func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataServer) error {
 	ctx := stream.Context()
-		var senderID string
-	var senderIDWithKernel string // 带有 kernel 前缀的 senderID，用于跨内核存证
+	var senderID string
 	var channelID string
 	var dataHashAccumulator []byte
 	var flowID string                 // 业务流程ID，用于跟踪完整的数据传输过程
 	var isCrossKernel bool            // 标记是否是跨内核频道
 	var receiverIDs []string         // 接收方ID列表，用于存证
 	var targetKernelID string         // 目标内核ID（跨内核时）
+	var currentKernelID string       // 当前内核ID
 
 	for {
 		packet, err := stream.Recv()
@@ -1116,7 +1116,12 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				log.Printf("🔄 Recording DATA_SEND complete for channel %s, sender %s, flow: %s", channelID, senderID, flowID)
 				finalHash := sha256.Sum256(dataHashAccumulator)
 
-				// 计算 target_id（与 DATA_SEND 相同的逻辑）
+				// 获取当前内核ID
+				if s.multiKernelManager != nil && s.multiKernelManager.config != nil {
+					currentKernelID = s.multiKernelManager.config.KernelID
+				}
+
+				// 计算 target_id
 				targetID := ""
 				if isCrossKernel && targetKernelID != "" {
 					targetID = targetKernelID
@@ -1124,23 +1129,56 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 					targetID = receiverIDs[0]
 				}
 
-				// 获取当前内核ID
-				currentKernelID := ""
-				if s.multiKernelManager != nil && s.multiKernelManager.config != nil {
-					currentKernelID = s.multiKernelManager.config.KernelID
-				}
-
-				// 记录跨内核传输完成存证：kernel -> remote kernel (DATA_SEND)
-				if isCrossKernel && targetKernelID != "" {
-					if _, err := s.auditLog.SubmitBasicEvidence(
-						currentKernelID,
+				// 如果是跨内核频道，先记录 connector -> kernel 的 DATA_SEND
+				if isCrossKernel {
+					if _, err := s.auditLog.SubmitBasicEvidenceWithFlowID(
+						senderID, // connector-A
 						evidence.EventTypeDataSend,
 						channelID,
 						hex.EncodeToString(finalHash[:]),
 						evidence.DirectionInternal,
-						targetID,
+						currentKernelID, // kernel-1
+						flowID,
 					); err != nil {
-						log.Printf("⚠ Failed to submit cross-kernel DATA_SEND complete evidence: %v", err)
+						log.Printf("⚠ Failed to submit connector->kernel DATA_SEND evidence: %v", err)
+					} else {
+						log.Printf("✓ Recorded connector->kernel DATA_SEND: %s -> %s, flow: %s", senderID, currentKernelID, flowID)
+					}
+				}
+
+				// 记录 DATA_SEND 存证（流结束），包含 flow_id 和 data_hash
+				// 跨内核：kernel-1 -> kernel-2
+				// 非跨内核：connector-A -> kernel-1
+				if _, err := s.auditLog.SubmitBasicEvidenceWithFlowID(
+					currentKernelID,
+					evidence.EventTypeDataSend,
+					channelID,
+					hex.EncodeToString(finalHash[:]),
+					evidence.DirectionInternal,
+					targetID,
+					flowID,
+				); err != nil {
+					log.Printf("⚠ Failed to submit DATA_SEND complete evidence: %v", err)
+				}
+
+				// 如果是跨内核频道，发送流结束标志给接收方内核
+				if isCrossKernel && targetKernelID != "" {
+					channel, err := s.channelManager.GetChannel(channelID)
+					if err == nil {
+						// 发送一个带有 IsFinal=true 的空数据包，通知接收方内核流已结束
+						endPacket := &circulation.DataPacket{
+							ChannelID:      channelID,
+							SequenceNumber: -1, // 特殊序列号表示结束
+							SenderID:       senderID, // 使用实际的发送方ID
+							Payload:        []byte{},
+							FlowID:         flowID,
+							IsFinal:        true,
+						}
+						if err := channel.PushData(endPacket); err != nil {
+							log.Printf("⚠ Failed to send end packet to kernel %s: %v", targetKernelID, err)
+						} else {
+							log.Printf("✓ Sent end packet to kernel %s, flow: %s", targetKernelID, flowID)
+						}
 					}
 				}
 			}
@@ -1174,124 +1212,51 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				return fmt.Errorf("sender %s is not a participant of this channel", senderID)
 			}
 
-		// 检查是否是跨内核频道
-		isCrossKernel = false
-		senderIDWithKernel = senderID
-		targetKernelID = ""
-
-		// 获取接收方ID列表
-		receiverIDs = channel.ReceiverIDs
-
-		for _, receiverID := range channel.ReceiverIDs {
-			if strings.Contains(receiverID, ":") {
-				// 存在远端接收者，这是跨内核频道
-				isCrossKernel = true
-				// 提取目标内核ID
-				parts := strings.Split(receiverID, ":")
-				if len(parts) >= 2 {
-					targetKernelID = parts[0]
-				}
-				break
-			}
-		}
-		if !isCrossKernel {
-			for _, senderIDInChannel := range channel.SenderIDs {
-				if strings.Contains(senderIDInChannel, ":") {
-					// 存在远端发送者，这是跨内核频道
-					isCrossKernel = true
-					break
-				}
-			}
-		}
-
-			// 如果是跨内核频道，构建带有 kernel 前缀的 senderID
-			if isCrossKernel && s.multiKernelManager != nil && s.multiKernelManager.config != nil {
-				kernelID := s.multiKernelManager.config.KernelID
-				senderIDWithKernel = fmt.Sprintf("%s:%s", kernelID, senderID)
-				log.Printf("🔄 Cross-kernel channel detected, using senderIDWithKernel=%s", senderIDWithKernel)
+			// 优先使用 packet 中的 flow_id，如果没有则生成新的
+			if packet.FlowId != "" {
+				flowID = packet.FlowId
+			} else {
+				flowID = uuid.New().String()
 			}
 
 			// 获取当前内核ID
-			currentKernelID := ""
+			currentKernelID = ""
 			if s.multiKernelManager != nil && s.multiKernelManager.config != nil {
 				currentKernelID = s.multiKernelManager.config.KernelID
 			}
 
-			// 记录存证：connector -> kernel (DATA_SEND)
-			// 与频道发送方连接器相关，记 DATA_SEND
-			if _, err := s.auditLog.SubmitBasicEvidence(
-				senderID, // source: connector-A (发送方)
-				evidence.EventTypeDataSend,
-				channelID,
-				"",
-				evidence.DirectionInternal,
-				currentKernelID, // target: kernel-1
-			); err != nil {
-				log.Printf("⚠ Failed to submit connector->kernel DATA_SEND evidence: %v", err)
-			}
+			// 检查是否是跨内核频道
+			isCrossKernel = false
+			targetKernelID = ""
 
-			// 生成业务流程ID（用于跟踪完整的数据传输过程）
-			flowID = uuid.New().String()
+			// 获取接收方ID列表
+			receiverIDs = channel.ReceiverIDs
 
-			// 记录跨内核转发
-			targetID := "" // 目标ID（直接下一跳）
-
-			if len(packet.TargetIds) > 0 {
-				// 使用第一个目标作为 target_id
-				targetID = packet.TargetIds[0]
-			} else {
-				// 广播模式下，使用所有接收方
-				if len(receiverIDs) > 0 {
-					targetID = receiverIDs[0]
-				}
-			}
-
-			// 如果是跨内核频道，target 是目标内核
-			if isCrossKernel && targetKernelID != "" {
-				targetID = targetKernelID
-				log.Printf("🔄 Cross-kernel transfer, setting target_id to: %s", targetID)
-			}
-
-			// 记录存证：kernel -> remote kernel (DATA_SEND)
-			// 当前内核是发送方，目标内核是接收方
-			log.Printf("🔄 Recording DATA_SEND for channel %s, sender %s, target %s, flow: %s", channelID, currentKernelID, targetID, flowID)
-			if _, err := s.auditLog.SubmitBasicEvidence(
-				currentKernelID, // source: kernel-1 (发送方)
-				evidence.EventTypeDataSend,
-				channelID,
-				"",
-				evidence.DirectionInternal,
-				targetID, // target: kernel-2 (接收方)
-			); err != nil {
-				log.Printf("⚠ Failed to submit kernel->remote DATA_SEND evidence: %v", err)
-			}
-			log.Printf("🔍 DEBUG StreamData: after SubmitEvidence, about to get channel")
-
-			// 记录存证：kernel -> 本地接收方连接器 (DATA_RECEIVE)
-			// 与频道接收方连接器相关，记 DATA_RECEIVE（包括本内核上的 connector-B 等）
-			for _, receiverID := range receiverIDs {
-				// 仅处理本内核上的接收者：
-				// - 裸 ID（本地 connector）
-				// - 或 currentKernelID:connectorID 格式
-				localConnectorID := receiverID
+			for _, receiverID := range channel.ReceiverIDs {
 				if strings.Contains(receiverID, ":") {
-					parts := strings.SplitN(receiverID, ":", 2)
-					if len(parts) < 2 || parts[0] != currentKernelID {
-						continue
+					// 存在远端接收者，这是跨内核频道
+					isCrossKernel = true
+					// 提取目标内核ID
+					parts := strings.Split(receiverID, ":")
+					if len(parts) >= 2 {
+						targetKernelID = parts[0]
 					}
-					localConnectorID = parts[1]
+					break
 				}
+			}
+			if !isCrossKernel {
+				for _, senderIDInChannel := range channel.SenderIDs {
+					if strings.Contains(senderIDInChannel, ":") {
+						// 存在远端发送者，这是跨内核频道
+						isCrossKernel = true
+						break
+					}
+				}
+			}
 
-			if _, err := s.auditLog.SubmitBasicEvidence(
-				currentKernelID,               // source: 当前内核
-				evidence.EventTypeDataReceive, // 与接收方连接器相关
-				channelID,
-				"",
-				evidence.DirectionInternal,
-				localConnectorID, // target: 本地接收方 connector
-			); err != nil {
-					log.Printf("⚠ Failed to submit kernel->local-connector DATA_RECEIVE evidence: %v", err)
-				}
+			// 如果是跨内核频道，记录 flow_id
+			if isCrossKernel {
+				log.Printf("🔄 Cross-kernel channel detected, using flow_id=%s", flowID)
 			}
 		}
 
@@ -1318,8 +1283,9 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 			Timestamp:      packet.Timestamp,
 			SenderID:       packet.SenderId,
 			TargetIDs:      packet.TargetIds,
+			FlowID:         flowID,
 		}
-		
+
 		log.Printf("🔍 DEBUG SendData: about to call PushData, SenderID=%s, TargetIDs=%v", dataPacket.SenderID, dataPacket.TargetIDs)
 
 		if err := channel.PushData(dataPacket); err != nil {
@@ -1327,9 +1293,8 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 			return fmt.Errorf("failed to push data: %v", err)
 		}
 
-		// 累积数据哈希
-		hash := sha256.Sum256(packet.Payload)
-		dataHashAccumulator = append(dataHashAccumulator, hash[:]...)
+		// 累积数据哈希（使用原始数据，与 kernel_service.go 保持一致）
+		dataHashAccumulator = append(dataHashAccumulator, packet.Payload...)
 
 		// 发送确认
 		if err := stream.Send(&pb.TransferStatus{

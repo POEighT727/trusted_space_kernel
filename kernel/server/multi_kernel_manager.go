@@ -1308,7 +1308,7 @@ func (m *MultiKernelManager) SyncConnectorInfo(targetKernelID string) error {
 }
 
 // ForwardData 转发数据到其他内核
-func (m *MultiKernelManager) ForwardData(targetKernelID string, dataPacket *pb.DataPacket) error {
+func (m *MultiKernelManager) ForwardData(targetKernelID string, dataPacket *pb.DataPacket, isFinal bool) error {
 	m.kernelsMu.RLock()
 	kernelInfo, exists := m.kernels[targetKernelID]
 	m.kernelsMu.RUnlock()
@@ -1350,6 +1350,7 @@ func (m *MultiKernelManager) ForwardData(targetKernelID string, dataPacket *pb.D
 		TargetKernelId: targetKernelID,
 		ChannelId:      dataPacket.ChannelId,
 		DataPacket:     dataPacket,
+		IsFinal:        isFinal,
 	}
 
 	_, err := kernelInfo.Client.ForwardData(context.Background(), req)

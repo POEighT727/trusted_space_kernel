@@ -131,6 +131,7 @@ type AuditLog struct {
 	indexBySource map[string][]*EvidenceRecord // 按 SourceID 索引
 	indexByTarget map[string][]*EvidenceRecord // 按 TargetID 索引
 	indexByEventType map[EventType][]*EvidenceRecord // 按事件类型索引
+	indexByFlowID map[string][]*EvidenceRecord // 按 FlowID 索引（用于跨内核关联）
 	lastRecordHash string // 最新记录的哈希（用于哈希链）
 
 	// 文件存储（向下兼容）
@@ -155,6 +156,7 @@ type EvidenceStore interface {
 	GetByTarget(targetID string, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
 	GetByDirection(direction EvidenceDirection, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
 	GetByEventType(eventType EventType, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
+	GetByFlowID(flowID string, startTime, endTime *time.Time) ([]*EvidenceRecord, error)
 	VerifyRecord(record *EvidenceRecord) error
 	Close() error
 }
@@ -167,6 +169,7 @@ type EvidenceFilter struct {
 	TargetID    string
 	Direction   string
 	ChannelID   string
+	FlowID      string // 业务流程ID，用于跨内核关联查询
 	StartTime   *time.Time
 	EndTime     *time.Time
 	Limit       int
@@ -209,6 +212,7 @@ func NewAuditLogWithConfig(config AuditLogConfig) (*AuditLog, error) {
 		al.indexBySource = make(map[string][]*EvidenceRecord)
 		al.indexByTarget = make(map[string][]*EvidenceRecord)
 		al.indexByEventType = make(map[EventType][]*EvidenceRecord)
+		al.indexByFlowID = make(map[string][]*EvidenceRecord)
 	}
 
 	// 如果使用文件存储
@@ -249,6 +253,94 @@ func (al *AuditLog) SubmitEvidenceWithFlowID(flowID, connectorID string, eventTy
 // targetID: 目标ID（直接下一跳：内核或连接器）
 func (al *AuditLog) SubmitBasicEvidence(sourceID string, eventType EventType, channelID, dataHash string, direction EvidenceDirection, targetID string) (*EvidenceRecord, error) {
 	return al.SubmitBasicEvidenceWithRetry(sourceID, eventType, channelID, dataHash, direction, targetID, 3)
+}
+
+// SubmitBasicEvidenceWithFlowID 提交带 flow_id 的基本事件存证
+// flowID: 业务流程ID，用于跨内核关联
+func (al *AuditLog) SubmitBasicEvidenceWithFlowID(sourceID string, eventType EventType, channelID, dataHash string, direction EvidenceDirection, targetID, flowID string) (*EvidenceRecord, error) {
+	log.Printf("📝 EVIDENCE SUBMIT: %s, source: %s, channel: %s, direction: %s, target: %s, flow: %s",
+		eventType, sourceID, channelID, direction, targetID, flowID)
+
+	// 生成事件实例ID
+	eventID := uuid.New().String()
+	tempTimestamp := time.Now()
+
+	// 生成数字签名
+	signature, err := al.generateEvidenceSignature(sourceID, string(eventType), channelID, dataHash, tempTimestamp.Unix())
+	if err != nil {
+		log.Printf("⚠️  Failed to generate signature for evidence: %v", err)
+		signature = ""
+	}
+
+	al.mu.Lock()
+	prevHash := al.lastRecordHash
+	al.mu.Unlock()
+
+	record := &EvidenceRecord{
+		EventID:   eventID,
+		EventType: eventType,
+		Timestamp: tempTimestamp,
+		SourceID:  sourceID,
+		TargetID:  targetID,
+		Direction: direction,
+		ChannelID: channelID,
+		DataHash:  dataHash,
+		Signature: signature,
+		PrevHash:  prevHash,
+		TxID:      flowID, // 使用 TxID 存储 flow_id
+	}
+
+	// 计算记录内容的哈希
+	record.Hash = al.calculateRecordHash(record)
+
+	// 更新最后记录哈希（用于哈希链）
+	al.mu.Lock()
+	al.lastRecordHash = record.Hash
+	al.mu.Unlock()
+
+	// 存储到数据库
+	if al.store != nil {
+		var lastErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			if err := al.store.Store(record); err != nil {
+				lastErr = err
+				log.Printf("⚠️ Failed to store evidence in database (attempt %d/3): %v", attempt, err)
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+					continue
+				}
+			} else {
+				log.Printf("✓ Evidence stored in database: %s", eventID)
+				break
+			}
+		}
+		if lastErr != nil {
+			log.Printf("⚠️ Failed to store evidence in database after 3 attempts: %v", lastErr)
+		}
+	}
+
+	// 更新内存缓存
+	if al.records != nil {
+		al.mu.Lock()
+		al.records = append(al.records, record)
+
+		if channelID != "" {
+			al.indexByCh[channelID] = append(al.indexByCh[channelID], record)
+		}
+
+		if sourceID != "" {
+			al.indexBySource[sourceID] = append(al.indexBySource[sourceID], record)
+		}
+
+		// 添加 flow_id 索引
+		if flowID != "" {
+			al.indexByFlowID[flowID] = append(al.indexByFlowID[flowID], record)
+		}
+
+		al.mu.Unlock()
+	}
+
+	return record, nil
 }
 
 // SubmitBasicEvidenceWithRetry 提交基本事件存证（带重试机制）
@@ -486,6 +578,42 @@ func (al *AuditLog) QueryByChannel(channelID string, startTime, endTime time.Tim
 	defer al.mu.RUnlock()
 
 	records, exists := al.indexByCh[channelID]
+	if !exists {
+		return []*EvidenceRecord{}
+	}
+
+	return al.filterByTimeRange(records, startTime, endTime, limit)
+}
+
+// QueryByFlowID 根据 FlowID 查询存证记录（用于跨内核关联）
+func (al *AuditLog) QueryByFlowID(flowID string, startTime, endTime time.Time, limit int) []*EvidenceRecord {
+	if al.store != nil {
+		var startTimePtr, endTimePtr *time.Time
+		if !startTime.IsZero() {
+			startTimePtr = &startTime
+		}
+		if !endTime.IsZero() {
+			endTimePtr = &endTime
+		}
+
+		records, err := al.store.GetByFlowID(flowID, startTimePtr, endTimePtr)
+		if err != nil {
+			log.Printf("⚠️ Failed to query evidence by flow_id from database: %v", err)
+			return []*EvidenceRecord{}
+		}
+
+		if limit > 0 && len(records) > limit {
+			records = records[:limit]
+		}
+
+		return records
+	}
+
+	// 内存缓存查询
+	al.mu.RLock()
+	defer al.mu.RUnlock()
+
+	records, exists := al.indexByFlowID[flowID]
 	if !exists {
 		return []*EvidenceRecord{}
 	}

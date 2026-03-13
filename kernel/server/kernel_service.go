@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,6 +28,11 @@ type KernelServiceServer struct {
 	registry           *control.Registry
 	notificationManager *NotificationManager
 	auditLog           *evidence.AuditLog
+
+	// 跨内核数据转发的哈希累加器（用于流结束时计算完整数据的哈希）
+	// key: channelID_flowID, value: 累积的字节数据
+	dataHashAccumulator map[string][]byte
+	dataHashMu          sync.Mutex
 }
 
 // NewKernelServiceServer 创建内核服务服务器
@@ -39,6 +45,7 @@ func NewKernelServiceServer(multiKernelManager *MultiKernelManager,
 		registry:            registry,
 		notificationManager: notificationManager,
 		auditLog:            auditLog,
+		dataHashAccumulator: make(map[string][]byte),
 	}
 }
 
@@ -770,6 +777,9 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 
 	// 转发数据到频道
 	// 注意：需要根据 payload 内容判断消息类型（proto 没有 MessageType 字段）
+	// 获取 flow_id（用于跨内核关联）
+	flowID := req.DataPacket.GetFlowId()
+
 	dataPacket := &circulation.DataPacket{
 		ChannelID:      req.DataPacket.ChannelId,
 		SequenceNumber: req.DataPacket.SequenceNumber,
@@ -778,6 +788,8 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 		Timestamp:      req.DataPacket.Timestamp,
 		SenderID:       req.DataPacket.SenderId,
 		TargetIDs:      req.DataPacket.TargetIds,
+		FlowID:         flowID,
+		IsFinal:        req.GetIsFinal(),
 	}
 
 	// 根据 payload 内容判断消息类型
@@ -807,56 +819,76 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 			currentKernelID = s.multiKernelManager.config.KernelID
 		}
 
-		// 计算数据哈希
-		dataHash := ""
-		if len(req.DataPacket.Payload) > 0 {
-			hash := sha256.Sum256(req.DataPacket.Payload)
-			dataHash = hex.EncodeToString(hash[:])
+		// 检查是否是最后一个数据包（流结束）
+		isFinal := dataPacket.IsFinal
+		log.Printf("🔍 DEBUG ForwardData: isFinal=%v, flowID=%s, payloadLen=%d", isFinal, flowID, len(req.DataPacket.Payload))
+
+		// 累积数据哈希（用于流结束时计算完整数据的哈希）
+		// 只有非结束数据包才累积哈希
+		// 注意：与 channel_service.go 保持一致 - 累积原始数据
+		accumulatorKey := req.ChannelId + "_" + flowID
+		if !isFinal && len(req.DataPacket.Payload) > 0 {
+			s.dataHashMu.Lock()
+			s.dataHashAccumulator[accumulatorKey] = append(s.dataHashAccumulator[accumulatorKey], req.DataPacket.Payload...)
+			s.dataHashMu.Unlock()
 		}
 
-		// 记录存证：kernel-1 -> kernel-2 (DATA_RECEIVE)
-		// 数据从 kernel-1 转发到 kernel-2，从 kernel-2 角度是接收数据
-		s.auditLog.SubmitBasicEvidence(
-			req.SourceKernelId, // source: kernel-1 (发送方)
-			evidence.EventTypeDataReceive,
-			req.ChannelId,
-			dataHash,
-			evidence.DirectionInternal,
-			currentKernelID, // target: kernel-2 (接收方内核)
-		)
+		// 如果是最后一个数据包，记录完整的 DATA_RECEIVE 存证
+		if isFinal && flowID != "" {
+			s.dataHashMu.Lock()
+			accumulatedData := s.dataHashAccumulator[accumulatorKey]
+			// 计算完整数据的哈希
+			finalHash := sha256.Sum256(accumulatedData)
+			// 清除累加器
+			delete(s.dataHashAccumulator, accumulatorKey)
+			s.dataHashMu.Unlock()
 
-		// 记录存证：kernel-2 -> connector-U (DATA_RECEIVE)
-		// 与频道接收方连接器相关，记 DATA_RECEIVE
-		// 查找本地接收者
-		for _, receiverID := range channel.ReceiverIDs {
-			// 跳过远程接收者（格式为 other-kernel:connector）
-			if strings.Contains(receiverID, ":") {
-				// 检查是否是远程内核的接收者
-				parts := strings.SplitN(receiverID, ":", 2)
-				if len(parts) >= 2 && parts[0] != currentKernelID {
-					continue // 远程接收者，跳过
-				}
-				// 如果是 currentKernelID:connector 格式，说明是本地接收者
-				// receiverID 就是 connectorID
-			}
-			// 本地接收者
-			targetConnectorID := receiverID
-			if strings.Contains(receiverID, ":") {
-				// 本地格式为 kernelID:connectorID，提取 connectorID
-				parts := strings.SplitN(receiverID, ":", 2)
-				targetConnectorID = parts[1]
-			}
-			if _, err := s.auditLog.SubmitBasicEvidence(
-				currentKernelID, // source: kernel-2
+			log.Printf("🔄 Recording DATA_RECEIVE complete for channel %s, flow: %s", req.ChannelId, flowID)
+
+			// 记录存证：kernel-1 -> kernel-2 (DATA_RECEIVE)，带 flow_id 和 data_hash
+			if _, err := s.auditLog.SubmitBasicEvidenceWithFlowID(
+				req.SourceKernelId, // source: kernel-1 (发送方)
 				evidence.EventTypeDataReceive,
 				req.ChannelId,
-				dataHash,
+				hex.EncodeToString(finalHash[:]),
 				evidence.DirectionInternal,
-				targetConnectorID, // target: connector-U (接收方连接器)
+				currentKernelID, // target: kernel-2 (接收方内核)
+				flowID,
 			); err != nil {
-				log.Printf("⚠ Failed to submit kernel->connector DATA_SEND evidence: %v", err)
+				log.Printf("⚠ Failed to submit kernel->kernel DATA_RECEIVE evidence: %v", err)
+			} else {
+				log.Printf("✓ Recorded kernel->kernel DATA_RECEIVE: %s -> %s, flow: %s", req.SourceKernelId, currentKernelID, flowID)
+			}
+
+			// 记录存证：kernel-2 -> connector-U (DATA_RECEIVE)，带 flow_id 和 data_hash
+			log.Printf("🔍 DEBUG: Recording connector DATA_RECEIVE, ReceiverIDs=%v, currentKernelID=%s", channel.ReceiverIDs, currentKernelID)
+			for _, receiverID := range channel.ReceiverIDs {
+				// 跳过远程接收者
+				if strings.Contains(receiverID, ":") {
+					parts := strings.SplitN(receiverID, ":", 2)
+					if len(parts) >= 2 && parts[0] != currentKernelID {
+						continue
+					}
+				}
+				targetConnectorID := receiverID
+				if strings.Contains(receiverID, ":") {
+					parts := strings.SplitN(receiverID, ":", 2)
+					targetConnectorID = parts[1]
+				}
+				if _, err := s.auditLog.SubmitBasicEvidenceWithFlowID(
+					currentKernelID,
+					evidence.EventTypeDataReceive,
+					req.ChannelId,
+					hex.EncodeToString(finalHash[:]),
+					evidence.DirectionInternal,
+					targetConnectorID,
+					flowID,
+				); err != nil {
+					log.Printf("⚠ Failed to submit kernel->connector DATA_RECEIVE evidence: %v", err)
+				}
 			}
 		}
+		// 移除了实时 DATA_RECEIVE 记录，只保留流结束时的完整记录
 	}
 
 	return &pb.ForwardDataResponse{

@@ -140,6 +140,8 @@ type DataPacket struct {
 	SenderID       string     // 发送方ID
 	TargetIDs      []string   // 目标接收者ID列表（为空则广播给所有订阅者）
 	MessageType    MessageType // 消息类型（数据/控制/存证）
+	FlowID         string    // 业务流程ID，用于跟踪完整的数据传输过程
+	IsFinal        bool      // 是否是最后一个数据包（流结束标志）
 }
 
 // PermissionChangeRequest 权限变更请求
@@ -187,7 +189,8 @@ type ChannelManager struct {
 	// 频道配置管理（可选，由创建者指定配置文件路径时使用）
 	configManager *ChannelConfigManager // 频道配置管理器
 	// forwardToKernel 回调，用于将 DataPacket 转发到远端内核
-	forwardToKernel func(kernelID string, packet *DataPacket) error
+	// isFinal: 是否是最后一个数据包（流结束标志）
+	forwardToKernel func(kernelID string, packet *DataPacket, isFinal bool) error
 
 	// 当前内核ID（用于跨内核通信时判断是否需要转发）
 	kernelID string
@@ -337,7 +340,8 @@ func (cm *ChannelManager) SetConfigManager(configManager *ChannelConfigManager) 
 }
 
 // SetForwardToKernel 设置将要用于跨内核转发数据的回调函数（由上层多内核管理器设置）
-func (cm *ChannelManager) SetForwardToKernel(fn func(kernelID string, packet *DataPacket) error) {
+// isFinal: 是否是最后一个数据包（流结束标志）
+func (cm *ChannelManager) SetForwardToKernel(fn func(kernelID string, packet *DataPacket, isFinal bool) error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.forwardToKernel = fn
@@ -1484,10 +1488,12 @@ func (c *Channel) PushData(packet *DataPacket) error {
 				SenderID:       packet.SenderID,
 				TargetIDs:      make([]string, len(connectorIDs)),
 				MessageType:    packet.MessageType,
+				FlowID:         packet.FlowID,
+				IsFinal:        packet.IsFinal,
 			}
 			copy(outPacket.Payload, packet.Payload)
 			copy(outPacket.TargetIDs, connectorIDs)
-			if err := c.manager.forwardToKernel(rk, outPacket); err != nil {
+			if err := c.manager.forwardToKernel(rk, outPacket, packet.IsFinal); err != nil {
 				log.Printf("⚠ Failed to forward packet to kernel %s: %v", rk, err)
 			} else {
 				log.Printf("✓ Successfully forwarded packet to kernel %s", rk)
@@ -2660,7 +2666,7 @@ func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
 			SenderID:    currentKernelID,
 		}
 
-		if err := c.manager.forwardToKernel(kernelID, packet); err != nil {
+		if err := c.manager.forwardToKernel(kernelID, packet, false); err != nil {
 			log.Printf("⚠ Failed to notify kernel %s of channel update: %v", kernelID, err)
 		} else {
 			log.Printf("✓ Notified kernel %s of channel update for channel %s", kernelID, c.ChannelID)
@@ -2877,7 +2883,7 @@ func (c *Channel) forwardControlMessageToRemoteKernels(packet *DataPacket) {
 	// 转发到所有远程内核
 	log.Printf("📨 forwardControlMessageToRemoteKernels: remoteKernels=%v", remoteKernels)
 	for kernelID := range remoteKernels {
-		if err := c.manager.forwardToKernel(kernelID, packet); err != nil {
+		if err := c.manager.forwardToKernel(kernelID, packet, false); err != nil {
 			log.Printf("⚠ Failed to forward control message to kernel %s: %v", kernelID, err)
 		} else {
 			log.Printf("✓ Forwarded control message to kernel %s", kernelID)
@@ -2932,53 +2938,4 @@ func (c *Channel) forwardControlMessageToRemoteKernels(packet *DataPacket) {
 // - 更符合分布式系统的设计理念
 // - 内核职责简化，专注核心功能
 // -----------------------------------------------------------
-
-// 外部存证连接器管理方法已移除
-// 存证功能现由内核内置实现，存证方的具体功能由连接器自行扩展
-
-// RegisterEvidenceConnector 注册外部存证连接器（已废弃）
-// 内核不再支持外部存证连接器，存证功能由内核内置实现
-func (cm *ChannelManager) RegisterEvidenceConnector(connectorID, name, description string, capabilities []string, config map[string]string) (interface{}, error) {
-	return nil, fmt.Errorf("external evidence connector is not supported, use built-in evidence instead")
-}
-
-// UnregisterEvidenceConnector 注销外部存证连接器（已废弃）
-func (cm *ChannelManager) UnregisterEvidenceConnector(connectorID string) error {
-	return fmt.Errorf("external evidence connector is not supported")
-}
-
-// GetEvidenceConnector 获取存证连接器信息（已废弃）
-func (cm *ChannelManager) GetEvidenceConnector(connectorID string) (interface{}, error) {
-	return nil, fmt.Errorf("external evidence connector is not supported")
-}
-
-// ListEvidenceConnectors 列出所有已注册的存证连接器（已废弃）
-func (cm *ChannelManager) ListEvidenceConnectors() []interface{} {
-	return []interface{}{}
-}
-
-// UpdateEvidenceConnectorHeartbeat 更新存证连接器心跳（已废弃）
-func (cm *ChannelManager) UpdateEvidenceConnectorHeartbeat(connectorID string) error {
-	return fmt.Errorf("external evidence connector is not supported")
-}
-
-// IsEvidenceConnectorAvailable 检查存证连接器是否可用（已废弃）
-func (cm *ChannelManager) IsEvidenceConnectorAvailable(connectorID string) bool {
-	return false
-}
-
-// GetAvailableEvidenceConnectors 获取所有可用的存证连接器（已废弃）
-func (cm *ChannelManager) GetAvailableEvidenceConnectors() []interface{} {
-	return []interface{}{}
-}
-
-// StartEvidenceConnectorHeartbeatCheck 启动存证连接器心跳检查协程（已废弃）
-func (cm *ChannelManager) StartEvidenceConnectorHeartbeatCheck() {
-	// no-op: external evidence connectors are no longer supported
-}
-
-// checkEvidenceConnectorHeartbeats 检查存证连接器心跳状态（已废弃）
-func (cm *ChannelManager) checkEvidenceConnectorHeartbeats() {
-	// no-op: external evidence connectors are no longer supported
-}
 

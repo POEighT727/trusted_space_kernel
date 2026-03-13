@@ -10,6 +10,8 @@ connector:
   expose_to_others: false
 
 kernel:
+  # 内核ID，用于跨内核通信标识
+  id: "kernel-1"
   # 内核服务器地址
   # 本地部署: "localhost" 或 "127.0.0.1"
   # 跨主机部署: 使用远程主机的IP地址或域名，例如: "192.168.1.100" 或 "kernel.example.com"

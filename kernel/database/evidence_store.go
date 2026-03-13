@@ -43,8 +43,8 @@ func NewMySQLEvidenceStore(db *sql.DB) *MySQLEvidenceStore {
 func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 	query := `
 		INSERT INTO evidence_records
-		(event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, signature, hash, prev_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		(event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := s.db.Exec(query,
 		record.EventID,
@@ -54,6 +54,7 @@ func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 		record.TargetID,
 		record.ChannelID,
 		record.DataHash,
+		record.TxID, // 业务流程ID
 		record.Signature,
 		record.Hash,
 		record.PrevHash,
@@ -69,7 +70,7 @@ func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 // GetByID 根据ID获取证据记录
 func (s *MySQLEvidenceStore) GetByID(id int64) (*evidence.EvidenceRecord, error) {
 	query := `
-		SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, signature, hash, prev_hash
+		SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash
 		FROM evidence_records WHERE id = ?`
 
 	row := s.db.QueryRow(query, id)
@@ -79,7 +80,7 @@ func (s *MySQLEvidenceStore) GetByID(id int64) (*evidence.EvidenceRecord, error)
 
 	err := row.Scan(&dbID, &record.EventID, &record.EventType, &record.Timestamp,
 		&record.SourceID, &record.TargetID, &record.ChannelID,
-		&record.DataHash, &record.Signature, &record.Hash, &record.PrevHash)
+		&record.DataHash, &record.TxID, &record.Signature, &record.Hash, &record.PrevHash)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan evidence record: %w", err)
@@ -116,6 +117,10 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 	if evidenceFilter.ChannelID != "" {
 		conditions = append(conditions, "channel_id = ?")
 		args = append(args, evidenceFilter.ChannelID)
+	}
+	if evidenceFilter.FlowID != "" {
+		conditions = append(conditions, "tx_id = ?")
+		args = append(args, evidenceFilter.FlowID)
 	}
 	if evidenceFilter.StartTime != nil {
 		conditions = append(conditions, "timestamp >= ?")
@@ -231,6 +236,10 @@ func (s *MySQLEvidenceStore) Count(filter interface{}) (int64, error) {
 		conditions = append(conditions, "channel_id = ?")
 		args = append(args, evidenceFilter.ChannelID)
 	}
+	if evidenceFilter.FlowID != "" {
+		conditions = append(conditions, "tx_id = ?")
+		args = append(args, evidenceFilter.FlowID)
+	}
 	if evidenceFilter.StartTime != nil {
 		conditions = append(conditions, "timestamp >= ?")
 		args = append(args, *evidenceFilter.StartTime)
@@ -321,6 +330,16 @@ func (s *MySQLEvidenceStore) GetByDirection(direction evidence.EvidenceDirection
 func (s *MySQLEvidenceStore) GetByEventType(eventType evidence.EventType, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error) {
 	filter := evidence.EvidenceFilter{
 		EventType: string(eventType),
+		StartTime: startTime,
+		EndTime:   endTime,
+	}
+	return s.Query(filter)
+}
+
+// GetByFlowID 根据 FlowID 获取证据记录（用于跨内核关联查询）
+func (s *MySQLEvidenceStore) GetByFlowID(flowID string, startTime, endTime *time.Time) ([]*evidence.EvidenceRecord, error) {
+	filter := evidence.EvidenceFilter{
+		FlowID:    flowID,
 		StartTime: startTime,
 		EndTime:   endTime,
 	}

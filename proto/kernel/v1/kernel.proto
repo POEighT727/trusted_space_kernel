@@ -144,6 +144,7 @@ message ForwardDataRequest {
   string target_kernel_id = 2;  // 目标内核ID
   string channel_id = 3;        // 频道ID
   DataPacket data_packet = 4;   // 数据包
+  bool is_final = 5;            // 是否是最后一个数据包（流结束标志）
 }
 
 message ForwardDataResponse {

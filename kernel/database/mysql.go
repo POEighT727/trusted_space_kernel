@@ -73,64 +73,22 @@ func (m *DBManager) initTables() error {
 		target_id VARCHAR(100) DEFAULT '' COMMENT '目标ID（直接下一跳：内核或连接器）',
 		channel_id VARCHAR(36) DEFAULT '' COMMENT '频道ID',
 		data_hash VARCHAR(128) DEFAULT '' COMMENT '数据哈希',
+		tx_id VARCHAR(36) DEFAULT '' COMMENT '业务流程ID（用于跨内核关联）',
 		signature TEXT COMMENT '内核数字签名',
 		hash VARCHAR(128) NOT NULL COMMENT '记录内容哈希',
 		prev_hash VARCHAR(128) DEFAULT '' COMMENT '上一条记录的哈希（哈希链）',
 		metadata JSON COMMENT '元数据',
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
 		INDEX idx_event_id (event_id),
 		INDEX idx_event_type (event_type),
 		INDEX idx_source_id (source_id),
 		INDEX idx_target_id (target_id),
 		INDEX idx_channel_id (channel_id),
+		INDEX idx_tx_id (tx_id),
 		INDEX idx_timestamp (timestamp)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='内核存证记录表';`
 
 	if _, err := m.db.Exec(evidenceTableSQL); err != nil {
 		return fmt.Errorf("failed to create evidence_records table: %w", err)
-	}
-
-	// 保留证据分发表（可选，用于分布式存证分发）
-	deliveryTableSQL := `
-	CREATE TABLE IF NOT EXISTS evidence_delivery (
-		id BIGINT AUTO_INCREMENT PRIMARY KEY,
-		record_id BIGINT NOT NULL COMMENT '证据记录ID',
-		connector_id VARCHAR(100) NOT NULL COMMENT '接收连接器ID',
-		channel_id VARCHAR(36) NOT NULL COMMENT '证据频道ID',
-		status ENUM('pending', 'delivered', 'failed') DEFAULT 'pending' COMMENT '分发状态',
-		attempts INT DEFAULT 0 COMMENT '尝试次数',
-		last_attempt TIMESTAMP NULL COMMENT '最后尝试时间',
-		error_message TEXT COMMENT '错误信息',
-		delivered_at TIMESTAMP NULL COMMENT '分发成功时间',
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-		INDEX idx_record_id (record_id),
-		INDEX idx_connector_id (connector_id),
-		INDEX idx_status (status),
-		FOREIGN KEY (record_id) REFERENCES evidence_records(id) ON DELETE CASCADE
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='证据分发表';`
-
-	if _, err := m.db.Exec(deliveryTableSQL); err != nil {
-		return fmt.Errorf("failed to create evidence_delivery table: %w", err)
-	}
-
-	// 保留证据验证表（可选，用于验证记录）
-	verificationTableSQL := `
-	CREATE TABLE IF NOT EXISTS evidence_verification (
-		id BIGINT AUTO_INCREMENT PRIMARY KEY,
-		record_id BIGINT NOT NULL COMMENT '证据记录ID',
-		connector_id VARCHAR(100) NOT NULL COMMENT '验证连接器ID',
-		verification_type VARCHAR(50) NOT NULL COMMENT '验证类型',
-		is_valid BOOLEAN NOT NULL COMMENT '是否有效',
-		error_message TEXT COMMENT '验证错误信息',
-		verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '验证时间',
-		INDEX idx_record_id (record_id),
-		INDEX idx_connector_id (connector_id),
-		INDEX idx_verification_type (verification_type),
-		FOREIGN KEY (record_id) REFERENCES evidence_records(id) ON DELETE CASCADE
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='证据验证表';`
-
-	if _, err := m.db.Exec(verificationTableSQL); err != nil {
-		return fmt.Errorf("failed to create evidence_verification table: %w", err)
 	}
 
 	return nil

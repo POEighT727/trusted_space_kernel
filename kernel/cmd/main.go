@@ -189,9 +189,6 @@ func main() {
 		log.Fatalf("Failed to set default evidence config: %v", err)
 	}
 
-	// 启动存证连接器心跳检查
-	channelManager.StartEvidenceConnectorHeartbeatCheck()
-
 	log.Println("✓ Channel manager initialized")
 
 	// 4. 数据库管理器（如果启用）
@@ -281,7 +278,7 @@ func main() {
 	}
 
 	// 将跨内核数据转发回调注入到 ChannelManager（当检测到目标为 kernel:connector 时调用）
-	channelManager.SetForwardToKernel(func(kernelID string, packet *circulation.DataPacket) error {
+	channelManager.SetForwardToKernel(func(kernelID string, packet *circulation.DataPacket, isFinal bool) error {
 		// 将 circulation.DataPacket 转为 pb.DataPacket
 		pbPacket := &pb.DataPacket{
 			ChannelId:      packet.ChannelID,
@@ -291,8 +288,9 @@ func main() {
 			Timestamp:      packet.Timestamp,
 			SenderId:       packet.SenderID,
 			TargetIds:      packet.TargetIDs,
+			FlowId:         packet.FlowID,
 		}
-		return multiKernelManager.ForwardData(kernelID, pbPacket)
+		return multiKernelManager.ForwardData(kernelID, pbPacket, isFinal)
 	})
 
 	// 连接种子内核
