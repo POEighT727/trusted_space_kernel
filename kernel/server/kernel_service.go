@@ -792,11 +792,15 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 		IsFinal:        req.GetIsFinal(),
 	}
 
+	log.Printf("🔍 DEBUG ForwardData: TargetIDs=%v, SenderID=%s, IsFinal=%v", req.DataPacket.TargetIds, req.DataPacket.SenderId, req.GetIsFinal())
+
 	// 根据 payload 内容判断消息类型
 	var testMsg circulation.ControlMessage
+	dataCategory := "business"
 	if err := json.Unmarshal(req.DataPacket.Payload, &testMsg); err == nil {
 		if testMsg.MessageType == "channel_update" || testMsg.MessageType == "permission_request" {
 			dataPacket.MessageType = circulation.MessageTypeControl
+			dataCategory = "control"
 		}
 	}
 	err = channel.PushData(dataPacket)
@@ -821,7 +825,22 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 
 		// 检查是否是最后一个数据包（流结束）
 		isFinal := dataPacket.IsFinal
-		log.Printf("🔍 DEBUG ForwardData: isFinal=%v, flowID=%s, payloadLen=%d", isFinal, flowID, len(req.DataPacket.Payload))
+
+		// 解析原始目标内核ID（如果有）
+		// 格式: "kernelID:connectorID" 或 "connectorID"
+		originalTargetKernelID := ""
+		for _, targetID := range req.DataPacket.TargetIds {
+			if strings.Contains(targetID, ":") {
+				parts := strings.SplitN(targetID, ":", 2)
+				if len(parts) >= 2 {
+					originalTargetKernelID = parts[0]
+					break
+				}
+			}
+		}
+
+		log.Printf("🔍 DEBUG ForwardData: isFinal=%v, flowID=%s, payloadLen=%d, originalTarget=%s",
+			isFinal, flowID, len(req.DataPacket.Payload), originalTargetKernelID)
 
 		// 累积数据哈希（用于流结束时计算完整数据的哈希）
 		// 只有非结束数据包才累积哈希
@@ -845,8 +864,13 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 
 			log.Printf("🔄 Recording DATA_RECEIVE complete for channel %s, flow: %s", req.ChannelId, flowID)
 
+			// 构建 metadata
+			metadata := map[string]string{
+				"data_category": dataCategory,
+			}
+
 			// 记录存证：kernel-1 -> kernel-2 (DATA_RECEIVE)，带 flow_id 和 data_hash
-			if _, err := s.auditLog.SubmitBasicEvidenceWithFlowID(
+			if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
 				req.SourceKernelId, // source: kernel-1 (发送方)
 				evidence.EventTypeDataReceive,
 				req.ChannelId,
@@ -854,10 +878,38 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 				evidence.DirectionInternal,
 				currentKernelID, // target: kernel-2 (接收方内核)
 				flowID,
+				metadata,
 			); err != nil {
 				log.Printf("⚠ Failed to submit kernel->kernel DATA_RECEIVE evidence: %v", err)
 			} else {
 				log.Printf("✓ Recorded kernel->kernel DATA_RECEIVE: %s -> %s, flow: %s", req.SourceKernelId, currentKernelID, flowID)
+			}
+
+			// 记录存证：kernel-2 -> kernel-3 (DATA_SEND) - 多跳转发存证
+			// 只有当存在原始目标内核ID 且 不是最终目标时，才记录转发存证
+			if originalTargetKernelID != "" && originalTargetKernelID != currentKernelID {
+				// 检查当前内核到原始目标是否有路由配置
+				if s.multiKernelManager != nil && s.multiKernelManager.multiHopConfigManager != nil {
+					nextKernel, _, _, hopIndex, totalHops, found := s.multiKernelManager.multiHopConfigManager.GetNextHop(currentKernelID, originalTargetKernelID)
+					if found && nextKernel != "" {
+						// 记录转发存证：当前内核 -> 下一跳内核
+						if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
+							currentKernelID, // source: 当前内核
+							evidence.EventTypeDataSend,
+							req.ChannelId,
+							hex.EncodeToString(finalHash[:]),
+							evidence.DirectionInternal,
+							nextKernel, // target: 下一跳内核
+							flowID,
+							metadata,
+						); err != nil {
+							log.Printf("⚠ Failed to submit kernel->kernel DATA_SEND evidence (multi-hop): %v", err)
+						} else {
+							log.Printf("✓ Recorded kernel->kernel DATA_SEND (multi-hop): %s -> %s (hop %d/%d), flow: %s",
+								currentKernelID, nextKernel, hopIndex, totalHops, flowID)
+						}
+					}
+				}
 			}
 
 			// 记录存证：kernel-2 -> connector-U (DATA_RECEIVE)，带 flow_id 和 data_hash
@@ -875,7 +927,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 					parts := strings.SplitN(receiverID, ":", 2)
 					targetConnectorID = parts[1]
 				}
-				if _, err := s.auditLog.SubmitBasicEvidenceWithFlowID(
+				if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
 					currentKernelID,
 					evidence.EventTypeDataReceive,
 					req.ChannelId,
@@ -883,6 +935,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 					evidence.DirectionInternal,
 					targetConnectorID,
 					flowID,
+					metadata,
 				); err != nil {
 					log.Printf("⚠ Failed to submit kernel->connector DATA_RECEIVE evidence: %v", err)
 				}

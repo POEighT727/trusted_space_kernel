@@ -293,6 +293,13 @@ func main() {
 		return multiKernelManager.ForwardData(kernelID, pbPacket, isFinal)
 	})
 
+	// 设置多跳路由回调，用于获取下一跳内核信息
+	if multiHopConfigManager != nil {
+		channelManager.SetGetNextHopKernel(func(currentKernelID, targetKernelID string) (string, string, int, int, int, bool) {
+			return multiHopConfigManager.GetNextHop(currentKernelID, targetKernelID)
+		})
+	}
+
 	// 连接种子内核
 	for _, seed := range config.MultiKernel.SeedKernels {
 		go func(seedConfig SeedKernelConfig) {

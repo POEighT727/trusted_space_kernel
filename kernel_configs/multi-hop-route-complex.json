@@ -29,6 +29,6 @@
       "auto_connect": true
     }
   ],
-  "enabled": true,
+  "enabled": false,
   "version": 1
 }

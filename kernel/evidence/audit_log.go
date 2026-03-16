@@ -90,6 +90,7 @@ type EvidenceRecord struct {
 	Signature   string            `json:"signature"`   // 内核签名
 	Hash        string            `json:"hash"`        // 记录内容哈希，用于完整性验证
 	PrevHash    string            `json:"prev_hash"`   // 上一条记录的哈希（哈希链）
+	Metadata    map[string]string `json:"metadata,omitempty"` // 扩展元数据
 
 	// 兼容旧接口的字段
 	TxID        string            `json:"tx_id,omitempty"`        // 业务流程ID（兼容旧接口）
@@ -252,12 +253,17 @@ func (al *AuditLog) SubmitEvidenceWithFlowID(flowID, connectorID string, eventTy
 // direction: 存证方向
 // targetID: 目标ID（直接下一跳：内核或连接器）
 func (al *AuditLog) SubmitBasicEvidence(sourceID string, eventType EventType, channelID, dataHash string, direction EvidenceDirection, targetID string) (*EvidenceRecord, error) {
-	return al.SubmitBasicEvidenceWithRetry(sourceID, eventType, channelID, dataHash, direction, targetID, 3)
+	return al.SubmitBasicEvidenceWithMetadata(sourceID, eventType, channelID, dataHash, direction, targetID, "", map[string]string{"data_category": "control"})
 }
 
 // SubmitBasicEvidenceWithFlowID 提交带 flow_id 的基本事件存证
 // flowID: 业务流程ID，用于跨内核关联
 func (al *AuditLog) SubmitBasicEvidenceWithFlowID(sourceID string, eventType EventType, channelID, dataHash string, direction EvidenceDirection, targetID, flowID string) (*EvidenceRecord, error) {
+	return al.SubmitBasicEvidenceWithMetadata(sourceID, eventType, channelID, dataHash, direction, targetID, flowID, nil)
+}
+
+// SubmitBasicEvidenceWithMetadata 提交带元数据的存证记录
+func (al *AuditLog) SubmitBasicEvidenceWithMetadata(sourceID string, eventType EventType, channelID, dataHash string, direction EvidenceDirection, targetID, flowID string, metadata map[string]string) (*EvidenceRecord, error) {
 	log.Printf("📝 EVIDENCE SUBMIT: %s, source: %s, channel: %s, direction: %s, target: %s, flow: %s",
 		eventType, sourceID, channelID, direction, targetID, flowID)
 
@@ -288,6 +294,11 @@ func (al *AuditLog) SubmitBasicEvidenceWithFlowID(sourceID string, eventType Eve
 		Signature: signature,
 		PrevHash:  prevHash,
 		TxID:      flowID, // 使用 TxID 存储 flow_id
+	}
+
+	// 设置元数据
+	if metadata != nil {
+		record.Metadata = metadata
 	}
 
 	// 计算记录内容的哈希
@@ -479,9 +490,21 @@ func (al *AuditLog) QueryByEventID(eventID string) (*EvidenceRecord, error) {
 	return nil, fmt.Errorf("evidence record not found for eventID: %s", eventID)
 }
 
-// QueryByTxID 根据业务流程ID查询所有相关事件（兼容旧接口）
-// 由于新版不再使用TxID，返回空结果
+// QueryByTxID 根据业务流程ID查询所有相关事件
 func (al *AuditLog) QueryByTxID(flowID string) ([]*EvidenceRecord, error) {
+	al.mu.RLock()
+	defer al.mu.RUnlock()
+
+	// 优先从内存索引查询
+	if records, ok := al.indexByFlowID[flowID]; ok {
+		return records, nil
+	}
+
+	// 如果内存中没有，尝试从存储层查询
+	if store, ok := al.store.(interface{ GetByFlowID(string, *time.Time, *time.Time) ([]*EvidenceRecord, error) }); ok {
+		return store.GetByFlowID(flowID, nil, nil)
+	}
+
 	return []*EvidenceRecord{}, nil
 }
 

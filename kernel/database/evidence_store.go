@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -41,10 +43,20 @@ func NewMySQLEvidenceStore(db *sql.DB) *MySQLEvidenceStore {
 
 // Store 存储证据记录
 func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
+	// 将 metadata 转换为 JSON 字符串存储
+	var metadataJSON []byte
+	if record.Metadata != nil {
+		var err error
+		metadataJSON, err = json.Marshal(record.Metadata)
+		if err != nil {
+			metadataJSON = []byte("{}")
+		}
+	}
+
 	query := `
 		INSERT INTO evidence_records
-		(event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		(event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := s.db.Exec(query,
 		record.EventID,
@@ -58,6 +70,7 @@ func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 		record.Signature,
 		record.Hash,
 		record.PrevHash,
+		metadataJSON,
 	)
 
 	if err != nil {
@@ -70,20 +83,28 @@ func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 // GetByID 根据ID获取证据记录
 func (s *MySQLEvidenceStore) GetByID(id int64) (*evidence.EvidenceRecord, error) {
 	query := `
-		SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash
+		SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash, metadata
 		FROM evidence_records WHERE id = ?`
 
 	row := s.db.QueryRow(query, id)
 
 	record := &evidence.EvidenceRecord{}
 	var dbID int64
+	var metadataBytes []byte
 
 	err := row.Scan(&dbID, &record.EventID, &record.EventType, &record.Timestamp,
 		&record.SourceID, &record.TargetID, &record.ChannelID,
-		&record.DataHash, &record.TxID, &record.Signature, &record.Hash, &record.PrevHash)
+		&record.DataHash, &record.TxID, &record.Signature, &record.Hash, &record.PrevHash, &metadataBytes)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan evidence record: %w", err)
+	}
+
+	// 反序列化 metadata
+	if len(metadataBytes) > 0 {
+		if err := json.Unmarshal(metadataBytes, &record.Metadata); err != nil {
+			log.Printf("⚠️ Failed to unmarshal metadata: %v", err)
+		}
 	}
 
 	return record, nil
@@ -145,7 +166,7 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 	}
 
 	query := fmt.Sprintf(`
-		SELECT event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, signature, hash, prev_hash
+		SELECT event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash, metadata
 		FROM evidence_records %s ORDER BY timestamp DESC %s`,
 		whereClause, limitClause)
 
@@ -158,12 +179,20 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 	var records []*evidence.EvidenceRecord
 	for rows.Next() {
 		record := &evidence.EvidenceRecord{}
+		var metadataBytes []byte
 
 		err := rows.Scan(&record.EventID, &record.EventType, &record.Timestamp,
 			&record.SourceID, &record.TargetID, &record.ChannelID,
-			&record.DataHash, &record.Signature, &record.Hash, &record.PrevHash)
+			&record.DataHash, &record.TxID, &record.Signature, &record.Hash, &record.PrevHash, &metadataBytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan evidence record: %w", err)
+		}
+
+		// 反序列化 metadata
+		if len(metadataBytes) > 0 {
+			if err := json.Unmarshal(metadataBytes, &record.Metadata); err != nil {
+				log.Printf("⚠️ Failed to unmarshal metadata: %v", err)
+			}
 		}
 
 		records = append(records, record)
@@ -174,10 +203,20 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 
 // Update 更新证据记录
 func (s *MySQLEvidenceStore) Update(record *evidence.EvidenceRecord) error {
+	// 将 metadata 转换为 JSON 字符串存储
+	var metadataJSON []byte
+	if record.Metadata != nil {
+		var err error
+		metadataJSON, err = json.Marshal(record.Metadata)
+		if err != nil {
+			metadataJSON = []byte("{}")
+		}
+	}
+
 	query := `
 		UPDATE evidence_records
 		SET event_type = ?, timestamp = ?, source_id = ?, target_id = ?,
-		    channel_id = ?, data_hash = ?, signature = ?, hash = ?, prev_hash = ?
+		    channel_id = ?, data_hash = ?, tx_id = ?, signature = ?, hash = ?, prev_hash = ?, metadata = ?
 		WHERE event_id = ?`
 
 	_, err := s.db.Exec(query,
@@ -187,9 +226,11 @@ func (s *MySQLEvidenceStore) Update(record *evidence.EvidenceRecord) error {
 		record.TargetID,
 		record.ChannelID,
 		record.DataHash,
+		record.TxID,
 		record.Signature,
 		record.Hash,
 		record.PrevHash,
+		metadataJSON,
 		record.EventID,
 	)
 
@@ -267,20 +308,28 @@ func (s *MySQLEvidenceStore) Count(filter interface{}) (int64, error) {
 
 // GetByEventID 根据事件ID获取证据记录
 func (s *MySQLEvidenceStore) GetByEventID(eventID string) (*evidence.EvidenceRecord, error) {
-	query := `SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, signature, hash, prev_hash
+	query := `SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash, metadata
 		FROM evidence_records WHERE event_id = ?`
 
 	row := s.db.QueryRow(query, eventID)
 
 	record := &evidence.EvidenceRecord{}
 	var dbID int64
+	var metadataBytes []byte
 
 	err := row.Scan(&dbID, &record.EventID, &record.EventType, &record.Timestamp,
 		&record.SourceID, &record.TargetID, &record.ChannelID,
-		&record.DataHash, &record.Signature, &record.Hash, &record.PrevHash)
+		&record.DataHash, &record.TxID, &record.Signature, &record.Hash, &record.PrevHash, &metadataBytes)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan evidence record: %w", err)
+	}
+
+	// 反序列化 metadata
+	if len(metadataBytes) > 0 {
+		if err := json.Unmarshal(metadataBytes, &record.Metadata); err != nil {
+			log.Printf("⚠️ Failed to unmarshal metadata: %v", err)
+		}
 	}
 
 	return record, nil

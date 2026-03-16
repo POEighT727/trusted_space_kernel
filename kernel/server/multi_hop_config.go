@@ -365,3 +365,81 @@ func (m *MultiHopConfigManager) GetRoutePath(routeName string) string {
 
 	return path
 }
+
+// GetNextHop 获取从指定内核到目标内核的下一跳信息
+// 返回下一跳内核ID、地址、端口，以及当前是第几跳、总共多少跳
+func (m *MultiHopConfigManager) GetNextHop(currentKernelID, targetKernelID string) (nextKernelID, nextAddress string, nextPort int, hopIndex, totalHops int, found bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	log.Printf("🔍 DEBUG GetNextHop: looking for path from %s to %s", currentKernelID, targetKernelID)
+
+	// 遍历所有路由配置
+	for _, config := range m.configs {
+		log.Printf("🔍 DEBUG GetNextHop: checking route %s, enabled=%v", config.RouteName, config.Enabled)
+		if !config.Enabled {
+			continue
+		}
+
+		totalHops = len(config.Hops)
+
+		// 查找当前内核所在的位置
+		for i, hop := range config.Hops {
+			log.Printf("🔍 DEBUG GetNextHop: hop[%d]: from=%s, to=%s", i, hop.FromKernel, hop.ToKernel)
+			if hop.FromKernel == currentKernelID {
+				// 如果当前内核就是要到达的目标内核
+				if hop.ToKernel == targetKernelID {
+					// 当前跳直接到目标，返回当前跳的 ToKernel
+					log.Printf("🔍 DEBUG GetNextHop: FOUND - direct hop from %s to %s", currentKernelID, targetKernelID)
+					return hop.ToKernel, hop.ToAddress, hop.ToPort, i + 1, totalHops, true
+				}
+
+				// 检查目标是否在后续路径中
+				for j := i + 1; j < len(config.Hops); j++ {
+					if config.Hops[j].ToKernel == targetKernelID {
+						// 找到路径！返回当前跳的下一跳（即当前跳的 ToKernel）
+						log.Printf("🔍 DEBUG GetNextHop: FOUND - multi-hop via %s", hop.ToKernel)
+						return hop.ToKernel, hop.ToAddress, hop.ToPort, i + 1, totalHops, true
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("🔍 DEBUG GetNextHop: NO PATH FOUND")
+	return "", "", 0, 0, 0, false
+}
+
+// GetRouteForKernelPair 获取两个内核之间的路由配置
+// 返回路由名称和跳数信息
+func (m *MultiHopConfigManager) GetRouteForKernelPair(currentKernelID, targetKernelID string) (routeName string, hopIndex, totalHops int, found bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, config := range m.configs {
+		if !config.Enabled {
+			continue
+		}
+
+		totalHops = len(config.Hops)
+
+		// 查找当前内核到目标内核的路径
+		for i, hop := range config.Hops {
+			if hop.FromKernel == currentKernelID {
+				// 检查目标是否在后续路径中
+				for j := i + 1; j < len(config.Hops); j++ {
+					if config.Hops[j].ToKernel == targetKernelID {
+						return config.RouteName, i + 1, totalHops, true
+					}
+				}
+
+				// 如果当前内核就是目标
+				if hop.ToKernel == targetKernelID {
+					return config.RouteName, i + 1, totalHops, true
+				}
+			}
+		}
+	}
+
+	return "", 0, 0, false
+}

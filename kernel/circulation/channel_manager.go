@@ -192,6 +192,11 @@ type ChannelManager struct {
 	// isFinal: 是否是最后一个数据包（流结束标志）
 	forwardToKernel func(kernelID string, packet *DataPacket, isFinal bool) error
 
+	// GetNextHopKernel 回调，用于获取多跳路由的下一跳内核
+	// 参数: currentKernelID(当前内核ID), targetKernelID(最终目标内核ID)
+	// 返回: nextKernelID(下一跳内核ID), address(下一跳地址), port(下一跳端口), hopIndex(当前第几跳), totalHops(总跳数), found(是否找到路由)
+	GetNextHopKernel func(currentKernelID, targetKernelID string) (nextKernelID, address string, port int, hopIndex, totalHops int, found bool)
+
 	// 当前内核ID（用于跨内核通信时判断是否需要转发）
 	kernelID string
 }
@@ -345,6 +350,15 @@ func (cm *ChannelManager) SetForwardToKernel(fn func(kernelID string, packet *Da
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.forwardToKernel = fn
+}
+
+// SetGetNextHopKernel 设置获取多跳路由下一跳的回调函数
+// 这个回调用于在多跳场景下确定数据的下一跳目标
+func (cm *ChannelManager) SetGetNextHopKernel(fn func(currentKernelID, targetKernelID string) (nextKernelID, address string, port int, hopIndex, totalHops int, found bool)) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.GetNextHopKernel = fn
+	log.Printf("✓ Multi-hop route callback set in ChannelManager")
 }
 
 // SetPermissionChangeCallback 设置权限变更回调
@@ -1478,7 +1492,35 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		if c.manager == nil || c.manager.forwardToKernel == nil {
 			return fmt.Errorf("forwardToKernel callback not configured")
 		}
+
+		currentKernelID := c.manager.kernelID
+
 		for rk, connectorIDs := range remoteTargetsByKernel {
+			// 确定实际转发的目标内核（多跳路由或直接转发）
+			actualTargetKernel := rk
+
+			// 如果目标是当前内核，只做本地处理，不转发
+			if actualTargetKernel == currentKernelID {
+				log.Printf("🔍 DEBUG PushData: target %s is current kernel %s, skip forwarding", actualTargetKernel, currentKernelID)
+				continue
+			}
+
+			// 检查是否配置了多跳路由
+		if c.manager.GetNextHopKernel != nil {
+			nextKernel, _, _, hopIndex, totalHops, found := c.manager.GetNextHopKernel(currentKernelID, rk)
+			log.Printf("🔍 DEBUG PushData: GetNextHopKernel(%s, %s) = %s, found=%v", currentKernelID, rk, nextKernel, found)
+			if found && nextKernel != "" {
+				// 使用多跳路由，只转发到下一跳
+				actualTargetKernel = nextKernel
+				log.Printf("🔄 Multi-hop: forwarding to next hop %s (hop %d/%d) instead of final target %s",
+					nextKernel, hopIndex, totalHops, rk)
+
+					// 如果是最后一跳，设置 IsFinal=true（通知下一跳这是最后一跳数据）
+					// 注意：只有当 actualTargetKernel 就是最终目标 rk 时才设置 IsFinal
+					// 否则需要在中间跳点处理转发
+				}
+			}
+
 			outPacket := &DataPacket{
 				ChannelID:      packet.ChannelID,
 				SequenceNumber: packet.SequenceNumber,
@@ -1493,10 +1535,17 @@ func (c *Channel) PushData(packet *DataPacket) error {
 			}
 			copy(outPacket.Payload, packet.Payload)
 			copy(outPacket.TargetIDs, connectorIDs)
-			if err := c.manager.forwardToKernel(rk, outPacket, packet.IsFinal); err != nil {
-				log.Printf("⚠ Failed to forward packet to kernel %s: %v", rk, err)
+
+			// 传递原始目标内核ID，用于存证记录
+			// 使用 TargetIDs 的第一个元素来传递原始目标
+			if len(connectorIDs) > 0 {
+				outPacket.TargetIDs[0] = rk + ":" + connectorIDs[0] // 格式: "最终目标内核:连接器"
+			}
+
+			if err := c.manager.forwardToKernel(actualTargetKernel, outPacket, packet.IsFinal); err != nil {
+				log.Printf("⚠ Failed to forward packet to kernel %s: %v", actualTargetKernel, err)
 			} else {
-				log.Printf("✓ Successfully forwarded packet to kernel %s", rk)
+				log.Printf("✓ Successfully forwarded packet to kernel %s (actual target: %s)", actualTargetKernel, rk)
 			}
 		}
 	}

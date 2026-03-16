@@ -90,6 +90,7 @@ message DataPacket {
   repeated string target_ids = 7; // 目标接收者ID列表（为空则广播给所有订阅者）
   string sender_kernel_id = 8;  // 发送方内核ID（跨内核时使用）
   string flow_id = 9;           // 业务流程ID，用于跟踪完整的数据传输过程
+  bool is_final = 10;           // 是否是最后一个数据包（流结束标志）
 }
 
 message TransferStatus {

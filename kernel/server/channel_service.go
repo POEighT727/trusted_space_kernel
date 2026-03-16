@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -1105,8 +1106,9 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 	var flowID string                 // 业务流程ID，用于跟踪完整的数据传输过程
 	var isCrossKernel bool            // 标记是否是跨内核频道
 	var receiverIDs []string         // 接收方ID列表，用于存证
-	var targetKernelID string         // 目标内核ID（跨内核时）
+	var targetKernelID string        // 目标内核ID（跨内核时）
 	var currentKernelID string       // 当前内核ID
+	var firstPacketDataCategory string // 第一个数据包的数据类型
 
 	for {
 		packet, err := stream.Recv()
@@ -1121,45 +1123,80 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 					currentKernelID = s.multiKernelManager.config.KernelID
 				}
 
-				// 计算 target_id
-				targetID := ""
+				// 计算 actualTargetForEvidence - 用于存证的目标
+				actualTargetForEvidence := ""
 				if isCrossKernel && targetKernelID != "" {
-					targetID = targetKernelID
-				} else if len(receiverIDs) > 0 {
-					targetID = receiverIDs[0]
-				}
+					// 跨内核时，actualTargetForEvidence 用于存证（下一跳）
 
-				// 如果是跨内核频道，先记录 connector -> kernel 的 DATA_SEND
-				if isCrossKernel {
-					if _, err := s.auditLog.SubmitBasicEvidenceWithFlowID(
-						senderID, // connector-A
-						evidence.EventTypeDataSend,
-						channelID,
-						hex.EncodeToString(finalHash[:]),
-						evidence.DirectionInternal,
-						currentKernelID, // kernel-1
-						flowID,
-					); err != nil {
-						log.Printf("⚠ Failed to submit connector->kernel DATA_SEND evidence: %v", err)
+					// 获取下一跳用于存证记录
+					if s.multiKernelManager != nil && s.multiKernelManager.multiHopConfigManager != nil {
+						nextKernel, _, _, _, _, found := s.multiKernelManager.multiHopConfigManager.GetNextHop(currentKernelID, targetKernelID)
+						if found && nextKernel != "" {
+							actualTargetForEvidence = nextKernel
+						} else {
+							// 如果没有多跳配置，直接使用目标内核
+							actualTargetForEvidence = targetKernelID
+						}
 					} else {
-						log.Printf("✓ Recorded connector->kernel DATA_SEND: %s -> %s, flow: %s", senderID, currentKernelID, flowID)
+						actualTargetForEvidence = targetKernelID
 					}
-				}
+				} else if len(receiverIDs) > 0 {
+					actualTargetForEvidence = receiverIDs[0]
+			}
 
-				// 记录 DATA_SEND 存证（流结束），包含 flow_id 和 data_hash
-				// 跨内核：kernel-1 -> kernel-2
-				// 非跨内核：connector-A -> kernel-1
-				if _, err := s.auditLog.SubmitBasicEvidenceWithFlowID(
+			// 如果是跨内核频道，先记录 connector -> kernel 的 DATA_SEND
+			if isCrossKernel {
+				// 根据数据类型设置 metadata
+				dataCategory := "business"
+				if firstPacketDataCategory != "business" {
+					dataCategory = "control"
+				}
+				metadata := map[string]string{
+					"data_category": dataCategory,
+				}
+				if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
+					senderID, // connector-A
+					evidence.EventTypeDataSend,
+					channelID,
+					hex.EncodeToString(finalHash[:]),
+					evidence.DirectionInternal,
+					currentKernelID, // kernel-1
+					flowID,
+					metadata,
+				); err != nil {
+					log.Printf("⚠ Failed to submit connector->kernel DATA_SEND evidence: %v", err)
+				} else {
+					log.Printf("✓ Recorded connector->kernel DATA_SEND: %s -> %s, flow: %s", senderID, currentKernelID, flowID)
+				}
+			}
+
+			// 记录 DATA_SEND 存证（流结束），包含 flow_id 和 data_hash
+			// 跨内核：kernel-1 -> kernel-2 (actualTargetForEvidence 是下一跳)
+			// 非跨内核：connector-A -> kernel-1
+			{
+				// 根据数据类型设置 metadata
+				dataCategory := "business"
+				if firstPacketDataCategory != "business" {
+					dataCategory = "control"
+				}
+				metadata := map[string]string{
+					"data_category": dataCategory,
+				}
+				if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
 					currentKernelID,
 					evidence.EventTypeDataSend,
 					channelID,
 					hex.EncodeToString(finalHash[:]),
 					evidence.DirectionInternal,
-					targetID,
+					actualTargetForEvidence,
 					flowID,
+					metadata,
 				); err != nil {
 					log.Printf("⚠ Failed to submit DATA_SEND complete evidence: %v", err)
+				} else {
+					log.Printf("✓ Recorded DATA_SEND: %s -> %s, flow: %s", currentKernelID, actualTargetForEvidence, flowID)
 				}
+			}
 
 				// 如果是跨内核频道，发送流结束标志给接收方内核
 				if isCrossKernel && targetKernelID != "" {
@@ -1200,6 +1237,11 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 			senderID = packet.SenderId
 			if senderID == "" {
 				return fmt.Errorf("sender_id is required in packet")
+			}
+
+			// 首次接收数据包时，记录数据类型（业务数据或控制消息）
+			if firstPacketDataCategory == "" {
+				firstPacketDataCategory = determineDataCategory(packet.Payload)
 			}
 
 			// 验证发送方身份
@@ -2699,4 +2741,21 @@ func (s *ChannelServiceServer) GetPermissionRequests(ctx context.Context, req *p
 		Requests: pbRequests,
 		Message:  "permission requests retrieved successfully",
 	}, nil
+}
+
+// determineDataCategory 根据 payload 判断数据类型
+// 返回 "business" 表示业务数据，返回控制消息类型如 "channel_proposal" 等
+func determineDataCategory(payload []byte) string {
+	// 尝试解析为 JSON
+	var msg struct {
+		MessageType string `json:"message_type"`
+	}
+	if err := json.Unmarshal(payload, &msg); err == nil {
+		// 如果成功解析，检查 MessageType
+		if msg.MessageType != "" {
+			return msg.MessageType
+		}
+	}
+	// 无法解析或没有 MessageType，默认为业务数据
+	return "business"
 }
