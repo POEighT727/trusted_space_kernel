@@ -372,11 +372,8 @@ func (m *MultiHopConfigManager) GetNextHop(currentKernelID, targetKernelID strin
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	log.Printf("🔍 DEBUG GetNextHop: looking for path from %s to %s", currentKernelID, targetKernelID)
-
 	// 遍历所有路由配置
 	for _, config := range m.configs {
-		log.Printf("🔍 DEBUG GetNextHop: checking route %s, enabled=%v", config.RouteName, config.Enabled)
 		if !config.Enabled {
 			continue
 		}
@@ -385,12 +382,10 @@ func (m *MultiHopConfigManager) GetNextHop(currentKernelID, targetKernelID strin
 
 		// 查找当前内核所在的位置
 		for i, hop := range config.Hops {
-			log.Printf("🔍 DEBUG GetNextHop: hop[%d]: from=%s, to=%s", i, hop.FromKernel, hop.ToKernel)
 			if hop.FromKernel == currentKernelID {
 				// 如果当前内核就是要到达的目标内核
 				if hop.ToKernel == targetKernelID {
 					// 当前跳直接到目标，返回当前跳的 ToKernel
-					log.Printf("🔍 DEBUG GetNextHop: FOUND - direct hop from %s to %s", currentKernelID, targetKernelID)
 					return hop.ToKernel, hop.ToAddress, hop.ToPort, i + 1, totalHops, true
 				}
 
@@ -398,7 +393,6 @@ func (m *MultiHopConfigManager) GetNextHop(currentKernelID, targetKernelID strin
 				for j := i + 1; j < len(config.Hops); j++ {
 					if config.Hops[j].ToKernel == targetKernelID {
 						// 找到路径！返回当前跳的下一跳（即当前跳的 ToKernel）
-						log.Printf("🔍 DEBUG GetNextHop: FOUND - multi-hop via %s", hop.ToKernel)
 						return hop.ToKernel, hop.ToAddress, hop.ToPort, i + 1, totalHops, true
 					}
 				}
@@ -406,7 +400,6 @@ func (m *MultiHopConfigManager) GetNextHop(currentKernelID, targetKernelID strin
 		}
 	}
 
-	log.Printf("🔍 DEBUG GetNextHop: NO PATH FOUND")
 	return "", "", 0, 0, 0, false
 }
 

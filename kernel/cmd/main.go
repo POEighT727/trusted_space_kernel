@@ -289,6 +289,7 @@ func main() {
 			SenderId:       packet.SenderID,
 			TargetIds:      packet.TargetIDs,
 			FlowId:         packet.FlowID,
+			IsFinal:        isFinal, // 传递流结束标志
 		}
 		return multiKernelManager.ForwardData(kernelID, pbPacket, isFinal)
 	})

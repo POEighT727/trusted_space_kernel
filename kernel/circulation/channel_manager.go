@@ -1501,14 +1501,12 @@ func (c *Channel) PushData(packet *DataPacket) error {
 
 			// 如果目标是当前内核，只做本地处理，不转发
 			if actualTargetKernel == currentKernelID {
-				log.Printf("🔍 DEBUG PushData: target %s is current kernel %s, skip forwarding", actualTargetKernel, currentKernelID)
 				continue
 			}
 
 			// 检查是否配置了多跳路由
 		if c.manager.GetNextHopKernel != nil {
 			nextKernel, _, _, hopIndex, totalHops, found := c.manager.GetNextHopKernel(currentKernelID, rk)
-			log.Printf("🔍 DEBUG PushData: GetNextHopKernel(%s, %s) = %s, found=%v", currentKernelID, rk, nextKernel, found)
 			if found && nextKernel != "" {
 				// 使用多跳路由，只转发到下一跳
 				actualTargetKernel = nextKernel
@@ -2177,25 +2175,19 @@ func (c *Channel) RequestPermissionChange(requesterID, changeType, targetID, rea
 
 // ApprovePermissionChange 批准权限变更
 func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
-	log.Printf("🔍 DEBUG ApprovePermissionChange ENTRY: approverID=%s, requestID=%s", approverID, requestID)
-	
 	c.permissionMu.Lock()
-	log.Printf("🔍 DEBUG ApprovePermissionChange: lock acquired")
 	// 注意：不使用 defer unlock，因为需要在 goroutine 之前手动解锁
 
-	log.Printf("🔍 DEBUG ApprovePermissionChange: checking channel status")
 	if c.Status != ChannelStatusActive {
 		return fmt.Errorf("channel is not active")
 	}
 
 	// 验证批准者权限
-	log.Printf("🔍 DEBUG ApprovePermissionChange: checking approver")
 	if approverID != c.ApproverID {
 		return fmt.Errorf("only the channel approver can approve permission changes")
 	}
 
 	// 查找请求
-	log.Printf("🔍 DEBUG ApprovePermissionChange: searching for request")
 	var request *PermissionChangeRequest
 	for _, req := range c.permissionRequests {
 		if req.RequestID == requestID {
@@ -2207,15 +2199,9 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 		return fmt.Errorf("permission change request not found")
 	}
 
-	log.Printf("🔍 DEBUG ApprovePermissionChange: found request, ChangeType=%s, TargetID=%s, Status=%s", 
-		request.ChangeType, request.TargetID, request.Status)
-
-	log.Printf("🔍 DEBUG ApprovePermissionChange: checking request status")
 	if request.Status != "pending" {
 		return fmt.Errorf("request is already %s", request.Status)
 	}
-
-	log.Printf("🔍 DEBUG ApprovePermissionChange: executing permission change")
 
 	// 执行权限变更
 	// 注意：对于 add_sender，应该使用 TargetID（目标连接器），而不是 RequesterID（请求者）
@@ -2251,7 +2237,6 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 		// 关键修复：无论发送者是否属于本地内核，都需要更新 remoteReceivers
 		// 因为可能已经有远程接收者存在，需要能够转发数据到远程内核
 		// 直接修改映射，避免调用 SetRemoteReceiver 导致的潜在问题
-		log.Printf("🔍 DEBUG ApprovePermissionChange: add_sender, updating remoteReceivers")
 		if c.manager != nil && c.remoteReceivers != nil {
 			// 遍历所有接收者，更新 remoteReceivers
 			for _, receiverID := range c.ReceiverIDs {
@@ -2262,7 +2247,6 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 					// 如果接收者在远程内核上，记录映射
 					if receiverKernelID != c.manager.kernelID {
 						c.remoteReceivers[connectorID] = receiverKernelID
-						log.Printf("🔍 DEBUG ApprovePermissionChange: add_sender, set remote receiver %s -> %s", connectorID, receiverKernelID)
 					}
 				}
 			}
@@ -2310,7 +2294,6 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 		// 关键修复：无论接收者是否属于本地内核，都需要更新 remoteReceivers
 		// 因为可能已经有远程发送者存在，需要能够转发数据到远程内核
 		// 直接修改映射，避免调用 SetRemoteReceiver 导致的潜在问题
-		log.Printf("🔍 DEBUG ApprovePermissionChange: add_receiver, updating remoteReceivers")
 		if c.manager != nil && c.remoteReceivers != nil {
 			// 遍历所有发送者，更新 remoteReceivers
 			for _, senderID := range c.SenderIDs {
@@ -2321,7 +2304,6 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 					// 如果发送者在远程内核上，记录映射
 					if senderKernelID != c.manager.kernelID {
 						c.remoteReceivers[connectorID] = senderKernelID
-						log.Printf("🔍 DEBUG ApprovePermissionChange: add_receiver, set remote receiver %s -> %s", connectorID, senderKernelID)
 					}
 				}
 			}
@@ -2336,7 +2318,6 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 	}
 
 	// 更新请求状态
-	log.Printf("🔍 DEBUG ApprovePermissionChange: about to update request status")
 	now := time.Now()
 	request.Status = "approved"
 	request.ApprovedAt = &now
@@ -2344,10 +2325,7 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 
 	c.LastActivity = time.Now()
 	
-	log.Printf("🔍 DEBUG ApprovePermissionChange: SenderIDs before notify = %v", c.SenderIDs)
-
 	// 通知远程内核频道已更新（发送方/接收方列表已变更）
-	log.Printf("🔍 DEBUG ApprovePermissionChange: calling notifyRemoteKernelsOfChannelUpdate, SenderIDs=%v, ReceiverIDs=%v", c.SenderIDs, c.ReceiverIDs)
 	
 	// 通知被添加的连接器：使用解析后的完整 kernel-qualified ID（而非原始 TargetID），
 	// 确保回调可以正确进行跨内核转发。
@@ -2396,8 +2374,6 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 	c.permissionMu.Unlock()
 	go c.notifyRemoteKernelsOfChannelUpdate()
 	
-	log.Printf("🔍 DEBUG ApprovePermissionChange: returning nil")
-
 	return nil
 }
 
@@ -2636,9 +2612,7 @@ func (c *Channel) broadcastPermissionResult(requestID, action, approverID, rejec
 
 // notifyRemoteKernelsOfChannelUpdate 通知远程内核频道已更新（发送方/接收方列表变更）
 func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
-	log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate START: c.manager=%v, forwardToKernel=%v, kernelID=%s", c.manager, c.manager != nil && c.manager.forwardToKernel != nil, c.manager.kernelID)
 	if c.manager == nil || c.manager.forwardToKernel == nil {
-		log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate: early return - manager or forwardToKernel is nil")
 		return
 	}
 
@@ -2654,7 +2628,6 @@ func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
 			kernelPart := parts[0]
 			if kernelPart != currentKernelID {
 				remoteKernels[kernelPart] = true
-				log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate: found remote sender kernel %s from %s", kernelPart, senderID)
 			}
 		}
 	}
@@ -2666,28 +2639,19 @@ func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
 			kernelPart := parts[0]
 			if kernelPart != currentKernelID {
 				remoteKernels[kernelPart] = true
-				log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate: found remote receiver kernel %s from %s", kernelPart, receiverID)
 			}
 		}
 	}
 
 	// 也检查 remoteReceivers 映射
-	for connectorID, kernelID := range c.remoteReceivers {
+	for _, kernelID := range c.remoteReceivers {
 		if kernelID != currentKernelID {
 			remoteKernels[kernelID] = true
-			log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate: found remote from remoteReceivers: %s -> %s", connectorID, kernelID)
 		}
 	}
 	
-	log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate: remoteKernels to notify = %v", remoteKernels)
-
 	// 发送频道更新通知到所有远程内核
 	for kernelID := range remoteKernels {
-	// 添加调试日志
-	log.Printf("🔍 DEBUG notifyRemoteKernelsOfChannelUpdate ENTRY: c.manager=%v, forwardToKernel=%v", c.manager, c.manager != nil && c.manager.forwardToKernel != nil)
-	log.Printf("🔍 DEBUG: Notifying kernel %s of channel update, remoteReceivers=%v, SenderIDs=%v, ReceiverIDs=%v",
-		kernelID, c.remoteReceivers, c.SenderIDs, c.ReceiverIDs)
-
 		// 创建一个频道更新控制消息
 		msg := ControlMessage{
 			MessageType: "channel_update",
@@ -2726,9 +2690,6 @@ func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
 // handleChannelUpdate 处理从远程内核接收的频道更新消息
 func (c *Channel) handleChannelUpdate(update *ChannelUpdateMessage) {
 	c.mu.Lock()
-
-	log.Printf("🔍 DEBUG handleChannelUpdate: received update, SenderIDs=%v, ReceiverIDs=%v, remoteReceivers before=%v",
-		update.SenderIDs, update.ReceiverIDs, c.remoteReceivers)
 
 	// Snapshot old receiver set to detect newly added local receivers
 	oldReceiversSet := make(map[string]bool, len(c.ReceiverIDs))

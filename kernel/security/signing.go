@@ -53,14 +53,11 @@ func GenerateEvidenceSignature(connectorID, eventType, channelID, dataHash strin
 	// 注意：这里我们使用内核的私钥来签名evidence，而不是连接器的私钥
 	// 这样可以证明evidence是由内核生成的
 
-	log.Printf("🔍 DEBUG GenerateEvidenceSignature: start for %s", connectorID)
-
 	// 构建要签名的数据
 	data := fmt.Sprintf("%s|%s|%s|%s|%d", connectorID, eventType, channelID, dataHash, timestamp)
 
 	// 使用内核的私钥进行签名
 	kernelKeyPath := "certs/kernel.key"
-	log.Printf("🔍 DEBUG GenerateEvidenceSignature: loading key from %s", kernelKeyPath)
 	privateKey, err := LoadRSAPrivateKey(kernelKeyPath)
 	if err != nil {
 		// 如果找不到内核私钥，返回空签名（不影响主要功能）
@@ -190,4 +187,51 @@ func VerifyEvidenceSignature(isCrossKernel bool, connectorID, eventType, channel
 	}
 
 	return VerifySignature([]byte(data), signature, publicKey)
+}
+
+// GenerateFlowSignature 生成数据流的最终签名（使用内核私钥对链尾哈希签名）
+func GenerateFlowSignature(chainTailHash string, timestamp int64) (string, error) {
+	// 构建要签名的数据：链尾哈希 + 时间戳
+	data := fmt.Sprintf("%s|%d", chainTailHash, timestamp)
+
+	// 使用内核的私钥进行签名
+	kernelKeyPath := "certs/kernel.key"
+	privateKey, err := LoadRSAPrivateKey(kernelKeyPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to load kernel private key: %w", err)
+	}
+
+	// 对数据进行签名
+	return SignData([]byte(data), privateKey)
+}
+
+// VerifyFlowSignature 验证数据流的最终签名
+func VerifyFlowSignature(chainTailHash string, timestamp int64, signature string) error {
+	if signature == "" {
+		return fmt.Errorf("empty flow signature")
+	}
+
+	// 构建待验证数据
+	data := fmt.Sprintf("%s|%d", chainTailHash, timestamp)
+
+	// 优先使用CA证书验证签名
+	caPublicKey, caErr := ExtractPublicKeyFromCert("certs/ca.crt")
+	if caErr == nil {
+		if err := VerifySignature([]byte(data), signature, caPublicKey); err == nil {
+			return nil
+		}
+	}
+
+	// 回退：使用内核证书验证（兼容旧版本）
+	kernelPublicKey, kernelErr := ExtractPublicKeyFromCert("certs/kernel.crt")
+	if kernelErr != nil {
+		return fmt.Errorf("failed to load certificate for verification: CA error: %v, kernel error: %v", caErr, kernelErr)
+	}
+
+	// 验证签名
+	if err := VerifySignature([]byte(data), signature, kernelPublicKey); err != nil {
+		return fmt.Errorf("flow signature verification failed: %w", err)
+	}
+
+	return nil
 }

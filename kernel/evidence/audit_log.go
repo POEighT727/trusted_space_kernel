@@ -79,22 +79,22 @@ const (
 
 // EvidenceRecord 存证记录（内核级别，只记录内核可直达的信息）
 type EvidenceRecord struct {
-	EventID     string            `json:"event_id"`     // 事件实例ID
-	EventType   EventType         `json:"event_type"`  // 事件类型
-	Timestamp   time.Time         `json:"timestamp"`   // 时间戳
-	SourceID    string            `json:"source_id"`   // 事件来源ID（连接器ID或内核ID）
-	TargetID    string            `json:"target_id"`   // 目标ID（直接下一跳：内核或连接器）
-	Direction   EvidenceDirection `json:"direction"`   // 存证方向
-	ChannelID   string            `json:"channel_id"`  // 频道ID
-	DataHash    string            `json:"data_hash"`   // 数据哈希
-	Signature   string            `json:"signature"`   // 内核签名
-	Hash        string            `json:"hash"`        // 记录内容哈希，用于完整性验证
-	PrevHash    string            `json:"prev_hash"`   // 上一条记录的哈希（哈希链）
-	Metadata    map[string]string `json:"metadata,omitempty"` // 扩展元数据
+	EventID        string            `json:"event_id"`     // 事件实例ID
+	EventType      EventType         `json:"event_type"`  // 事件类型
+	Timestamp      time.Time         `json:"timestamp"`   // 时间戳
+	SourceID       string            `json:"source_id"`   // 事件来源ID（连接器ID或内核ID）
+	TargetID       string            `json:"target_id"`   // 目标ID（直接下一跳：内核或连接器）
+	Direction      EvidenceDirection `json:"direction"`   // 存证方向
+	ChannelID      string            `json:"channel_id"`  // 频道ID
+	FlowID         string            `json:"flow_id"`     // 业务流程ID
+	DataHash       string            `json:"data_hash"`   // 数据哈希
+	Signature      string            `json:"signature"`   // 签名（流模式下仅在流结束时生成）
+	Hash           string            `json:"hash"`        // 记录内容哈希，用于完整性验证
+	PrevHash       string            `json:"prev_hash"`   // 上一条记录的哈希（哈希链）
+	Metadata       map[string]string `json:"metadata,omitempty"` // 扩展元数据
 
 	// 兼容旧接口的字段
-	TxID        string            `json:"tx_id,omitempty"`        // 业务流程ID（兼容旧接口）
-	ConnectorID string            `json:"connector_id,omitempty"` // 连接器ID（兼容旧接口）
+	ConnectorID string `json:"connector_id,omitempty"` // 连接器ID（兼容旧接口）
 }
 
 // UnmarshalJSON 自定义JSON反序列化，支持向后兼容
@@ -264,19 +264,13 @@ func (al *AuditLog) SubmitBasicEvidenceWithFlowID(sourceID string, eventType Eve
 
 // SubmitBasicEvidenceWithMetadata 提交带元数据的存证记录
 func (al *AuditLog) SubmitBasicEvidenceWithMetadata(sourceID string, eventType EventType, channelID, dataHash string, direction EvidenceDirection, targetID, flowID string, metadata map[string]string) (*EvidenceRecord, error) {
-	log.Printf("📝 EVIDENCE SUBMIT: %s, source: %s, channel: %s, direction: %s, target: %s, flow: %s",
-		eventType, sourceID, channelID, direction, targetID, flowID)
-
 	// 生成事件实例ID
 	eventID := uuid.New().String()
 	tempTimestamp := time.Now()
 
-	// 生成数字签名
-	signature, err := al.generateEvidenceSignature(sourceID, string(eventType), channelID, dataHash, tempTimestamp.Unix())
-	if err != nil {
-		log.Printf("⚠️  Failed to generate signature for evidence: %v", err)
-		signature = ""
-	}
+	// 注意：单条签名（Signature）在流签名模式下不再生成
+	// 签名将在数据流结束时统一通过 SignFlow 方法生成
+	signature := ""
 
 	al.mu.Lock()
 	prevHash := al.lastRecordHash
@@ -290,10 +284,10 @@ func (al *AuditLog) SubmitBasicEvidenceWithMetadata(sourceID string, eventType E
 		TargetID:  targetID,
 		Direction: direction,
 		ChannelID: channelID,
+		FlowID:    flowID,
 		DataHash:  dataHash,
 		Signature: signature,
 		PrevHash:  prevHash,
-		TxID:      flowID, // 使用 TxID 存储 flow_id
 	}
 
 	// 设置元数据
@@ -321,7 +315,7 @@ func (al *AuditLog) SubmitBasicEvidenceWithMetadata(sourceID string, eventType E
 					continue
 				}
 			} else {
-				log.Printf("✓ Evidence stored in database: %s", eventID)
+				log.Printf("Evidence stored in database: %s", eventID)
 				break
 			}
 		}
@@ -357,9 +351,6 @@ func (al *AuditLog) SubmitBasicEvidenceWithMetadata(sourceID string, eventType E
 // SubmitBasicEvidenceWithRetry 提交基本事件存证（带重试机制）
 // maxRetries: 最大重试次数
 func (al *AuditLog) SubmitBasicEvidenceWithRetry(sourceID string, eventType EventType, channelID, dataHash string, direction EvidenceDirection, targetID string, maxRetries int) (*EvidenceRecord, error) {
-	log.Printf("📝 EVIDENCE SUBMIT: %s, source: %s, channel: %s, direction: %s, target: %s",
-		eventType, sourceID, channelID, direction, targetID)
-
 	// 生成事件实例ID
 	eventID := uuid.New().String()
 	tempTimestamp := time.Now()
@@ -408,7 +399,7 @@ func (al *AuditLog) SubmitBasicEvidenceWithRetry(sourceID string, eventType Even
 					continue
 				}
 			} else {
-				log.Printf("✓ Evidence stored in database: %s", eventID)
+				log.Printf("Evidence stored in database: %s", eventID)
 				break
 			}
 		}
@@ -488,29 +479,6 @@ func (al *AuditLog) QueryByEventID(eventID string) (*EvidenceRecord, error) {
 	}
 
 	return nil, fmt.Errorf("evidence record not found for eventID: %s", eventID)
-}
-
-// QueryByTxID 根据业务流程ID查询所有相关事件
-func (al *AuditLog) QueryByTxID(flowID string) ([]*EvidenceRecord, error) {
-	al.mu.RLock()
-	defer al.mu.RUnlock()
-
-	// 优先从内存索引查询
-	if records, ok := al.indexByFlowID[flowID]; ok {
-		return records, nil
-	}
-
-	// 如果内存中没有，尝试从存储层查询
-	if store, ok := al.store.(interface{ GetByFlowID(string, *time.Time, *time.Time) ([]*EvidenceRecord, error) }); ok {
-		return store.GetByFlowID(flowID, nil, nil)
-	}
-
-	return []*EvidenceRecord{}, nil
-}
-
-// QueryByTxIDSingle 根据交易ID查询单个事件（兼容旧接口）
-func (al *AuditLog) QueryByTxIDSingle(txID string) (*EvidenceRecord, error) {
-	return nil, fmt.Errorf("TxID query is no longer supported, use QueryByEventID instead")
 }
 
 // QueryByChannelAndConnector 根据频道和连接器ID查询证据记录（兼容旧接口）
@@ -834,11 +802,96 @@ func (al *AuditLog) GetRecordCount() int {
 
 // VerifyRecord 验证单个记录的完整性
 func (al *AuditLog) VerifyRecord(record *EvidenceRecord) error {
-		calculatedHash := al.calculateRecordHash(record)
+	calculatedHash := al.calculateRecordHash(record)
 	if calculatedHash != record.Hash {
 		return fmt.Errorf("hash mismatch: expected=%s, got=%s", record.Hash, calculatedHash)
-		}
+	}
 	return nil
+}
+
+// SignFlow 对指定 flow_id 的所有记录生成流签名
+// 在数据流结束时调用，获取链尾哈希并生成签名
+func (al *AuditLog) SignFlow(flowID string) (*EvidenceRecord, error) {
+	if flowID == "" {
+		return nil, fmt.Errorf("flow_id is required")
+	}
+
+	// 获取该 flow_id 的所有记录
+	records := al.QueryByFlowID(flowID, time.Time{}, time.Time{}, 0)
+	if len(records) == 0 {
+		return nil, fmt.Errorf("no records found for flow_id: %s", flowID)
+	}
+
+	// 获取链尾记录（最后一条）
+	lastRecord := records[len(records)-1]
+	chainTailHash := lastRecord.Hash
+
+	// 生成流签名（对链尾哈希签名）
+	timestamp := time.Now().Unix()
+	signature, err := security.GenerateFlowSignature(chainTailHash, timestamp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate flow signature: %w", err)
+	}
+
+	// 更新最后一条记录的 Signature
+	lastRecord.Signature = signature
+
+	// 如果有持久化存储，更新数据库
+	if al.store != nil {
+		if err := al.store.Update(lastRecord); err != nil {
+			log.Printf("⚠️ Failed to update flow signature in database: %v", err)
+		}
+	}
+
+	// 更新内存索引中的记录
+	al.mu.Lock()
+	if records, exists := al.indexByFlowID[flowID]; exists && len(records) > 0 {
+		records[len(records)-1].Signature = signature
+	}
+	al.mu.Unlock()
+
+	log.Printf("✅ Flow signature generated for flow_id: %s, chain_tail_hash: %s", flowID, chainTailHash)
+	return lastRecord, nil
+}
+
+// VerifyFlow 验证指定 flow_id 的流签名
+// 验证流程：获取链尾记录，验证 Signature 是否有效
+func (al *AuditLog) VerifyFlow(flowID string) (bool, error) {
+	if flowID == "" {
+		return false, fmt.Errorf("flow_id is required")
+	}
+
+	// 获取该 flow_id 的所有记录
+	records := al.QueryByFlowID(flowID, time.Time{}, time.Time{}, 0)
+	if len(records) == 0 {
+		return false, fmt.Errorf("no records found for flow_id: %s", flowID)
+	}
+
+	// 获取链尾记录
+	lastRecord := records[len(records)-1]
+
+	// 检查是否有流签名
+	if lastRecord.Signature == "" {
+		return false, fmt.Errorf("no flow signature found for flow_id: %s", flowID)
+	}
+
+	// 验证链尾哈希连续性（可选：验证整条链）
+	if len(records) > 1 {
+		for i := 1; i < len(records); i++ {
+			if records[i].PrevHash != records[i-1].Hash {
+				return false, fmt.Errorf("chain broken at record %d", i)
+			}
+		}
+	}
+
+	// 验证流签名
+	chainTailHash := lastRecord.Hash
+	timestamp := lastRecord.Timestamp.Unix()
+	if err := security.VerifyFlowSignature(chainTailHash, timestamp, lastRecord.Signature); err != nil {
+		return false, fmt.Errorf("flow signature verification failed: %w", err)
+	}
+
+	return true, nil
 }
 
 // writeRecordToFile 将记录写入文件
@@ -941,7 +994,6 @@ func (al *AuditLog) sendEvidenceToChannel(channelID string, record *EvidenceReco
 
 	// 检查频道是否已激活
 	if channel.Status != circulation.ChannelStatusActive {
-		log.Printf("ℹ️ Channel %s is not active (status: %s), skipping evidence transmission", channelID, channel.Status)
 		return nil
 	}
 

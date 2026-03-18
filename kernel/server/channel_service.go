@@ -50,7 +50,7 @@ func (nm *NotificationManager) Register(receiverID string) chan *pb.ChannelNotif
 	// 创建新的通知通道
 	notifyChan := make(chan *pb.ChannelNotification, 10)
 	nm.notifications[receiverID] = notifyChan
-	log.Printf("✓ Notification channel registered for connector %s", receiverID)
+	log.Printf("Notification channel registered for connector %s", receiverID)
 	return notifyChan
 }
 
@@ -172,16 +172,13 @@ func NewChannelServiceServer(
 
 	// 设置evidence频道创建通知回调
 	channelManager.SetChannelCreatedCallback(server.notifyChannelCreated)
-	log.Printf("✓ Evidence channel notification callback set")
+	log.Printf("Evidence channel notification callback set")
 
 	return server
 }
 
 // notifyChannelCreated 处理异步创建的频道通知（特别是evidence频道）
 func (s *ChannelServiceServer) notifyChannelCreated(channel *circulation.Channel) {
-	log.Printf("📢 发送异步创建频道通知: %s (发送方: %v, 接收方: %v)",
-		channel.ChannelID, channel.SenderIDs, channel.ReceiverIDs)
-
 	// 构建通知消息
 	notification := &pb.ChannelNotification{
 		ChannelId:         channel.ChannelID,
@@ -283,11 +280,10 @@ func (s *ChannelServiceServer) notifyParticipant(participantID string, notificat
 			connectorID = parts[1]
 		}
 
-		// 如果目标内核是本内核，直接使用本地通知管理器
-		if s.multiKernelManager != nil && s.multiKernelManager.config != nil && kernelID == s.multiKernelManager.config.KernelID {
-			log.Printf("📨 Local notification to %s", connectorID)
-			return s.NotificationManager.Notify(connectorID, notification)
-		}
+	// 如果目标内核是本内核，直接使用本地通知管理器
+	if s.multiKernelManager != nil && s.multiKernelManager.config != nil && kernelID == s.multiKernelManager.config.KernelID {
+		return s.NotificationManager.Notify(connectorID, notification)
+	}
 
 		// 查找目标内核连接信息
 		s.multiKernelManager.kernelsMu.RLock()
@@ -301,7 +297,6 @@ func (s *ChannelServiceServer) notifyParticipant(participantID string, notificat
 
 		// 使用远端内核的 IdentityService（主服务器端口）来调用 ChannelService.NotifyChannelCreated，
 		// 因为 ChannelService 注册在主端口的 gRPC 服务上，而 kinfo.conn 是内核间的 kernel-to-kernel 连接。
-		log.Printf("→ Forwarding channel notification to kernel %s for connector %s (channel %s)", kernelID, connectorID, notification.ChannelId)
 		conn, err := s.multiKernelManager.connectToKernelIdentityService(kinfo)
 		if err != nil {
 			log.Printf("⚠ Failed to connect to identity service of kernel %s: %v", kernelID, err)
@@ -319,13 +314,9 @@ func (s *ChannelServiceServer) notifyParticipant(participantID string, notificat
 		// 附加协商状态标记（如果为已接受或已拒绝），便于远端直接将占位标记为相应状态
 		if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED {
 			senderWithMeta = fmt.Sprintf("%s|%s", senderWithMeta, "ACCEPTED")
-			log.Printf("📨 Adding ACCEPTED status to senderWithMeta: %s", senderWithMeta)
 		} else if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_REJECTED {
 			senderWithMeta = fmt.Sprintf("%s|%s", senderWithMeta, "REJECTED")
 		}
-
-		log.Printf("📨 Calling NotifyChannelCreated on kernel %s: ReceiverId=%s, SenderId=%s",
-			kernelID, connectorID, senderWithMeta)
 
 		resp, err := chClient.NotifyChannelCreated(context.Background(), &pb.NotifyChannelRequest{
 			ReceiverId: connectorID,
@@ -336,14 +327,13 @@ func (s *ChannelServiceServer) notifyParticipant(participantID string, notificat
 		if err != nil {
 			log.Printf("⚠ Failed to forward notification to kernel %s: %v", kernelID, err)
 		} else {
-			log.Printf("✓ Notification forwarded to kernel %s for connector %s: success=%v, msg=%s",
+			log.Printf("Notification forwarded to kernel %s for connector %s: success=%v, msg=%s",
 				kernelID, connectorID, resp.Success, resp.Message)
 		}
 		return err
 	}
 
 	// 本地参与者
-	log.Printf("📨 Local notification to %s", participantID)
 	return s.NotificationManager.Notify(participantID, notification)
 }
 
@@ -577,8 +567,6 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 				}
 			}
 		}
-
-		log.Printf("✓ 频道提议已创建，等待参与方确认")
 	}()
 
 	return &pb.ProposeChannelResponse{
@@ -591,8 +579,6 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 
 // AcceptChannelProposal 接受频道提议（协商第二阶段）
 func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *pb.AcceptChannelProposalRequest) (*pb.AcceptChannelProposalResponse, error) {
-	log.Printf("📥 AcceptChannelProposal received: channel=%s, accepter=%s, proposal=%s", req.ChannelId, req.AccepterId, req.ProposalId)
-
 	// 验证接受者身份：优先以 connector 证书验证；若失败，允许已知内核以 "kernelID:connectorID" 格式代为转发
 	isForwarded := false
 	if err := security.VerifyConnectorID(ctx, req.AccepterId); err != nil {
@@ -605,13 +591,10 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 			}, nil
 		}
 
-		log.Printf("🔐 AcceptChannelProposal: VerifyConnectorID failed, certID from ctx=%s, req.AccepterId=%s", certID, req.AccepterId)
-
 		// 检查是否是内核转发请求
 		// 情况1：证书 CN 是特定内核 ID（如 kernel-1, kernel-2）
 		// 情况2：证书 CN 是通用的 trusted-data-space-kernel，但 AccepterId 包含 kernel- 前缀
 		isValidForwardedRequest := false
-		accepterKernelID := ""
 
 		// 先检查证书 CN 是否在 kernels 列表中
 		s.multiKernelManager.kernelsMu.RLock()
@@ -622,7 +605,6 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 			// 证书 CN 是已知内核
 			if strings.HasPrefix(req.AccepterId, certID+":") {
 				isValidForwardedRequest = true
-				accepterKernelID = certID
 			}
 		} else if certID == "trusted-data-space-kernel" {
 			// 证书 CN 是通用内核证书，检查 AccepterId 是否包含 kernel- 前缀
@@ -631,8 +613,6 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 				parts := strings.SplitN(req.AccepterId, ":", 2)
 				if strings.HasPrefix(parts[0], "kernel-") {
 					isValidForwardedRequest = true
-					accepterKernelID = parts[0]
-					log.Printf("🔐 AcceptChannelProposal: detected forwarded request from generic cert, extracted kernel=%s", accepterKernelID)
 				}
 			}
 		}
@@ -646,7 +626,6 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 
 		// 这是一个被转发的接受请求
 		isForwarded = true
-		log.Printf("🔐 AcceptChannelProposal: isForwarded=true, accepterKernelID=%s", accepterKernelID)
 	}
 
 	// 获取频道信息，检查提议状态
@@ -691,7 +670,6 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 	// 如果频道已经是 active 状态，且这是来自远端内核的 accept，
 	// 需要通知远端内核频道已激活（因为频道可能是在创建者自动接受时激活的）
 	if channel.Status == circulation.ChannelStatusActive && isForwarded {
-		log.Printf("✓ DEBUG: Channel %s already active, isForwarded=%v, notifying...", channel.ChannelID, isForwarded)
 		notification := &pb.ChannelNotification{
 			ChannelId:         channel.ChannelID,
 			CreatorId:         channel.CreatorID,
@@ -706,13 +684,11 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 		go s.notifyOtherKernelsChannelActivated(channel, notification)
 
 		// 同时通知本地创建者（如果创建者是本地参与者且尚未收到通知）
-		log.Printf("✓ DEBUG: CreatorID=%s, contains colon=%v", channel.CreatorID, strings.Contains(channel.CreatorID, ":"))
 		if channel.CreatorID != "" && !strings.Contains(channel.CreatorID, ":") {
-			log.Printf("✓ DEBUG: About to notify creator %s", channel.CreatorID)
 			if err := s.notifyParticipant(channel.CreatorID, notification); err != nil {
 				log.Printf("⚠ Failed to notify creator %s of channel activation: %v", channel.CreatorID, err)
 			} else {
-				log.Printf("✓ Sent ACCEPTED notification to creator %s", channel.CreatorID)
+				log.Printf("Sent ACCEPTED notification to creator %s", channel.CreatorID)
 			}
 		}
 	}
@@ -825,13 +801,8 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 		}
 	}
 
-	log.Printf("🔍 AcceptChannelProposal: allApproved=%v, hasRemoteParticipants=%v", allApproved, hasRemoteParticipants)
-	log.Printf("🔍 SenderApprovals: %v", channel.ChannelProposal.SenderApprovals)
-	log.Printf("🔍 ReceiverApprovals: %v", channel.ChannelProposal.ReceiverApprovals)
-
 	if allApproved {
 		// 所有参与方都已确认，频道正式创建，发送创建通知
-		log.Printf("✅ Channel %s is being activated - all participants approved!", channel.ChannelID)
 		go func() {
 			notification := &pb.ChannelNotification{
 				ChannelId:         channel.ChannelID,
@@ -860,7 +831,7 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 				if err := s.notifyParticipant(senderID, notification); err != nil {
 					log.Printf("⚠ Failed to notify sender %s: %v", senderID, err)
 				} else {
-					log.Printf("✓ Sent ACCEPTED notification to sender %s", senderID)
+					log.Printf("Sent ACCEPTED notification to sender %s", senderID)
 				}
 			}
 
@@ -869,7 +840,7 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 				if err := s.notifyParticipant(receiverID, notification); err != nil {
 					log.Printf("⚠ Failed to notify receiver %s: %v", receiverID, err)
 				} else {
-					log.Printf("✓ Sent ACCEPTED notification to receiver %s", receiverID)
+					log.Printf("Sent ACCEPTED notification to receiver %s", receiverID)
 				}
 			}
 
@@ -893,11 +864,11 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 				if err := s.notifyParticipant(channel.CreatorID, notification); err != nil {
 					log.Printf("⚠ Failed to notify creator %s: %v", channel.CreatorID, err)
 				} else {
-					log.Printf("✓ Sent ACCEPTED notification to creator %s", channel.CreatorID)
+					log.Printf("Sent ACCEPTED notification to creator %s", channel.CreatorID)
 				}
 			}
 
-			log.Printf("✓ 频道 %s 已正式创建，所有参与方已确认", channel.ChannelID)
+			log.Printf("Channel %s activated, all participants approved", channel.ChannelID)
 
 			// 主动通知其他内核频道已激活（用于跨内核场景）
 			// 这样 origin kernel 能更新其本地频道状态
@@ -948,7 +919,7 @@ func (s *ChannelServiceServer) forwardAcceptToRemoteKernels(channelID, accepterI
 		if err != nil {
 			log.Printf("⚠ Failed to forward accept to kernel %s: %v", k.KernelID, err)
 		} else {
-			log.Printf("✓ Forwarded accept from %s to kernel %s", accepterID, k.KernelID)
+			log.Printf("Forwarded accept from %s to kernel %s", accepterID, k.KernelID)
 		}
 	}
 }
@@ -1025,7 +996,7 @@ func (s *ChannelServiceServer) notifyOtherKernelsChannelActivated(channel *circu
 		if err != nil {
 			log.Printf("⚠ Failed to notify kernel %s of channel activation: %v", k.KernelID, err)
 		} else {
-			log.Printf("✓ Notified kernel %s that channel %s is activated", k.KernelID, channel.ChannelID)
+			log.Printf("Notified kernel %s that channel %s is activated", k.KernelID, channel.ChannelID)
 		}
 	}
 }
@@ -1115,7 +1086,6 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 		if err == io.EOF {
 			// 流结束，记录传输完成
 			if channelID != "" && senderID != "" && flowID != "" {
-				log.Printf("🔄 Recording DATA_SEND complete for channel %s, sender %s, flow: %s", channelID, senderID, flowID)
 				finalHash := sha256.Sum256(dataHashAccumulator)
 
 				// 获取当前内核ID
@@ -1166,7 +1136,7 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				); err != nil {
 					log.Printf("⚠ Failed to submit connector->kernel DATA_SEND evidence: %v", err)
 				} else {
-					log.Printf("✓ Recorded connector->kernel DATA_SEND: %s -> %s, flow: %s", senderID, currentKernelID, flowID)
+					log.Printf("Recorded connector->kernel DATA_SEND: %s -> %s, flow: %s", senderID, currentKernelID, flowID)
 				}
 			}
 
@@ -1194,11 +1164,20 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				); err != nil {
 					log.Printf("⚠ Failed to submit DATA_SEND complete evidence: %v", err)
 				} else {
-					log.Printf("✓ Recorded DATA_SEND: %s -> %s, flow: %s", currentKernelID, actualTargetForEvidence, flowID)
+					log.Printf("Recorded DATA_SEND: %s -> %s, flow: %s", currentKernelID, actualTargetForEvidence, flowID)
 				}
 			}
 
-				// 如果是跨内核频道，发送流结束标志给接收方内核
+			// 在数据流结束时生成流签名
+			if flowID != "" {
+				if _, err := s.auditLog.SignFlow(flowID); err != nil {
+					log.Printf("⚠ Failed to sign flow %s: %v", flowID, err)
+				} else {
+					log.Printf("✅ Flow signature generated for flow: %s", flowID)
+				}
+			}
+
+			// 如果是跨内核频道，发送流结束标志给接收方内核
 				if isCrossKernel && targetKernelID != "" {
 					channel, err := s.channelManager.GetChannel(channelID)
 					if err == nil {
@@ -1214,7 +1193,7 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 						if err := channel.PushData(endPacket); err != nil {
 							log.Printf("⚠ Failed to send end packet to kernel %s: %v", targetKernelID, err)
 						} else {
-							log.Printf("✓ Sent end packet to kernel %s, flow: %s", targetKernelID, flowID)
+							log.Printf("Sent end packet to kernel %s, flow: %s", targetKernelID, flowID)
 						}
 					}
 				}
@@ -1296,23 +1275,18 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				}
 			}
 
-			// 如果是跨内核频道，记录 flow_id
-			if isCrossKernel {
-				log.Printf("🔄 Cross-kernel channel detected, using flow_id=%s", flowID)
-			}
-		}
+		// 如果是跨内核频道，记录 flow_id
+		// (cross-kernel channel detected)
+	}
 
 		// 获取频道
 		channel, err := s.channelManager.GetChannel(packet.ChannelId)
 		if err != nil {
-			log.Printf("🔍 DEBUG SendData: channel not found: %v", err)
 			return fmt.Errorf("channel not found: %v", err)
 		}
-		log.Printf("🔍 DEBUG SendData: channel found, Status=%s", channel.Status)
 
 		// 检查频道是否处于活跃状态（协商完成后才能传输数据）
 		if channel.Status != circulation.ChannelStatusActive {
-			log.Printf("🔍 DEBUG SendData: channel not active, status=%s", channel.Status)
 			return fmt.Errorf("channel is not active: status=%s", channel.Status)
 		}
 
@@ -1328,10 +1302,7 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 			FlowID:         flowID,
 		}
 
-		log.Printf("🔍 DEBUG SendData: about to call PushData, SenderID=%s, TargetIDs=%v", dataPacket.SenderID, dataPacket.TargetIDs)
-
 		if err := channel.PushData(dataPacket); err != nil {
-			log.Printf("🔍 DEBUG SendData: PushData failed: %v", err)
 			return fmt.Errorf("failed to push data: %v", err)
 		}
 
@@ -1389,7 +1360,6 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 
 	// 如果是从离线状态恢复，发送频道激活通知
 	if isRecovery {
-		log.Printf("🔄 Connector %s recovered from offline state, sending channel notification", req.ConnectorId)
 		go func() {
 			// 构造频道通知
 			negotiationStatus := pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED
@@ -1534,9 +1504,6 @@ func (s *ChannelServiceServer) WaitForChannelNotification(req *pb.WaitNotificati
 
 // NotifyChannelCreated 处理频道创建通知（内部使用，用于测试）
 func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb.NotifyChannelRequest) (*pb.NotifyChannelResponse, error) {
-	log.Printf("📨 NotifyChannelReceived: channel=%s, receiver=%s, sender=%s",
-		req.ChannelId, req.ReceiverId, req.SenderId)
-
 	// 解析 SenderId 中的 originStatus（如果有）
 	originStatus := ""
 	originProposalId := ""
@@ -1562,7 +1529,6 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 
 	if err != nil {
 		// 如果本地没有该频道，尝试从请求中的 SenderId（origin kernel）获取频道详细信息并在本地创建占位频道
-		log.Printf("📌 Channel not found locally, will fetch from origin kernel %s", originKernel)
 		originKernel = req.SenderId
 		if strings.Contains(originKernel, "|") {
 			parts := strings.SplitN(originKernel, "|", 3)
@@ -1615,8 +1581,6 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 			}
 		}
 
-		log.Printf("📌 Fetching channel info from origin kernel %s (conn state check passed)...", originKernel)
-
 		// 使用带超时的上下文防止永久阻塞
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -1625,7 +1589,6 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 			RequesterKernelId: s.multiKernelManager.config.KernelID,
 			ChannelId:         req.ChannelId,
 		})
-		log.Printf("📌 GetCrossKernelChannelInfo result: found=%v, err=%v", infoResp != nil && infoResp.Found, err)
 		if err != nil || !infoResp.Found {
 			log.Printf("⚠️ GetCrossKernelChannelInfo failed: err=%v, infoResp=%v", err, infoResp)
 			return &pb.NotifyChannelResponse{
@@ -1745,7 +1708,7 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 			channel.ChannelProposal.Status = circulation.NegotiationStatusAccepted
 		channel.LastActivity = time.Now()
 
-			log.Printf("✓ Channel %s activated after receiving ACCEPTED from kernel %s",
+			log.Printf("Channel %s activated after receiving ACCEPTED from kernel %s",
 			channel.ChannelID, originKernel)
 
 			// 启动数据分发协程
@@ -1787,7 +1750,7 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 
 			// 如果不是所有参与者都已接受，设置标志但保持状态为 proposed
 			notifiedForAccept = true
-			log.Printf("✓ Channel %s: received ACCEPTED from kernel %s, waiting for all participants to accept",
+			log.Printf("Channel %s: received ACCEPTED from kernel %s, waiting for all participants to accept",
 				channel.ChannelID, originKernel)
 
 			// 远端参与方的批准状态由 AcceptChannelProposal 转发链路统一更新，
@@ -1799,13 +1762,13 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 				// 检查是否以 originKernel: 开头
 				if strings.HasPrefix(receiverID, originKernel+":") {
 					channel.ChannelProposal.ReceiverApprovals[receiverID] = true
-					log.Printf("✓ Updated receiver approval: %s = true (from ACCEPTED notification)", receiverID)
+					log.Printf("Updated receiver approval: %s = true (from ACCEPTED notification)", receiverID)
 				}
 			}
 			for _, senderID := range channel.SenderIDs {
 				if strings.HasPrefix(senderID, originKernel+":") {
 					channel.ChannelProposal.SenderApprovals[senderID] = true
-					log.Printf("✓ Updated sender approval: %s = true (from ACCEPTED notification)", senderID)
+					log.Printf("Updated sender approval: %s = true (from ACCEPTED notification)", senderID)
 				}
 			}
 
@@ -1831,7 +1794,7 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 			channel.Status = circulation.ChannelStatusActive
 			channel.ChannelProposal.Status = circulation.NegotiationStatusAccepted
 			channel.LastActivity = time.Now()
-			log.Printf("✓ Channel %s activated after all participants accepted", channel.ChannelID)
+			log.Printf("Channel %s activated after all participants accepted", channel.ChannelID)
 
 			// 启动数据分发协程
 			go channel.StartDataDistribution()
@@ -1933,7 +1896,7 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 					if err := s.notifyParticipant(senderID, notification); err != nil {
 						log.Printf("⚠ Failed to notify sender %s: %v", senderID, err)
 					} else {
-						log.Printf("✓ Sent PROPOSED notification to sender %s", senderID)
+						log.Printf("Sent PROPOSED notification to sender %s", senderID)
 					}
 				}
 			}
@@ -1962,7 +1925,7 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 					if err := s.notifyParticipant(receiverID, notification); err != nil {
 						log.Printf("⚠ Failed to notify receiver %s: %v", receiverID, err)
 					} else {
-						log.Printf("✓ Sent PROPOSED notification to receiver %s", receiverID)
+						log.Printf("Sent PROPOSED notification to receiver %s", receiverID)
 					}
 				}
 			}
@@ -1976,7 +1939,7 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 	// 说明创建者已接受，但本地仍需 accept 才能激活
 	// 只有在第一次没有通知过的情况下才通知（避免重复通知）
 	if channel.Status == circulation.ChannelStatusProposed && originStatus == "ACCEPTED" && !notifiedForAccept {
-		log.Printf("✓ Channel %s: creator (kernel %s) has accepted, waiting for local accept",
+		log.Printf("Channel %s: creator has accepted, waiting for local accept",
 			channel.ChannelID, originKernel)
 
 		// 更新协商状态为 proposed（如果之前不是）
@@ -2062,13 +2025,13 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 			// 检查是否以 originKernel: 开头
 			if strings.HasPrefix(receiverID, originKernel+":") {
 				channel.ChannelProposal.ReceiverApprovals[receiverID] = true
-				log.Printf("✓ Updated receiver approval in creator-accepted branch: %s = true", receiverID)
+				log.Printf("Updated receiver approval in creator-accepted branch: %s = true", receiverID)
 			}
 		}
 		for _, senderID := range channel.SenderIDs {
 			if strings.HasPrefix(senderID, originKernel+":") {
 				channel.ChannelProposal.SenderApprovals[senderID] = true
-				log.Printf("✓ Updated sender approval in creator-accepted branch: %s = true", senderID)
+				log.Printf("Updated sender approval in creator-accepted branch: %s = true", senderID)
 			}
 		}
 
@@ -2094,7 +2057,7 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 			channel.Status = circulation.ChannelStatusActive
 			channel.ChannelProposal.Status = circulation.NegotiationStatusAccepted
 			channel.LastActivity = time.Now()
-			log.Printf("✓ Channel %s activated after all participants accepted (in creator-accepted branch)", channel.ChannelID)
+			log.Printf("Channel %s activated after all participants accepted (in creator-accepted branch)", channel.ChannelID)
 
 			// 启动数据分发协程
 			go channel.StartDataDistribution()

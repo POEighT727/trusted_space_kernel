@@ -66,7 +66,7 @@ func (s *EvidenceServiceServer) SubmitEvidence(ctx context.Context, req *pb.Evid
 	}
 
 	return &pb.EvidenceResponse{
-		EvidenceTxId: record.TxID,
+		EvidenceTxId: record.FlowID,
 		Committed:    true,
 		Message:      "evidence committed successfully",
 		Timestamp:    record.Timestamp.Unix(),
@@ -86,11 +86,7 @@ func (s *EvidenceServiceServer) QueryEvidence(ctx context.Context, req *pb.Query
 	// 根据不同条件查询
 	if req.FlowId != "" {
 		// 按业务流程ID查询 - 查询完整的业务流程
-		var err error
-		records, err = s.auditLog.QueryByTxID(req.FlowId)
-		if err != nil {
-			return nil, fmt.Errorf("failed to query by flow ID: %w", err)
-		}
+		records = s.auditLog.QueryByFlowID(req.FlowId, time.Time{}, time.Time{}, 0)
 	} else if req.ChannelId != "" {
 		// 按频道查询 - 需要验证查询者是否是该频道的参与者
 		channel, err := s.channelManager.GetChannel(req.ChannelId)
@@ -151,7 +147,7 @@ func (s *EvidenceServiceServer) QueryEvidence(ctx context.Context, req *pb.Query
 	pbRecords := make([]*pb.EvidenceRecord, len(records))
 	for i, record := range records {
 		pbRecords[i] = &pb.EvidenceRecord{
-			EvidenceTxId: record.TxID,
+			EvidenceTxId: record.FlowID,
 			Evidence: &pb.EvidenceRequest{
 				ConnectorId: record.ConnectorID,
 				EventType:   string(record.EventType),

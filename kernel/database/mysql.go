@@ -72,9 +72,9 @@ func (m *DBManager) initTables() error {
 		source_id VARCHAR(100) NOT NULL COMMENT '事件来源ID（连接器或内核）',
 		target_id VARCHAR(100) DEFAULT '' COMMENT '目标ID（直接下一跳：内核或连接器）',
 		channel_id VARCHAR(36) DEFAULT '' COMMENT '频道ID',
+		flow_id VARCHAR(36) DEFAULT '' COMMENT '业务流程ID',
 		data_hash VARCHAR(128) DEFAULT '' COMMENT '数据哈希',
-		tx_id VARCHAR(36) DEFAULT '' COMMENT '业务流程ID（用于跨内核关联）',
-		signature TEXT COMMENT '内核数字签名',
+		signature TEXT COMMENT '签名（流模式下仅在流结束时生成）',
 		hash VARCHAR(128) NOT NULL COMMENT '记录内容哈希',
 		prev_hash VARCHAR(128) DEFAULT '' COMMENT '上一条记录的哈希（哈希链）',
 		metadata JSON COMMENT '元数据',
@@ -83,7 +83,7 @@ func (m *DBManager) initTables() error {
 		INDEX idx_source_id (source_id),
 		INDEX idx_target_id (target_id),
 		INDEX idx_channel_id (channel_id),
-		INDEX idx_tx_id (tx_id),
+		INDEX idx_flow_id (flow_id),
 		INDEX idx_timestamp (timestamp)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='内核存证记录表';`
 

@@ -55,7 +55,7 @@ func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 
 	query := `
 		INSERT INTO evidence_records
-		(event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash, metadata)
+		(event_id, event_type, timestamp, source_id, target_id, channel_id, flow_id, data_hash, signature, hash, prev_hash, metadata)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := s.db.Exec(query,
@@ -65,8 +65,8 @@ func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 		record.SourceID,
 		record.TargetID,
 		record.ChannelID,
+		record.FlowID,
 		record.DataHash,
-		record.TxID, // 业务流程ID
 		record.Signature,
 		record.Hash,
 		record.PrevHash,
@@ -83,7 +83,7 @@ func (s *MySQLEvidenceStore) Store(record *evidence.EvidenceRecord) error {
 // GetByID 根据ID获取证据记录
 func (s *MySQLEvidenceStore) GetByID(id int64) (*evidence.EvidenceRecord, error) {
 	query := `
-		SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash, metadata
+		SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, flow_id, data_hash, signature, hash, prev_hash, metadata
 		FROM evidence_records WHERE id = ?`
 
 	row := s.db.QueryRow(query, id)
@@ -93,8 +93,8 @@ func (s *MySQLEvidenceStore) GetByID(id int64) (*evidence.EvidenceRecord, error)
 	var metadataBytes []byte
 
 	err := row.Scan(&dbID, &record.EventID, &record.EventType, &record.Timestamp,
-		&record.SourceID, &record.TargetID, &record.ChannelID,
-		&record.DataHash, &record.TxID, &record.Signature, &record.Hash, &record.PrevHash, &metadataBytes)
+		&record.SourceID, &record.TargetID, &record.ChannelID, &record.FlowID,
+		&record.DataHash, &record.Signature, &record.Hash, &record.PrevHash, &metadataBytes)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan evidence record: %w", err)
@@ -140,7 +140,7 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 		args = append(args, evidenceFilter.ChannelID)
 	}
 	if evidenceFilter.FlowID != "" {
-		conditions = append(conditions, "tx_id = ?")
+		conditions = append(conditions, "flow_id = ?")
 		args = append(args, evidenceFilter.FlowID)
 	}
 	if evidenceFilter.StartTime != nil {
@@ -166,7 +166,7 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 	}
 
 	query := fmt.Sprintf(`
-		SELECT event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash, metadata
+		SELECT event_id, event_type, timestamp, source_id, target_id, channel_id, flow_id, data_hash, signature, hash, prev_hash, metadata
 		FROM evidence_records %s ORDER BY timestamp DESC %s`,
 		whereClause, limitClause)
 
@@ -183,7 +183,7 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 
 		err := rows.Scan(&record.EventID, &record.EventType, &record.Timestamp,
 			&record.SourceID, &record.TargetID, &record.ChannelID,
-			&record.DataHash, &record.TxID, &record.Signature, &record.Hash, &record.PrevHash, &metadataBytes)
+			&record.FlowID, &record.DataHash, &record.Signature, &record.Hash, &record.PrevHash, &metadataBytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan evidence record: %w", err)
 		}
@@ -216,7 +216,7 @@ func (s *MySQLEvidenceStore) Update(record *evidence.EvidenceRecord) error {
 	query := `
 		UPDATE evidence_records
 		SET event_type = ?, timestamp = ?, source_id = ?, target_id = ?,
-		    channel_id = ?, data_hash = ?, tx_id = ?, signature = ?, hash = ?, prev_hash = ?, metadata = ?
+		    channel_id = ?, flow_id = ?, data_hash = ?, signature = ?, hash = ?, prev_hash = ?, metadata = ?
 		WHERE event_id = ?`
 
 	_, err := s.db.Exec(query,
@@ -225,8 +225,8 @@ func (s *MySQLEvidenceStore) Update(record *evidence.EvidenceRecord) error {
 		record.SourceID,
 		record.TargetID,
 		record.ChannelID,
+		record.FlowID,
 		record.DataHash,
-		record.TxID,
 		record.Signature,
 		record.Hash,
 		record.PrevHash,
@@ -278,7 +278,7 @@ func (s *MySQLEvidenceStore) Count(filter interface{}) (int64, error) {
 		args = append(args, evidenceFilter.ChannelID)
 	}
 	if evidenceFilter.FlowID != "" {
-		conditions = append(conditions, "tx_id = ?")
+		conditions = append(conditions, "flow_id = ?")
 		args = append(args, evidenceFilter.FlowID)
 	}
 	if evidenceFilter.StartTime != nil {
@@ -308,7 +308,7 @@ func (s *MySQLEvidenceStore) Count(filter interface{}) (int64, error) {
 
 // GetByEventID 根据事件ID获取证据记录
 func (s *MySQLEvidenceStore) GetByEventID(eventID string) (*evidence.EvidenceRecord, error) {
-	query := `SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, data_hash, tx_id, signature, hash, prev_hash, metadata
+	query := `SELECT id, event_id, event_type, timestamp, source_id, target_id, channel_id, flow_id, data_hash, signature, hash, prev_hash, metadata
 		FROM evidence_records WHERE event_id = ?`
 
 	row := s.db.QueryRow(query, eventID)
@@ -318,8 +318,8 @@ func (s *MySQLEvidenceStore) GetByEventID(eventID string) (*evidence.EvidenceRec
 	var metadataBytes []byte
 
 	err := row.Scan(&dbID, &record.EventID, &record.EventType, &record.Timestamp,
-		&record.SourceID, &record.TargetID, &record.ChannelID,
-		&record.DataHash, &record.TxID, &record.Signature, &record.Hash, &record.PrevHash, &metadataBytes)
+		&record.SourceID, &record.TargetID, &record.ChannelID, &record.FlowID,
+		&record.DataHash, &record.Signature, &record.Hash, &record.PrevHash, &metadataBytes)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan evidence record: %w", err)
@@ -425,5 +425,15 @@ func (s *MySQLEvidenceStore) calculateRecordHash(record *evidence.EvidenceRecord
 
 // Close 关闭存储
 func (s *MySQLEvidenceStore) Close() error {
+	return nil
+}
+
+// UpdateFlowSignature 更新记录的流签名
+func (s *MySQLEvidenceStore) UpdateFlowSignature(eventID, flowSignature string) error {
+	query := `UPDATE evidence_records SET flow_signature = ? WHERE event_id = ?`
+	_, err := s.db.Exec(query, flowSignature, eventID)
+	if err != nil {
+		return fmt.Errorf("failed to update flow signature: %w", err)
+	}
 	return nil
 }

@@ -114,16 +114,15 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 		}
 		s.multiKernelManager.kernelsMu.Lock()
 		s.multiKernelManager.kernels[req.KernelId] = kernelInfo
-		log.Printf("✓ Saved kernel %s to kernels map (via approve)", req.KernelId)
+		log.Printf("Saved kernel %s to kernels map (via approve)", req.KernelId)
 		s.multiKernelManager.kernelsMu.Unlock()
 
 		// 重要：同步创建到新注册内核的客户端连接（用于后续 ForwardData 和通知转发）
 		targetPort := int(req.Port) + 2 // kernel-to-kernel 端口 = 主端口 + 2
-		log.Printf("🔧 Creating client for approved kernel %s at %s:%d", req.KernelId, req.Address, targetPort)
 		if err := s.multiKernelManager.createKernelClient(req.KernelId, req.Address, targetPort); err != nil {
 			log.Printf("⚠ Failed to create client for approved kernel %s: %v", req.KernelId, err)
 		} else {
-			log.Printf("✓ Client connection established for approved kernel %s", req.KernelId)
+			log.Printf("Client connection established for approved kernel %s", req.KernelId)
 		}
 
 		// 广播本内核已知的其他内核给新注册的内核
@@ -231,19 +230,18 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 	// 保存到已知内核列表
 	s.multiKernelManager.kernelsMu.Lock()
 	s.multiKernelManager.kernels[req.KernelId] = kernelInfo
-	log.Printf("✓ Saved kernel %s to kernels map, conn=%v", req.KernelId, kernelInfo.conn)
+	log.Printf("Saved kernel %s to kernels map, conn=%v", req.KernelId, kernelInfo.conn)
 	s.multiKernelManager.kernelsMu.Unlock()
 
 	// 创建到新注册内核的客户端连接（用于后续 ForwardData 等调用）
 	// kernel_port 为主端口+2
 	targetPort := int(req.Port) + 2
-	log.Printf("🔧 About to create client for kernel %s at %s:%d", req.KernelId, req.Address, targetPort)
-	
+
 	// 同步创建客户端连接（重要：确保连接在发送任何通知前已建立）
 	if err := s.multiKernelManager.createKernelClient(req.KernelId, req.Address, targetPort); err != nil {
 		log.Printf("⚠ Failed to create client for registered kernel %s: %v", req.KernelId, err)
 	} else {
-		log.Printf("✓ Client connection established for kernel %s", req.KernelId)
+		log.Printf("Client connection established for kernel %s", req.KernelId)
 	}
 
 	// 广播本内核已知的其他内核给新注册的内核
@@ -360,7 +358,7 @@ func (s *KernelServiceServer) SyncKnownKernels(ctx context.Context, req *pb.Sync
 				LastHeartbeat: kernelInfo.LastHeartbeat,
 				PublicKey:     kernelInfo.PublicKey,
 			}
-			log.Printf("✓ Added new kernel %s from sync (via %s)", kernelInfo.KernelId, req.SourceKernelId)
+			log.Printf("Added new kernel %s from sync (via %s)", kernelInfo.KernelId, req.SourceKernelId)
 
 			// 主动向新内核发起互联请求
 			go func(kid string, addr string, port int) {
@@ -534,7 +532,7 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 				if err := s.notificationManager.Notify(id, notification); err != nil {
 					log.Printf("⚠ Failed to notify local receiver %s: %v", id, err)
 				} else {
-					log.Printf("✓ Notified local receiver %s of cross-kernel proposal %s", id, channel.ChannelID)
+					log.Printf("Notified local receiver %s of cross-kernel proposal %s", id, channel.ChannelID)
 				}
 			}
 		}
@@ -543,7 +541,7 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 				if err := s.notificationManager.Notify(id, notification); err != nil {
 					log.Printf("⚠ Failed to notify local sender %s: %v", id, err)
 				} else {
-					log.Printf("✓ Notified local sender %s of cross-kernel proposal %s", id, channel.ChannelID)
+					log.Printf("Notified local sender %s of cross-kernel proposal %s", id, channel.ChannelID)
 				}
 			}
 		}
@@ -751,7 +749,7 @@ func (s *KernelServiceServer) CreateCrossKernelChannel(ctx context.Context, req 
 					Message: fmt.Sprintf("remote kernel %s rejected: %v", rk, err),
 				}, nil
 			}
-			log.Printf("✓ Notified kernel %s to inform connector %s of channel %s", rk, targetCID, channel.ChannelID)
+			log.Printf("Notified kernel %s to inform connector %s of channel %s", rk, targetCID, channel.ChannelID)
 		}
 		identityConn.Close()
 	}
@@ -791,8 +789,6 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 		FlowID:         flowID,
 		IsFinal:        req.GetIsFinal(),
 	}
-
-	log.Printf("🔍 DEBUG ForwardData: TargetIDs=%v, SenderID=%s, IsFinal=%v", req.DataPacket.TargetIds, req.DataPacket.SenderId, req.GetIsFinal())
 
 	// 根据 payload 内容判断消息类型
 	var testMsg circulation.ControlMessage
@@ -839,9 +835,6 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 			}
 		}
 
-		log.Printf("🔍 DEBUG ForwardData: isFinal=%v, flowID=%s, payloadLen=%d, originalTarget=%s",
-			isFinal, flowID, len(req.DataPacket.Payload), originalTargetKernelID)
-
 		// 累积数据哈希（用于流结束时计算完整数据的哈希）
 		// 只有非结束数据包才累积哈希
 		// 注意：与 channel_service.go 保持一致 - 累积原始数据
@@ -882,7 +875,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 			); err != nil {
 				log.Printf("⚠ Failed to submit kernel->kernel DATA_RECEIVE evidence: %v", err)
 			} else {
-				log.Printf("✓ Recorded kernel->kernel DATA_RECEIVE: %s -> %s, flow: %s", req.SourceKernelId, currentKernelID, flowID)
+				log.Printf("Recorded kernel->kernel DATA_RECEIVE: %s -> %s, flow: %s", req.SourceKernelId, currentKernelID, flowID)
 			}
 
 			// 记录存证：kernel-2 -> kernel-3 (DATA_SEND) - 多跳转发存证
@@ -905,7 +898,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 						); err != nil {
 							log.Printf("⚠ Failed to submit kernel->kernel DATA_SEND evidence (multi-hop): %v", err)
 						} else {
-							log.Printf("✓ Recorded kernel->kernel DATA_SEND (multi-hop): %s -> %s (hop %d/%d), flow: %s",
+							log.Printf("Recorded kernel->kernel DATA_SEND (multi-hop): %s -> %s (hop %d/%d), flow: %s",
 								currentKernelID, nextKernel, hopIndex, totalHops, flowID)
 						}
 					}
@@ -913,7 +906,6 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 			}
 
 			// 记录存证：kernel-2 -> connector-U (DATA_RECEIVE)，带 flow_id 和 data_hash
-			log.Printf("🔍 DEBUG: Recording connector DATA_RECEIVE, ReceiverIDs=%v, currentKernelID=%s", channel.ReceiverIDs, currentKernelID)
 			for _, receiverID := range channel.ReceiverIDs {
 				// 跳过远程接收者
 				if strings.Contains(receiverID, ":") {
@@ -938,6 +930,15 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 					metadata,
 				); err != nil {
 					log.Printf("⚠ Failed to submit kernel->connector DATA_RECEIVE evidence: %v", err)
+				}
+			}
+
+			// 在数据流结束时生成流签名（跨内核接收方）
+			if flowID != "" {
+				if _, err := s.auditLog.SignFlow(flowID); err != nil {
+					log.Printf("⚠ Failed to sign flow %s: %v", flowID, err)
+				} else {
+					log.Printf("✅ Flow signature generated for flow: %s (receiver side)", flowID)
 				}
 			}
 		}
@@ -1100,7 +1101,7 @@ func (s *KernelServiceServer) SyncPermissionRequest(ctx context.Context, req *pb
 		// 从 SourceKernelID 提取 requesterID（格式：kernel-X:connector-Y）
 		requesterID := remoteReq.SourceKernelID
 		channel.StorePermissionRequestFromRemote(permReqMsg, requesterID)
-		log.Printf("✓ Stored permission request %s to channel %s local list", remoteReq.RequestID, remoteReq.ChannelID)
+		log.Printf("Stored permission request %s to channel %s local list", remoteReq.RequestID, remoteReq.ChannelID)
 	} else {
 		log.Printf("⚠️ Cannot get channel %s to store permission request: %v", remoteReq.ChannelID, err)
 	}
