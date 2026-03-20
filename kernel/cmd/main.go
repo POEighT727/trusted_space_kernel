@@ -277,6 +277,9 @@ func main() {
 		multiKernelManager.SetMultiHopConfigManager(multiHopConfigManager)
 	}
 
+	// 初始化多跳审批回调，使发起方能在收到审批通知后自动重连
+	multiKernelManager.InitMultiHopApprovedCallback()
+
 	// 将跨内核数据转发回调注入到 ChannelManager（当检测到目标为 kernel:connector 时调用）
 	channelManager.SetForwardToKernel(func(kernelID string, packet *circulation.DataPacket, isFinal bool) error {
 		// 将 circulation.DataPacket 转为 pb.DataPacket

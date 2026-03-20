@@ -40,6 +40,14 @@ service KernelService {
 
   // 获取同步的权限请求
   rpc GetRemotePermissionRequests (GetRemotePermissionRequestsRequest) returns (GetRemotePermissionRequestsResponse);
+
+  // 多跳链路建立完成通知：当中间节点审批后并自动建立了下一跳连接时，
+  // 通过此 RPC 通知发起方"该 hop 已由我代为完成"，发起方收到后自动建立对应连接。
+  rpc HopEstablished (HopEstablishedRequest) returns (HopEstablishedResponse);
+
+  // 多跳链路审批通知：当目标内核审批了互联请求后，通过此 RPC 主动通知发起方，
+  // 发起方收到后自动重试建立到该内核的连接，无需手动重新执行 connect-kernel --route。
+  rpc NotifyMultiHopApproved (NotifyMultiHopApprovedRequest) returns (NotifyMultiHopApprovedResponse);
 }
 
 // ------------------------------------------------------------
@@ -212,4 +220,39 @@ message GetRemotePermissionRequestsResponse {
   bool success = 1;
   repeated PermissionChangeRequest requests = 2; // 权限变更请求列表
   string message = 3;
+}
+
+// ------------------------------------------------------------
+// 多跳链路建立完成通知相关消息定义
+// ------------------------------------------------------------
+message HopEstablishedRequest {
+  string source_kernel_id = 1;    // 通知发送方内核ID（中间节点）
+  string hop_id = 2;             // Hop 标识（如 "hop-2"）
+  string target_kernel_id = 3;   // 目标内核ID（本 hop 的终点）
+  string target_address = 4;      // 目标内核地址
+  int32 target_port = 5;         // 目标内核端口
+  string route_name = 6;         // 所属路由名称
+}
+
+message HopEstablishedResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ------------------------------------------------------------
+// 多跳链路审批通知相关消息定义
+// ------------------------------------------------------------
+message NotifyMultiHopApprovedRequest {
+  string approved_kernel_id = 1;    // 被批准的内核ID（发起方）
+  string approver_kernel_id = 2;    // 批准方内核ID
+  string request_id = 3;           // 原始互联请求ID
+  string route_name = 4;           // 所属路由名称（可选，用于路由追踪）
+  int32 hop_index = 5;             // hop 序号（从1开始）
+  int32 hop_total = 6;             // 总 hop 数
+  int64 approved_at = 7;           // 批准时间戳
+}
+
+message NotifyMultiHopApprovedResponse {
+  bool success = 1;
+  string message = 2;
 }

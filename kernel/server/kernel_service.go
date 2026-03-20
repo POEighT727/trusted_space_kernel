@@ -1149,3 +1149,33 @@ func (s *KernelServiceServer) GetRemotePermissionRequests(ctx context.Context, r
 		Message:  "remote permission requests retrieved successfully",
 	}, nil
 }
+
+// NotifyMultiHopApproved 多跳链路审批通知
+// 当目标内核审批了互联请求后，通过此 RPC 主动通知发起方，
+// 发起方收到后自动重试建立到该内核的连接，无需手动重新执行 connect-kernel --route。
+func (s *KernelServiceServer) NotifyMultiHopApproved(ctx context.Context, req *pb.NotifyMultiHopApprovedRequest) (*pb.NotifyMultiHopApprovedResponse, error) {
+	log.Printf("Received multi-hop approval notification: approved_kernel=%s, approver=%s, request_id=%s, hop=%d/%d",
+		req.ApprovedKernelId, req.ApproverKernelId, req.RequestId, req.HopIndex, req.HopTotal)
+
+	// 记录存证
+	if s.auditLog != nil {
+		s.auditLog.SubmitBasicEvidence(
+			req.ApproverKernelId,
+			evidence.EventTypeInterconnectApproved,
+			"",
+			req.RequestId,
+			evidence.DirectionIncoming,
+			req.ApprovedKernelId,
+		)
+	}
+
+	// 调用 MultiKernelManager 的多跳审批回调，触发自动重连
+	if s.multiKernelManager != nil && s.multiKernelManager.OnMultiHopApproved != nil {
+		s.multiKernelManager.OnMultiHopApproved(req)
+	}
+
+	return &pb.NotifyMultiHopApprovedResponse{
+		Success: true,
+		Message: "approval notification received",
+	}, nil
+}

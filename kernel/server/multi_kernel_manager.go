@@ -20,8 +20,6 @@ import (
 	"github.com/trusted-space/kernel/kernel/control"
 	"github.com/trusted-space/kernel/kernel/evidence"
 )
-
-// RemotePermissionRequest 表示同步过来的权限请求
 type RemotePermissionRequest struct {
 	RequestID     string
 	RequesterID   string
@@ -86,6 +84,16 @@ type MultiKernelManager struct {
 	// 同步的权限请求（key: channelID, value: 权限请求列表）
 	remotePermissionRequests     map[string][]*RemotePermissionRequest
 	remotePermissionRequestsMu sync.RWMutex
+
+	// ========== 多跳链路自动建立机制 ==========
+	// 待审批的 hop 追踪器（key: requestID, value: hopInfo）
+	pendingHops     map[string]*PendingHopInfo
+	pendingHopsMu   sync.RWMutex
+	// 当前活跃的多跳路由建立会话（key: routeName, value: 会话）
+	multiHopSessions     map[string]*MultiHopSession
+	multiHopSessionsMu   sync.RWMutex
+	// 多跳审批回调：收到审批通知后自动触发重连
+	OnMultiHopApproved func(notification *pb.NotifyMultiHopApprovedRequest)
 }
 
 // NewMultiKernelManager 创建多内核管理器
@@ -100,6 +108,8 @@ func NewMultiKernelManager(config *KernelConfig, registry *control.Registry,
 		pendingRequests: make(map[string]*PendingInterconnectRequest),
 		remotePermissionRequests: make(map[string][]*RemotePermissionRequest),
 		running:        true,
+		pendingHops:    make(map[string]*PendingHopInfo),
+		multiHopSessions: make(map[string]*MultiHopSession),
 	}
 
 	return manager, nil
@@ -130,6 +140,29 @@ type PendingInterconnectRequest struct {
 	CaCertificate     []byte
 	Timestamp         int64
 	Status            string // "pending", "approved", "rejected"
+}
+
+// PendingHopInfo 表示一个等待审批的 hop 信息（由发起方记录）
+type PendingHopInfo struct {
+	RouteName  string // 所属路由名称
+	HopIndex   int    // hop 序号（从1开始）
+	HopTotal   int    // 总 hop 数
+	ToKernelID string // 目标内核 ID
+	ToAddress  string // 目标地址
+	ToPort     int    // 目标端口
+	RequestID  string // 原始请求 ID
+	Approved   bool   // 是否已收到批准通知
+	ApprovedBy string // 批准方内核 ID
+}
+
+// MultiHopSession 表示一个活跃的多跳路由建立会话（由发起方持有）
+type MultiHopSession struct {
+	RouteName   string
+	RouteConfig *MultiHopConfigFile
+	Hops       map[int]*PendingHopInfo // key: hopIndex, value: hop info
+	AllDone    chan struct{}          // 所有 hop 都建立完成后关闭
+	Done       bool                   // 是否已完成
+	Mu         sync.Mutex
 }
 
 // AddPendingRequest 添加一个待审批请求
@@ -191,7 +224,8 @@ func (m *MultiKernelManager) ApprovePendingRequest(requestID string) error {
 
 	// 先通知请求方"已批准"，调用对方的 RegisterKernel 并带上 interconnect_approve 标记，
 	// 让请求方在自己的服务端直接把批准方加入已知内核列表（避免再次创建 pending）。
-	if err := m.notifyRequesterApprove(req); err != nil {
+	// 同时发送 NotifyMultiHopApproved RPC，让请求方知道该 hop 已批准并触发自动重连。
+	if err := m.notifyRequesterApproveAndMultiHopApproved(req, requestID); err != nil {
 		return fmt.Errorf("failed to notify requester %s of approve: %w", req.RequesterKernelID, err)
 	}
 
@@ -207,8 +241,13 @@ func (m *MultiKernelManager) ApprovePendingRequest(requestID string) error {
 }
 
 // notifyRequesterApprove 向请求方发送批准通知（使用 RegisterKernel + metadata interconnect_approve）
+// 这是一个内部辅助方法，仅发送 IsInterconnectApprove=true 的注册请求
 func (m *MultiKernelManager) notifyRequesterApprove(req *PendingInterconnectRequest) error {
-	// 建立到请求方的临时 TLS 连接（用于发送 approve 通知）
+	return m.sendInterconnectApprove(req)
+}
+
+// sendInterconnectApprove 建立到请求方的连接并发送 IsInterconnectApprove=true 的注册请求
+func (m *MultiKernelManager) sendInterconnectApprove(req *PendingInterconnectRequest) error {
 	cert, err := tls.LoadX509KeyPair(m.config.KernelCertPath, m.config.KernelKeyPath)
 	if err != nil {
 		return fmt.Errorf("failed to load certificates: %w", err)
@@ -223,10 +262,9 @@ func (m *MultiKernelManager) notifyRequesterApprove(req *PendingInterconnectRequ
 		return fmt.Errorf("failed to append own CA certificate")
 	}
 
-	// 如果我们已经有对端 CA，加入以便验证对端证书
 	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", req.RequesterKernelID)
-	if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
-		_ = caCertPool.AppendCertsFromPEM(peerCACert)
+	if peerCert, err := os.ReadFile(peerCACertPath); err == nil {
+		_ = caCertPool.AppendCertsFromPEM(peerCert)
 	}
 
 	tlsConfig := &tls.Config{
@@ -246,8 +284,6 @@ func (m *MultiKernelManager) notifyRequesterApprove(req *PendingInterconnectRequ
 	defer conn.Close()
 
 	client := pb.NewKernelServiceClient(conn)
-
-	// 读取自己的 CA 证书 以便对方保存
 	ownCACertData, _ := os.ReadFile(m.config.CACertPath)
 
 	approveReq := &pb.RegisterKernelRequest{
@@ -263,6 +299,73 @@ func (m *MultiKernelManager) notifyRequesterApprove(req *PendingInterconnectRequ
 	_, err = client.RegisterKernel(context.Background(), approveReq)
 	if err != nil {
 		return fmt.Errorf("approve RPC failed: %w", err)
+	}
+	return nil
+}
+
+// notifyRequesterApproveAndMultiHopApproved 发送互联批准 + 多跳审批通知
+// 批准方调用此方法通知发起方该 hop 已批准，发起方收到后将自动重连
+func (m *MultiKernelManager) notifyRequesterApproveAndMultiHopApproved(req *PendingInterconnectRequest, requestID string) error {
+	// 1. 先发送 IsInterconnectApprove=true 的注册请求
+	if err := m.sendInterconnectApprove(req); err != nil {
+		return fmt.Errorf("failed to send interconnect approve: %w", err)
+	}
+
+	// 2. 然后发送 NotifyMultiHopApproved RPC，携带 hop 元信息
+	cert, err := tls.LoadX509KeyPair(m.config.KernelCertPath, m.config.KernelKeyPath)
+	if err != nil {
+		return fmt.Errorf("failed to load certificates: %w", err)
+	}
+
+	caCertPool := x509.NewCertPool()
+	ownCACert, err := os.ReadFile(m.config.CACertPath)
+	if err != nil {
+		return fmt.Errorf("failed to read own CA certificate: %w", err)
+	}
+	if !caCertPool.AppendCertsFromPEM(ownCACert) {
+		return fmt.Errorf("failed to append own CA certificate")
+	}
+
+	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", req.RequesterKernelID)
+	if peerCert, err := os.ReadFile(peerCACertPath); err == nil {
+		_ = caCertPool.AppendCertsFromPEM(peerCert)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caCertPool,
+		MinVersion:   tls.VersionTLS13,
+	}
+	creds := credentials.NewTLS(tlsConfig)
+
+	targetAddr := fmt.Sprintf("%s:%d", req.Address, req.KernelPort)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.config.ConnectTimeout)*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, targetAddr, grpc.WithTransportCredentials(creds))
+	if err != nil {
+		log.Printf("⚠ Failed to dial for NotifyMultiHopApproved: %v (register already sent)", err)
+		return nil
+	}
+	defer conn.Close()
+
+	client := pb.NewKernelServiceClient(conn)
+
+	notifyReq := &pb.NotifyMultiHopApprovedRequest{
+		ApprovedKernelId: req.RequesterKernelID,
+		ApproverKernelId: m.config.KernelID,
+		RequestId:       requestID,
+		HopIndex:        0,
+		HopTotal:        0,
+		ApprovedAt:       time.Now().Unix(),
+	}
+
+	resp, err := client.NotifyMultiHopApproved(context.Background(), notifyReq)
+	if err != nil {
+		log.Printf("⚠ NotifyMultiHopApproved RPC failed: %v (register already sent)", err)
+		return nil
+	}
+	if !resp.Success {
+		log.Printf("⚠ NotifyMultiHopApproved returned failure: %s", resp.Message)
 	}
 	return nil
 }
@@ -1646,6 +1749,105 @@ func (m *MultiKernelManager) SyncPeerKernels(targetKernelID string) {
 	}
 }
 
+// ========== 多跳链路自动建立机制 ==========
+
+// OnMultiHopApprovedHandler 初始化多跳审批回调（由 main.go 在启动时调用）
+// 该回调会在 kernel_service.go 的 NotifyMultiHopApproved 中被调用
+func (m *MultiKernelManager) InitMultiHopApprovedCallback() {
+	m.OnMultiHopApproved = func(notification *pb.NotifyMultiHopApprovedRequest) {
+		log.Printf("🔔 MultiHopApproved callback triggered: request_id=%s, hop=%d/%d",
+			notification.RequestId, notification.HopIndex, notification.HopTotal)
+
+		// 找到对应的待审批 hop 并触发重连
+		m.pendingHopsMu.Lock()
+		hopInfo, exists := m.pendingHops[notification.RequestId]
+		if !exists {
+			log.Printf("⚠ No pending hop found for request_id=%s", notification.RequestId)
+			m.pendingHopsMu.Unlock()
+			return
+		}
+		// 标记为已批准
+		hopInfo.Approved = true
+		hopInfo.ApprovedBy = notification.ApproverKernelId
+		requestID := notification.RequestId
+		m.pendingHopsMu.Unlock()
+
+		// 立即尝试重连该 hop（不阻塞 RPC 响应）
+		go func() {
+			log.Printf("🔄 Retrying connection to %s after approval...", hopInfo.ToKernelID)
+			// 再次尝试连接，此时目标已批准，应该能成功
+			if err := m.connectToKernelInternal(hopInfo.ToKernelID, hopInfo.ToAddress, hopInfo.ToPort, false); err != nil {
+				if strings.Contains(err.Error(), "already connected") {
+					log.Printf("✅ Kernel %s already connected", hopInfo.ToKernelID)
+				} else {
+					log.Printf("⚠ Retry failed for %s: %v", hopInfo.ToKernelID, err)
+					// 清理该 hop 的待审批记录
+					m.pendingHopsMu.Lock()
+					delete(m.pendingHops, requestID)
+					m.pendingHopsMu.Unlock()
+					return
+				}
+			} else {
+				log.Printf("✅ Successfully reconnected to %s via multi-hop auto-establish", hopInfo.ToKernelID)
+			}
+
+			// 清理该 hop 的待审批记录
+			m.pendingHopsMu.Lock()
+			delete(m.pendingHops, requestID)
+			m.pendingHopsMu.Unlock()
+
+			// 检查该路由的所有 hop 是否都已建立完成
+			m.checkMultiHopSessionComplete(hopInfo.RouteName)
+		}()
+	}
+}
+
+// checkMultiHopSessionComplete 检查多跳会话是否全部完成
+func (m *MultiKernelManager) checkMultiHopSessionComplete(routeName string) {
+	m.multiHopSessionsMu.Lock()
+	defer m.multiHopSessionsMu.Unlock()
+
+	session, exists := m.multiHopSessions[routeName]
+	if !exists {
+		return
+	}
+
+	session.Mu.Lock()
+	defer session.Mu.Unlock()
+
+	// 检查所有 hop 是否都已连接
+	allDone := true
+	for _, hop := range session.Hops {
+		m.kernelsMu.RLock()
+		kernelInfo, connected := m.kernels[hop.ToKernelID]
+		connected = connected && kernelInfo != nil && kernelInfo.conn != nil && kernelInfo.Client != nil
+		m.kernelsMu.RUnlock()
+		if !connected {
+			allDone = false
+			break
+		}
+	}
+
+	if allDone {
+		session.Done = true
+		close(session.AllDone)
+		log.Printf("🎉 Multi-hop route %s fully established!", routeName)
+		// 清理会话
+		delete(m.multiHopSessions, routeName)
+	}
+}
+
+// RegisterPendingHop 注册一个待审批的 hop
+func (m *MultiKernelManager) RegisterPendingHop(session *MultiHopSession, hopIndex int, hopInfo *PendingHopInfo) {
+	m.pendingHopsMu.Lock()
+	m.pendingHops[hopInfo.RequestID] = hopInfo
+	m.pendingHopsMu.Unlock()
+
+	session.Mu.Lock()
+	session.Hops[hopIndex] = hopInfo
+	session.Mu.Unlock()
+}
+
 // Shutdown 关闭多内核管理器
 func (m *MultiKernelManager) Shutdown() {
 	m.running = false
@@ -1663,6 +1865,7 @@ func (m *MultiKernelManager) Shutdown() {
 
 // ConnectMultiHopRoute 根据多跳链路配置建立连接
 // 该方法会按照配置中的每一跳依次建立连接
+// 如果遇到待审批的 hop，会自动注册并等待审批通知，无需手动重试
 func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) error {
 	if config == nil {
 		return fmt.Errorf("config cannot be nil")
@@ -1675,13 +1878,22 @@ func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) er
 	log.Printf("=== Establishing multi-hop route: %s ===", config.RouteName)
 	log.Printf("Route: %s", config.Description)
 
-	// 存储所有待审批的请求
-	type pendingRequest struct {
-		hopNum    int
-		kernelID  string
-		requestID string
+	// 创建多跳会话，用于追踪所有待审批的 hop
+	session := &MultiHopSession{
+		RouteName:   config.RouteName,
+		RouteConfig: config,
+		Hops:        make(map[int]*PendingHopInfo),
+		AllDone:     make(chan struct{}),
+		Done:        false,
 	}
-	var pendingRequests []pendingRequest
+
+	// 注册会话
+	m.multiHopSessionsMu.Lock()
+	m.multiHopSessions[config.RouteName] = session
+	m.multiHopSessionsMu.Unlock()
+
+	// 用于统计有多少个待审批的 hop
+	pendingHopCount := 0
 
 	// 依次建立每一跳的连接
 	for i, hop := range config.Hops {
@@ -1713,12 +1925,19 @@ func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) er
 				requestID := strings.TrimPrefix(err.Error(), "interconnect_pending:")
 				log.Printf("  ⚠ Interconnect pending for %s (request ID: %s)", hop.ToKernel, requestID)
 
-				// 收集待审批请求，不立即返回
-				pendingRequests = append(pendingRequests, pendingRequest{
-					hopNum:    hopNum,
-					kernelID:  hop.ToKernel,
-					requestID: requestID,
-				})
+				// 注册待审批的 hop 到会话中，以便收到批准通知后自动重连
+				hopInfo := &PendingHopInfo{
+					RouteName:  config.RouteName,
+					HopIndex:   hopNum,
+					HopTotal:   len(config.Hops),
+					ToKernelID: hop.ToKernel,
+					ToAddress:  hop.ToAddress,
+					ToPort:     hop.ToPort,
+					RequestID:  requestID,
+					Approved:   false,
+				}
+				m.RegisterPendingHop(session, hopNum, hopInfo)
+				pendingHopCount++
 				continue
 			}
 
@@ -1729,22 +1948,38 @@ func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) er
 		log.Printf("  ✓ Successfully connected to %s", hop.ToKernel)
 	}
 
-	// 如果有待审批请求，返回所有待审批信息
-	if len(pendingRequests) > 0 {
-		// 构建详细的待审批信息
-		msg := "All pending approval requests:\n"
-		for _, pr := range pendingRequests {
-			msg += fmt.Sprintf("  - Hop %d -> %s: %s\n", pr.hopNum, pr.kernelID, pr.requestID)
-		}
-		msg += "\nPlease approve on each target kernel:\n"
-		for _, pr := range pendingRequests {
-			msg += fmt.Sprintf("  Kernel %s: approve-request %s\n", pr.kernelID, pr.requestID)
-		}
-		return fmt.Errorf("multi-hop pending: %d request(s) need approval", len(pendingRequests))
+	// 如果有待审批请求，不再返回错误，而是启动后台等待
+	if pendingHopCount > 0 {
+		log.Printf("📋 %d hop(s) pending approval. Waiting for approvals from remote kernels...", pendingHopCount)
+		log.Printf("   Please run 'approve-request <request_id>' on each target kernel.")
+		// 启动后台 goroutine 等待所有审批
+		go m.waitForMultiHopApprovals(session, pendingHopCount)
+		// 立即返回，让用户可以继续其他操作
+		return nil
 	}
 
 	log.Printf("=== Multi-hop route %s established ===", config.RouteName)
 	return nil
+}
+
+// waitForMultiHopApprovals 等待所有待审批的 hop 完成批准
+// 当所有 hop 都建立完成后，记录日志并清理会话
+func (m *MultiKernelManager) waitForMultiHopApprovals(session *MultiHopSession, expectedCount int) {
+	// 等待会话完成（所有 hop 都建立）或超时
+	timeout := time.After(120 * time.Second) // 2 分钟超时
+
+	select {
+	case <-session.AllDone:
+		log.Printf("🎉 All %d hops approved for route %s, connections auto-established!",
+			expectedCount, session.RouteName)
+	case <-timeout:
+		log.Printf("⏰ Multi-hop route %s timed out after 2 minutes. %d hop(s) still pending.",
+			session.RouteName, expectedCount)
+		// 清理会话
+		m.multiHopSessionsMu.Lock()
+		delete(m.multiHopSessions, session.RouteName)
+		m.multiHopSessionsMu.Unlock()
+	}
 }
 
 // ConnectAllEnabledRoutes 连接所有已启用的多跳路由
