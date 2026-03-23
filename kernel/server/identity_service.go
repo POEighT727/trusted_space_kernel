@@ -104,7 +104,6 @@ func (s *IdentityServiceServer) Handshake(ctx context.Context, req *pb.Handshake
 
 	// 检查是否是重启恢复，如果是则发送频道恢复通知
 	if s.channelManager.IsConnectorRestarting(req.ConnectorId) {
-		log.Printf("🔄 Connector %s detected as restarting, sending channel recovery notifications", req.ConnectorId)
 		s.sendChannelRecoveryNotifications(req.ConnectorId)
 	}
 
@@ -165,10 +164,9 @@ func (s *IdentityServiceServer) sendChannelRecoveryNotifications(connectorID str
 
 					// 发送通知
 					if err := s.notificationManager.Notify(connectorID, notification); err != nil {
-						log.Printf("⚠️ Recovery notification attempt %d for channel %s to %s failed: %v",
+						log.Printf("[WARN] Recovery notification attempt %d for channel %s to %s failed: %v",
 							i+1, channel.ChannelID, connectorID, err)
 					} else {
-						log.Printf("✓ Recovery notification sent for channel %s to %s", channel.ChannelID, connectorID)
 						successCount++
 					}
 				}
@@ -176,12 +174,11 @@ func (s *IdentityServiceServer) sendChannelRecoveryNotifications(connectorID str
 
 			// 如果所有通知都发送成功，退出重试循环
 			if successCount == totalCount && totalCount > 0 {
-				log.Printf("✅ All recovery notifications sent successfully to %s", connectorID)
 				return
 			}
 		}
 
-		log.Printf("⚠️ Failed to send recovery notifications to %s after %d attempts", connectorID, maxRetries)
+		log.Printf("[WARN] Failed to send recovery notifications to %s after %d attempts", connectorID, maxRetries)
 	}()
 }
 

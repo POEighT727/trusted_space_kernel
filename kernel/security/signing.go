@@ -157,7 +157,7 @@ func ExtractPublicKeyFromCert(certPath string) (*rsa.PublicKey, error) {
 func VerifyEvidenceSignature(isCrossKernel bool, connectorID, eventType, channelID, dataHash, signature string, timestamp int64) error {
 	if isCrossKernel {
 		// 跨内核场景：源内核已通过mTLS验证连接器身份，信任源内核的验证结果
-		log.Printf("⚠️ Cross-kernel evidence from connector %s - skipping signature verification (trusted via mTLS)", connectorID)
+		log.Printf("[WARN] Cross-kernel evidence from connector %s - skipping signature verification (trusted via mTLS)", connectorID)
 		return nil
 	}
 
@@ -182,7 +182,7 @@ func VerifyEvidenceSignature(isCrossKernel bool, connectorID, eventType, channel
 	publicKey, err := ExtractPublicKeyFromCert(certPath)
 	if err != nil {
 		// 既没有CA证书也没有连接器证书时，记录警告但不阻断业务
-		log.Printf("⚠️ Cannot verify evidence signature for connector %s: CA cert error: %v, connector cert error: %v", connectorID, caErr, err)
+		log.Printf("[WARN] Cannot verify evidence signature for connector %s: CA cert error: %v, connector cert error: %v", connectorID, caErr, err)
 		return nil
 	}
 

@@ -212,7 +212,6 @@ func (m *MultiKernelManager) ApprovePendingRequest(requestID string) error {
 	_, alreadyKnown := m.kernels[req.RequesterKernelID]
 	m.kernelsMu.RUnlock()
 	if alreadyKnown {
-		log.Printf("Requester %s already known locally, skipping approve notification", req.RequesterKernelID)
 		// 确保已有持久连接；如果没有则尝试建立
 		if err := m.connectToKernelInternal(req.RequesterKernelID, req.Address, req.KernelPort, false); err != nil {
 			return fmt.Errorf("failed to ensure connection to requester kernel %s: %w", req.RequesterKernelID, err)
@@ -343,7 +342,7 @@ func (m *MultiKernelManager) notifyRequesterApproveAndMultiHopApproved(req *Pend
 	defer cancel()
 	conn, err := grpc.DialContext(ctx, targetAddr, grpc.WithTransportCredentials(creds))
 	if err != nil {
-		log.Printf("⚠ Failed to dial for NotifyMultiHopApproved: %v (register already sent)", err)
+		log.Printf("[WARN] Failed to dial for NotifyMultiHopApproved: %v (register already sent)", err)
 		return nil
 	}
 	defer conn.Close()
@@ -361,11 +360,11 @@ func (m *MultiKernelManager) notifyRequesterApproveAndMultiHopApproved(req *Pend
 
 	resp, err := client.NotifyMultiHopApproved(context.Background(), notifyReq)
 	if err != nil {
-		log.Printf("⚠ NotifyMultiHopApproved RPC failed: %v (register already sent)", err)
+		log.Printf("[WARN] NotifyMultiHopApproved RPC failed: %v (register already sent)", err)
 		return nil
 	}
 	if !resp.Success {
-		log.Printf("⚠ NotifyMultiHopApproved returned failure: %s", resp.Message)
+		log.Printf("[WARN] NotifyMultiHopApproved returned failure: %s", resp.Message)
 	}
 	return nil
 }
@@ -404,7 +403,6 @@ func (m *MultiKernelManager) BroadcastKnownKernels(targetKernelID string) error 
 	m.kernelsMu.RUnlock()
 
 	if len(knownKernels) == 0 {
-		log.Printf("No known kernels to broadcast to %s", targetKernelID)
 		return nil
 	}
 
@@ -420,13 +418,11 @@ func (m *MultiKernelManager) BroadcastKnownKernels(targetKernelID string) error 
 		return fmt.Errorf("failed to broadcast known kernels to %s: %w", targetKernelID, err)
 	}
 
-	log.Printf("✓ Broadcasted %d known kernels to %s, peer added %d new kernels",
+	log.Printf("Broadcasting %d known kernels to %s, peer added %d new kernels",
 		len(knownKernels), targetKernelID, len(resp.NewlyKnownKernels))
 
 	// 如果对方返回了新内核，尝试连接到它们
 	for _, newKernel := range resp.NewlyKnownKernels {
-		log.Printf("  → New kernel discovered from %s: %s at %s:%d",
-			targetKernelID, newKernel.KernelId, newKernel.Address, newKernel.Port)
 
 		// 检查是否已经在本地列表中
 		m.kernelsMu.Lock()
@@ -440,10 +436,8 @@ func (m *MultiKernelManager) BroadcastKnownKernels(targetKernelID string) error 
 				mainPort := int(newKernel.Port)
 				kernelPort := mainPort + 2
 				if err := m.connectToKernelInternal(newKernel.KernelId, newKernel.Address, kernelPort, false); err != nil {
-					log.Printf("⚠ Failed to reconnect to kernel %s: %v", newKernel.KernelId, err)
+					log.Printf("[WARN] Failed to reconnect to kernel %s: %v", newKernel.KernelId, err)
 				}
-			} else {
-				log.Printf("  ℹ️ Kernel %s already known locally", newKernel.KernelId)
 			}
 			continue
 		}
@@ -454,9 +448,8 @@ func (m *MultiKernelManager) BroadcastKnownKernels(targetKernelID string) error 
 		if err := m.connectToKernelInternal(newKernel.KernelId, newKernel.Address, kernelPort, false); err != nil {
 			// 如果是 already connected 错误，忽略
 			if strings.Contains(err.Error(), "already connected") {
-				log.Printf("  ℹ️ Kernel %s already connected", newKernel.KernelId)
 			} else {
-				log.Printf("⚠ Failed to connect to new kernel %s: %v", newKernel.KernelId, err)
+				log.Printf("[WARN] Failed to connect to new kernel %s: %v", newKernel.KernelId, err)
 			}
 		}
 	}
@@ -492,9 +485,6 @@ func (m *MultiKernelManager) StartKernelServer() error {
 		peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
 		if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
 			if !caCertPool.AppendCertsFromPEM(peerCACert) {
-				log.Printf("Warning: failed to append peer CA certificate for %s", kernelID)
-			} else {
-				log.Printf("Loaded peer CA certificate for %s", kernelID)
 			}
 		}
 	}
@@ -517,7 +507,7 @@ func (m *MultiKernelManager) StartKernelServer() error {
 		return fmt.Errorf("failed to listen on kernel port: %w", err)
 	}
 
-	log.Printf("🔗 Kernel-to-kernel server started on %s", address)
+	log.Printf("[INFO] Kernel-to-kernel server started on %s", address)
 
 	if err := server.Serve(listener); err != nil {
 		return fmt.Errorf("failed to serve kernel server: %w", err)
@@ -561,12 +551,9 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 	// 检查是否已经有对等内核的CA证书，如果有也添加
 	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
 	if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
-			if !caCertPool.AppendCertsFromPEM(peerCACert) {
-				log.Printf("Warning: failed to append peer CA certificate for %s", kernelID)
-			} else {
-				// suppressed detailed peer CA log
-			}
+		if !caCertPool.AppendCertsFromPEM(peerCACert) {
 		}
+	}
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -631,11 +618,8 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 		// 保存对方的CA证书（如果提供）
 		if len(resp.PeerCaCertificate) > 0 {
 			peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
-			if err := os.WriteFile(peerCACertPath, resp.PeerCaCertificate, 0644); err != nil {
-				log.Printf("Warning: failed to save peer CA certificate for %s: %v", kernelID, err)
-			} else {
-				// suppressed detailed CA saved log
-			}
+		if err := os.WriteFile(peerCACertPath, resp.PeerCaCertificate, 0644); err != nil {
+		}
 		}
 
 		// 从 message 中提取 request id 并返回特定错误，供调用处区分 pending 状态
@@ -648,7 +632,6 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 			}
 		}
 
-		log.Printf("Interconnect request pending for kernel %s: %s", kernelID, resp.Message)
 		// Close connection (no final registration)
 		conn.Close()
 		if requestID != "" {
@@ -665,9 +648,7 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 			if len(resp.PeerCaCertificate) > 0 {
 				peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
 				if err := os.WriteFile(peerCACertPath, resp.PeerCaCertificate, 0644); err != nil {
-					log.Printf("Warning: failed to save peer CA certificate for %s: %v", kernelID, err)
 				} else {
-					log.Printf("✓ Saved peer CA certificate for %s (from already registered response)", kernelID)
 				}
 			}
 		} else {
@@ -678,11 +659,8 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 		// 保存对方的CA证书
 		if len(resp.PeerCaCertificate) > 0 {
 			peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
-			if err := os.WriteFile(peerCACertPath, resp.PeerCaCertificate, 0644); err != nil {
-				log.Printf("Warning: failed to save peer CA certificate for %s: %v", kernelID, err)
-			} else {
-				// suppressed detailed CA saved log
-			}
+		if err := os.WriteFile(peerCACertPath, resp.PeerCaCertificate, 0644); err != nil {
+		}
 		}
 	}
 
@@ -705,7 +683,7 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 	// 启动心跳goroutine
 	go m.kernelHeartbeat(kernelID)
 
-	log.Printf("✅ Connected to kernel %s at %s:%d", kernelID, address, port)
+	log.Printf("[OK] Connected to kernel %s at %s:%d", kernelID, address, port)
 
 	// 广播本内核已知的其他内核给新连接的内核
 	go m.BroadcastKnownKernels(kernelID)
@@ -756,7 +734,6 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int,
 		if err := m.ConnectMultiHopRoute(routeCfg); err != nil {
 			return fmt.Errorf("failed to connect multi-hop route: %w", err)
 		}
-		log.Printf("✓ Connected using multi-hop route: %s", routeName[0])
 	}
 
 	// 创建TLS配置
@@ -781,9 +758,6 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int,
 	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
 	if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
 		if !caCertPool.AppendCertsFromPEM(peerCACert) {
-			log.Printf("Warning: failed to append peer CA certificate for %s", kernelID)
-		} else {
-			log.Printf("Using existing peer CA certificate for %s", kernelID)
 		}
 	}
 
@@ -862,9 +836,7 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int,
 		if len(resp.PeerCaCertificate) > 0 {
 			peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
 			if err := os.WriteFile(peerCACertPath, resp.PeerCaCertificate, 0644); err != nil {
-				log.Printf("Warning: failed to save peer CA certificate for %s: %v", kernelID, err)
 			} else {
-				log.Printf("Saved peer CA certificate for kernel %s (pending approval)", kernelID)
 			}
 		}
 
@@ -878,7 +850,6 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int,
 			}
 		}
 
-		log.Printf("Interconnect request pending for kernel %s: %s", kernelID, resp.Message)
 		// Close connection (no final registration)
 		conn.Close()
 		if requestID != "" {
@@ -896,9 +867,7 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int,
 	if len(resp.PeerCaCertificate) > 0 {
 		peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
 		if err := os.WriteFile(peerCACertPath, resp.PeerCaCertificate, 0644); err != nil {
-			log.Printf("Warning: failed to save peer CA certificate for %s: %v", kernelID, err)
 		} else {
-			log.Printf("Saved peer CA certificate for kernel %s", kernelID)
 		}
 	}
 
@@ -921,7 +890,7 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int,
 	// 启动心跳goroutine
 	go m.kernelHeartbeat(kernelID)
 
-	log.Printf("✅ Connected to kernel %s at %s:%d", kernelID, address, port)
+	log.Printf("[OK] Connected to kernel %s at %s:%d", kernelID, address, port)
 	return nil
 }
 
@@ -956,7 +925,6 @@ func (m *MultiKernelManager) ConnectToKernelViaRoute(routeName string) error {
 		return fmt.Errorf("failed to connect multi-hop route: %w", err)
 	}
 
-	log.Printf("✅ Successfully connected to %s via route %s", targetKernelID, routeName)
 	return nil
 }
 
@@ -973,7 +941,7 @@ func (m *MultiKernelManager) DisconnectFromKernel(kernelID string) error {
 	kernelInfo.conn.Close()
 	delete(m.kernels, kernelID)
 
-	log.Printf("✅ Disconnected from kernel %s", kernelID)
+	log.Printf("[OK] Disconnected from kernel %s", kernelID)
 	return nil
 }
 
@@ -990,12 +958,11 @@ func (m *MultiKernelManager) EnsureKernelConnected(kernelID string) error {
 
 	// 如果已经有有效的连接，直接返回
 	if kernelInfo.Client != nil && kernelInfo.conn != nil {
-		log.Printf("✓ Kernel %s already connected", kernelID)
 		return nil
 	}
 
 	// 需要建立连接
-	log.Printf("⚠️ Kernel %s has no active connection (Client=%v, conn=%v), attempting to connect...",
+	log.Printf("[WARN]️ Kernel %s has no active connection (Client=%v, conn=%v), attempting to connect...",
 		kernelID, kernelInfo.Client != nil, kernelInfo.conn != nil)
 
 	// 检查是否有必要的地址信息
@@ -1031,9 +998,6 @@ func (m *MultiKernelManager) EnsureKernelConnected(kernelID string) error {
 	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
 	if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
 		if !caCertPool.AppendCertsFromPEM(peerCACert) {
-			log.Printf("Warning: failed to append peer CA certificate for %s", kernelID)
-		} else {
-			log.Printf("Using existing peer CA certificate for %s", kernelID)
 		}
 	} else {
 		log.Printf("No peer CA certificate for %s, will attempt insecure connection", kernelID)
@@ -1066,7 +1030,7 @@ func (m *MultiKernelManager) EnsureKernelConnected(kernelID string) error {
 	kernelInfo.Status = "active"
 	kernelInfo.LastHeartbeat = time.Now().Unix()
 
-	log.Printf("✅ Successfully connected to kernel %s at %s", kernelID, targetAddr)
+	log.Printf("[OK] Successfully connected to kernel %s at %s", kernelID, targetAddr)
 	return nil
 }
 
@@ -1144,9 +1108,7 @@ func (m *MultiKernelManager) connectToKernelIdentityService(kernel *KernelInfo) 
 	peerCACertExists := false
 	if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
 		if !caCertPool.AppendCertsFromPEM(peerCACert) {
-			log.Printf("Warning: failed to append peer CA certificate for %s", kernel.KernelID)
 		} else {
-			log.Printf("Using peer CA certificate for kernel %s", kernel.KernelID)
 			peerCACertExists = true
 		}
 	} else {
@@ -1193,23 +1155,20 @@ func (m *MultiKernelManager) connectToKernelIdentityService(kernel *KernelInfo) 
 
 // createKernelClient 为已注册的内核创建持久客户端连接（用于 ForwardData 等调用）
 func (m *MultiKernelManager) createKernelClient(kernelID, address string, port int) error {
-	log.Printf("🔧 createKernelClient called: kernelID=%s, address=%s, port=%d", kernelID, address, port)
 	
 	m.kernelsMu.Lock()
 	defer m.kernelsMu.Unlock()
 
 	// 检查是否已存在连接
 	if existing, exists := m.kernels[kernelID]; exists && existing.Client != nil {
-		log.Printf("ℹ️ Client already exists for kernel %s (conn=%v), skipping", kernelID, existing.conn)
 		return nil
 	}
 
-	log.Printf("🔧 Creating TLS config for kernel %s...", kernelID)
 	
 	// 创建TLS配置
 	cert, err := tls.LoadX509KeyPair(m.config.KernelCertPath, m.config.KernelKeyPath)
 	if err != nil {
-		log.Printf("❌ Failed to load client certificates for %s: %v", kernelID, err)
+		log.Printf("[ERROR] Failed to load client certificates for %s: %v", kernelID, err)
 		return fmt.Errorf("failed to load client certificates: %w", err)
 	}
 
@@ -1218,23 +1177,20 @@ func (m *MultiKernelManager) createKernelClient(kernelID, address string, port i
 	// 添加自己的CA证书
 	ownCACert, err := os.ReadFile(m.config.CACertPath)
 	if err != nil {
-		log.Printf("❌ Failed to read own CA certificate for %s: %v", kernelID, err)
+		log.Printf("[ERROR] Failed to read own CA certificate for %s: %v", kernelID, err)
 		return fmt.Errorf("failed to read own CA certificate: %w", err)
 	}
 	if !caCertPool.AppendCertsFromPEM(ownCACert) {
-		log.Printf("❌ Failed to append own CA certificate for %s", kernelID)
 		return fmt.Errorf("failed to append own CA certificate")
 	}
 
 	// 添加对等内核的CA证书
 	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
-	if peerCACert, err := os.ReadFile(peerCACertPath); err != nil {
-		log.Printf("⚠️ Peer CA certificate not found for %s: %v (trying without it)", kernelID, err)
+	if peerCert, err := os.ReadFile(peerCACertPath); err != nil {
+		log.Printf("[WARN] Peer CA certificate not found for %s: %v (trying without it)", kernelID, err)
 	} else {
-		if !caCertPool.AppendCertsFromPEM(peerCACert) {
-			log.Printf("⚠️ Failed to append peer CA certificate for %s", kernelID)
-		} else {
-			log.Printf("✓ Using peer CA certificate for kernel %s", kernelID)
+		if !caCertPool.AppendCertsFromPEM(peerCert) {
+			log.Printf("[WARN] Failed to append peer CA certificate for %s", kernelID)
 		}
 	}
 
@@ -1249,17 +1205,15 @@ func (m *MultiKernelManager) createKernelClient(kernelID, address string, port i
 
 	// 连接到目标内核的主服务器端口
 	targetAddr := fmt.Sprintf("%s:%d", address, port)
-	log.Printf("🔗 Connecting to kernel %s at %s...", kernelID, targetAddr)
 	
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.config.ConnectTimeout)*time.Second)
 	defer cancel()
 
 	conn, err := grpc.DialContext(ctx, targetAddr, grpc.WithTransportCredentials(creds))
 	if err != nil {
-		log.Printf("❌ Failed to connect to kernel %s: %v", kernelID, err)
+		log.Printf("[ERROR] Failed to connect to kernel %s: %v", kernelID, err)
 		return fmt.Errorf("failed to connect to kernel %s: %w", kernelID, err)
 	}
-	log.Printf("✓ Connected to kernel %s, creating gRPC client...", kernelID)
 
 	client := pb.NewKernelServiceClient(conn)
 
@@ -1268,7 +1222,6 @@ func (m *MultiKernelManager) createKernelClient(kernelID, address string, port i
 		existing.conn = conn
 		existing.Client = client
 		existing.LastHeartbeat = time.Now().Unix()
-		log.Printf("✓ Updated client connection for kernel %s", kernelID)
 	} else {
 		// 如果内核信息不存在，创建一个新的
 		m.kernels[kernelID] = &KernelInfo{
@@ -1281,7 +1234,6 @@ func (m *MultiKernelManager) createKernelClient(kernelID, address string, port i
 			conn:          conn,
 			Client:        client,
 		}
-		log.Printf("✓ Created new client connection for kernel %s", kernelID)
 	}
 
 	return nil
@@ -1314,7 +1266,6 @@ func (m *MultiKernelManager) CollectAllConnectors() ([]*pb.ConnectorInfo, error)
 	m.kernelsMu.RUnlock()
 
 	for _, kernel := range kernels {
-		log.Printf("Attempting to collect connectors from kernel %s at %s:%d", kernel.KernelID, kernel.Address, kernel.MainPort)
 
 		// 为每个内核创建到其主服务器端口的新连接（用于访问IdentityService）
 		identityConn, err := m.connectToKernelIdentityService(kernel)
@@ -1323,7 +1274,6 @@ func (m *MultiKernelManager) CollectAllConnectors() ([]*pb.ConnectorInfo, error)
 			continue
 		}
 
-		log.Printf("Successfully connected to identity service of kernel %s", kernel.KernelID)
 
 		// 使用Identity服务发现连接器
 		client := pb.NewIdentityServiceClient(identityConn)
@@ -1339,7 +1289,6 @@ func (m *MultiKernelManager) CollectAllConnectors() ([]*pb.ConnectorInfo, error)
 			continue
 		}
 
-		log.Printf("Successfully discovered %d connectors from kernel %s", len(resp.Connectors), kernel.KernelID)
 
 		// 添加远程连接器信息
 		for _, remoteConn := range resp.Connectors {
@@ -1422,7 +1371,7 @@ func (m *MultiKernelManager) ForwardData(targetKernelID string, dataPacket *pb.D
 
 	// If client or conn is nil, attempt a best-effort reconnect to avoid panic.
 	if kernelInfo.Client == nil || kernelInfo.conn == nil {
-		log.Printf("⚠ Kernel %s client/conn nil, attempting reconnect", targetKernelID)
+		log.Printf("[WARN] Kernel %s client/conn nil, attempting reconnect", targetKernelID)
 
 		// Close and remove any stale entry before reconnecting.
 		m.kernelsMu.Lock()
@@ -1458,7 +1407,7 @@ func (m *MultiKernelManager) ForwardData(targetKernelID string, dataPacket *pb.D
 
 	_, err := kernelInfo.Client.ForwardData(context.Background(), req)
 	if err != nil {
-		log.Printf("⚠ ForwardData RPC to %s failed: %v", targetKernelID, err)
+		log.Printf("[WARN] ForwardData RPC to %s failed: %v", targetKernelID, err)
 	}
 	return err
 }
@@ -1519,7 +1468,7 @@ func (m *MultiKernelManager) sendHeartbeat(kernelID string) {
 // SyncKnownKernelsToKernel 向指定内核发送本内核已知的内核列表
 // 这用于当本内核了解到新内核后，主动让对方了解本内核已知的其他内核
 func (m *MultiKernelManager) SyncKnownKernelsToKernel(kernelID string, address string, port int) {
-	log.Printf("🔄 Syncing known kernels to %s at %s:%d", kernelID, address, port)
+	log.Printf("[INFO] Syncing known kernels to %s at %s:%d", kernelID, address, port)
 
 	// 构建已知内核列表
 	m.kernelsMu.RLock()
@@ -1557,18 +1506,15 @@ func (m *MultiKernelManager) SyncKnownKernelsToKernel(kernelID string, address s
 	// 创建到目标内核的临时连接
 	cert, err := tls.LoadX509KeyPair(m.config.KernelCertPath, m.config.KernelKeyPath)
 	if err != nil {
-		log.Printf("⚠ Failed to load certificates for sync: %v", err)
 		return
 	}
 
 	caCertPool := x509.NewCertPool()
 	ownCACert, err := os.ReadFile(m.config.CACertPath)
 	if err != nil {
-		log.Printf("⚠ Failed to read CA certificate: %v", err)
 		return
 	}
 	if !caCertPool.AppendCertsFromPEM(ownCACert) {
-		log.Printf("⚠ Failed to append own CA certificate")
 		return
 	}
 
@@ -1591,7 +1537,7 @@ func (m *MultiKernelManager) SyncKnownKernelsToKernel(kernelID string, address s
 
 	conn, err := grpc.DialContext(ctx, targetAddr, grpc.WithTransportCredentials(creds))
 	if err != nil {
-		log.Printf("⚠ Failed to connect to %s for sync: %v", kernelID, err)
+		log.Printf("[WARN] Failed to connect to %s for sync: %v", kernelID, err)
 		return
 	}
 	defer conn.Close()
@@ -1606,12 +1552,9 @@ func (m *MultiKernelManager) SyncKnownKernelsToKernel(kernelID string, address s
 
 	resp, err := client.SyncKnownKernels(ctx, req)
 	if err != nil {
-		log.Printf("⚠ Failed to sync to %s: %v", kernelID, err)
+		log.Printf("[WARN] Failed to sync to %s: %v", kernelID, err)
 		return
 	}
-
-	log.Printf("✓ Synced %d kernels to %s, peer added %d new kernels",
-		len(knownKernels), kernelID, len(resp.NewlyKnownKernels))
 
 	// 如果对方返回了新内核，尝试连接到它们
 	for _, newKernel := range resp.NewlyKnownKernels {
@@ -1637,7 +1580,7 @@ func (m *MultiKernelManager) SyncKnownKernelsToKernel(kernelID string, address s
 		kernelPort := mainPort + 2
 		if err := m.connectToKernelInternal(newKernel.KernelId, newKernel.Address, kernelPort, false); err != nil {
 			if !strings.Contains(err.Error(), "already connected") {
-				log.Printf("⚠ Failed to connect to kernel %s: %v", newKernel.KernelId, err)
+				log.Printf("[WARN] Failed to connect to kernel %s: %v", newKernel.KernelId, err)
 			}
 		}
 	}
@@ -1666,7 +1609,7 @@ func (m *MultiKernelManager) SyncPeerKernels(targetKernelID string) {
 
 		if err := m.connectToKernelInternal(targetKernelID, kernelInfo.Address, kernelPort, false); err != nil {
 			if !strings.Contains(err.Error(), "already connected") {
-				log.Printf("⚠ Failed to connect to %s for sync: %v", targetKernelID, err)
+				log.Printf("[WARN] Failed to connect to %s for sync: %v", targetKernelID, err)
 			}
 		}
 		// 连接后重新获取信息
@@ -1717,12 +1660,9 @@ func (m *MultiKernelManager) SyncPeerKernels(targetKernelID string) {
 
 	resp, err := kernelInfo.Client.SyncKnownKernels(ctx, req)
 	if err != nil {
-		log.Printf("⚠ Failed to sync peer kernels to %s: %v", targetKernelID, err)
+		log.Printf("[WARN] Failed to sync peer kernels to %s: %v", targetKernelID, err)
 		return
 	}
-
-	log.Printf("✓ Synced %d peer kernels to %s, peer added %d new kernels",
-		len(kernelsToSync), targetKernelID, len(resp.NewlyKnownKernels))
 
 	// 如果对方返回了新内核，尝试连接到它们
 	for _, newKernel := range resp.NewlyKnownKernels {
@@ -1743,7 +1683,7 @@ func (m *MultiKernelManager) SyncPeerKernels(targetKernelID string) {
 		kernelPort := mainPort + 2
 		if err := m.connectToKernelInternal(newKernel.KernelId, newKernel.Address, kernelPort, false); err != nil {
 			if !strings.Contains(err.Error(), "already connected") {
-				log.Printf("⚠ Failed to connect to kernel %s: %v", newKernel.KernelId, err)
+				log.Printf("[WARN] Failed to connect to kernel %s: %v", newKernel.KernelId, err)
 			}
 		}
 	}
@@ -1755,14 +1695,11 @@ func (m *MultiKernelManager) SyncPeerKernels(targetKernelID string) {
 // 该回调会在 kernel_service.go 的 NotifyMultiHopApproved 中被调用
 func (m *MultiKernelManager) InitMultiHopApprovedCallback() {
 	m.OnMultiHopApproved = func(notification *pb.NotifyMultiHopApprovedRequest) {
-		log.Printf("🔔 MultiHopApproved callback triggered: request_id=%s, hop=%d/%d",
-			notification.RequestId, notification.HopIndex, notification.HopTotal)
-
 		// 找到对应的待审批 hop 并触发重连
 		m.pendingHopsMu.Lock()
 		hopInfo, exists := m.pendingHops[notification.RequestId]
 		if !exists {
-			log.Printf("⚠ No pending hop found for request_id=%s", notification.RequestId)
+			log.Printf("[WARN] No pending hop found for request_id=%s", notification.RequestId)
 			m.pendingHopsMu.Unlock()
 			return
 		}
@@ -1774,13 +1711,11 @@ func (m *MultiKernelManager) InitMultiHopApprovedCallback() {
 
 		// 立即尝试重连该 hop（不阻塞 RPC 响应）
 		go func() {
-			log.Printf("🔄 Retrying connection to %s after approval...", hopInfo.ToKernelID)
 			// 再次尝试连接，此时目标已批准，应该能成功
 			if err := m.connectToKernelInternal(hopInfo.ToKernelID, hopInfo.ToAddress, hopInfo.ToPort, false); err != nil {
 				if strings.Contains(err.Error(), "already connected") {
-					log.Printf("✅ Kernel %s already connected", hopInfo.ToKernelID)
 				} else {
-					log.Printf("⚠ Retry failed for %s: %v", hopInfo.ToKernelID, err)
+					log.Printf("[WARN] Retry failed for %s: %v", hopInfo.ToKernelID, err)
 					// 清理该 hop 的待审批记录
 					m.pendingHopsMu.Lock()
 					delete(m.pendingHops, requestID)
@@ -1788,7 +1723,6 @@ func (m *MultiKernelManager) InitMultiHopApprovedCallback() {
 					return
 				}
 			} else {
-				log.Printf("✅ Successfully reconnected to %s via multi-hop auto-establish", hopInfo.ToKernelID)
 			}
 
 			// 清理该 hop 的待审批记录
@@ -1831,7 +1765,6 @@ func (m *MultiKernelManager) checkMultiHopSessionComplete(routeName string) {
 	if allDone {
 		session.Done = true
 		close(session.AllDone)
-		log.Printf("🎉 Multi-hop route %s fully established!", routeName)
 		// 清理会话
 		delete(m.multiHopSessions, routeName)
 	}
@@ -1907,7 +1840,6 @@ func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) er
 		m.kernelsMu.RUnlock()
 
 		if alreadyConnected && existingKernel.conn != nil && existingKernel.Client != nil {
-			log.Printf("  ✓ Already connected to %s, skipping", hop.ToKernel)
 			continue
 		}
 
@@ -1916,14 +1848,12 @@ func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) er
 		if err := m.connectToKernelInternal(hop.ToKernel, hop.ToAddress, hop.ToPort, true); err != nil {
 			// 检查是否是"已连接"错误
 			if strings.Contains(err.Error(), "already connected") {
-				log.Printf("  ✓ Kernel %s already connected", hop.ToKernel)
 				continue
 			}
 
 			// 检查是否是待审批错误
 			if strings.HasPrefix(err.Error(), "interconnect_pending:") {
 				requestID := strings.TrimPrefix(err.Error(), "interconnect_pending:")
-				log.Printf("  ⚠ Interconnect pending for %s (request ID: %s)", hop.ToKernel, requestID)
 
 				// 注册待审批的 hop 到会话中，以便收到批准通知后自动重连
 				hopInfo := &PendingHopInfo{
@@ -1941,16 +1871,14 @@ func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) er
 				continue
 			}
 
-			log.Printf("  ✗ Failed to connect to %s: %v", hop.ToKernel, err)
+			log.Printf("  [ERROR] Failed to connect to %s: %v", hop.ToKernel, err)
 			return fmt.Errorf("hop %d: failed to connect to %s: %w", hopNum, hop.ToKernel, err)
 		}
 
-		log.Printf("  ✓ Successfully connected to %s", hop.ToKernel)
 	}
 
 	// 如果有待审批请求，不再返回错误，而是启动后台等待
 	if pendingHopCount > 0 {
-		log.Printf("📋 %d hop(s) pending approval. Waiting for approvals from remote kernels...", pendingHopCount)
 		log.Printf("   Please run 'approve-request <request_id>' on each target kernel.")
 		// 启动后台 goroutine 等待所有审批
 		go m.waitForMultiHopApprovals(session, pendingHopCount)
@@ -1970,11 +1898,7 @@ func (m *MultiKernelManager) waitForMultiHopApprovals(session *MultiHopSession, 
 
 	select {
 	case <-session.AllDone:
-		log.Printf("🎉 All %d hops approved for route %s, connections auto-established!",
-			expectedCount, session.RouteName)
 	case <-timeout:
-		log.Printf("⏰ Multi-hop route %s timed out after 2 minutes. %d hop(s) still pending.",
-			session.RouteName, expectedCount)
 		// 清理会话
 		m.multiHopSessionsMu.Lock()
 		delete(m.multiHopSessions, session.RouteName)
@@ -2001,10 +1925,8 @@ func (m *MultiKernelManager) ConnectAllEnabledRoutes(configManager *MultiHopConf
 	failedCount := 0
 
 	for _, config := range enabledConfigs {
-		log.Printf("Processing route: %s", config.RouteName)
 
 		if err := m.ConnectMultiHopRoute(config); err != nil {
-			log.Printf("✗ Failed to establish route %s: %v", config.RouteName, err)
 			failedCount++
 			continue
 		}
@@ -2038,9 +1960,9 @@ func (m *MultiKernelManager) GetMultiHopRouteInfo(config *MultiHopConfigFile) st
 		kernelInfo, connected := m.kernels[hop.ToKernel]
 		m.kernelsMu.RUnlock()
 
-		status := "✗ Not connected"
+		status := "[ERROR] Not connected"
 		if connected && kernelInfo != nil && kernelInfo.conn != nil && kernelInfo.Client != nil {
-			status = "✓ Connected"
+			status = "[OK] Connected"
 		}
 
 		info += fmt.Sprintf("  %d. %s -> %s [%s:%d] [%s]\n",

@@ -103,7 +103,7 @@ func (s *MySQLEvidenceStore) GetByID(id int64) (*evidence.EvidenceRecord, error)
 	// 反序列化 metadata
 	if len(metadataBytes) > 0 {
 		if err := json.Unmarshal(metadataBytes, &record.Metadata); err != nil {
-			log.Printf("⚠️ Failed to unmarshal metadata: %v", err)
+			log.Printf("[WARN] Failed to unmarshal metadata: %v", err)
 		}
 	}
 
@@ -191,7 +191,7 @@ func (s *MySQLEvidenceStore) Query(filter interface{}) ([]*evidence.EvidenceReco
 		// 反序列化 metadata
 		if len(metadataBytes) > 0 {
 			if err := json.Unmarshal(metadataBytes, &record.Metadata); err != nil {
-				log.Printf("⚠️ Failed to unmarshal metadata: %v", err)
+				log.Printf("[WARN] Failed to unmarshal metadata: %v", err)
 			}
 		}
 
@@ -328,7 +328,7 @@ func (s *MySQLEvidenceStore) GetByEventID(eventID string) (*evidence.EvidenceRec
 	// 反序列化 metadata
 	if len(metadataBytes) > 0 {
 		if err := json.Unmarshal(metadataBytes, &record.Metadata); err != nil {
-			log.Printf("⚠️ Failed to unmarshal metadata: %v", err)
+			log.Printf("[WARN] Failed to unmarshal metadata: %v", err)
 		}
 	}
 

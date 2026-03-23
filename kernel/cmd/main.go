@@ -152,17 +152,17 @@ func main() {
 	*defaultEvidenceCompress = config.Channel.Evidence.DefaultCompressData
 
 	// 初始化组件
-	log.Println("Initializing kernel components...")
+	log.Println("[INFO] Initializing kernel components...")
 
 	// 1. 身份注册表
 	registry := control.NewRegistry()
 	registry.StartHealthCheck()
-	log.Println("✓ Registry initialized")
+	log.Println("[OK] Registry initialized")
 
 	// 2. 权限策略引擎
 	policyEngine := control.NewPolicyEngine(config.Policy.DefaultAllow)
 	policyEngine.LoadDefaultRules()
-	log.Println("✓ Policy engine initialized")
+	log.Println("[OK] Policy engine initialized")
 
 	// 3. 频道管理器
 	channelManager := circulation.NewChannelManager()
@@ -189,7 +189,7 @@ func main() {
 		log.Fatalf("Failed to set default evidence config: %v", err)
 	}
 
-	log.Println("✓ Channel manager initialized")
+	log.Println("[OK] Channel manager initialized")
 
 	// 4. 数据库管理器（如果启用）
 	var dbManager *database.DBManager
@@ -212,7 +212,7 @@ func main() {
 
 		// 创建证据存储
 		evidenceStore = database.NewMySQLEvidenceStore(dbManager.GetDB())
-		log.Println("✓ Database initialized")
+		log.Println("[OK] Database initialized")
 	}
 
 	// 5. 审计日志
@@ -229,17 +229,17 @@ func main() {
 		log.Fatalf("Failed to initialize audit log: %v", err)
 	}
 	defer auditLog.Close()
-	log.Println("✓ Audit log initialized")
+	log.Println("[OK] Audit log initialized")
 
 	// 6. CA 服务（用于动态签发证书）
 	ca, err := security.NewCA(config.Security.CACertPath, config.Security.CAKeyPath)
 	if err != nil {
 		log.Fatalf("Failed to initialize CA: %v", err)
 	}
-	log.Println("✓ CA initialized")
+	log.Println("[OK] CA initialized")
 
 	// 7. 多内核管理器（核心组件，总是启用）
-	log.Println("正在初始化多内核管理器...")
+	log.Println("[INFO] Initializing multi-kernel manager...")
 
 	kernelConfig := &server.KernelConfig{
 		KernelID:          config.Kernel.ID,
@@ -262,14 +262,14 @@ func main() {
 	}
 
 	// 8. 多跳链路配置管理器
-	log.Println("正在初始化多跳链路配置管理器...")
+	log.Println("[INFO] Initializing multi-hop config manager...")
 	multiHopConfigManager, err := server.NewMultiHopConfigManager("./kernel_configs")
 	if err != nil {
-		log.Printf("Warning: Failed to initialize multi-hop config manager: %v", err)
+		log.Printf("[WARN] Failed to initialize multi-hop config manager: %v", err)
 		// 不致命，继续运行
 		multiHopConfigManager = nil
 	} else {
-		log.Printf("✓ Multi-hop config manager initialized with %d routes",
+		log.Printf("[OK] Multi-hop config manager initialized with %d routes",
 			len(multiHopConfigManager.ListConfigs()))
 		// 注意：不再自动连接多跳路由，由用户通过 connect-kernel -route 命令手动指定
 
@@ -308,7 +308,7 @@ func main() {
 	for _, seed := range config.MultiKernel.SeedKernels {
 		go func(seedConfig SeedKernelConfig) {
 			if err := multiKernelManager.ConnectToKernel(seedConfig.KernelID, seedConfig.Address, seedConfig.Port); err != nil {
-				log.Printf("Failed to connect to seed kernel %s: %v", seedConfig.KernelID, err)
+				log.Printf("[WARN] Failed to connect to seed kernel %s: %v", seedConfig.KernelID, err)
 			}
 		}(seed)
 	}
@@ -316,11 +316,11 @@ func main() {
 	// 启动内核间通信服务器
 	go func() {
 		if err := multiKernelManager.StartKernelServer(); err != nil {
-			log.Printf("Failed to start kernel server: %v", err)
+			log.Printf("[ERROR] Failed to start kernel server: %v", err)
 		}
 	}()
 
-	log.Println("✓ Multi-kernel manager initialized")
+	log.Println("[OK] Multi-kernel manager initialized")
 
 	// 8. mTLS 配置
 	mtlsConfig := &security.MTLSConfig{
@@ -333,7 +333,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to setup mTLS: %v", err)
 	}
-	log.Println("✓ mTLS configured")
+	log.Println("[OK] mTLS configured")
 
 	// 创建 gRPC 服务器
 	grpcServer := grpc.NewServer(
@@ -347,11 +347,10 @@ func main() {
 	
 	// 设置权限变更回调：当权限被批准时，通知被添加的连接器（含跨内核转发）
 	channelManager.SetPermissionChangeCallback(func(channelID, connectorID, changeType string) {
-		log.Printf("📨 Permission change approved, notifying connector %s: channel=%s, type=%s", connectorID, channelID, changeType)
 		// 获取频道信息
 		channel, err := channelManager.GetChannel(channelID)
 		if err != nil {
-			log.Printf("⚠️ Failed to get channel %s: %v", channelID, err)
+			log.Printf("[WARN] Permission change callback: failed to get channel %s: %v", channelID, err)
 			return
 		}
 
@@ -369,9 +368,7 @@ func main() {
 
 		// NotifyParticipant 支持本地和跨内核通知（kernelID:connectorID 格式）
 		if err := channelService.NotifyParticipant(connectorID, notification); err != nil {
-			log.Printf("⚠️ Failed to notify connector %s: %v", connectorID, err)
-		} else {
-			log.Printf("✓ Notified connector %s of permission change", connectorID)
+			log.Printf("[WARN] Permission change callback: failed to notify connector %s: %v", connectorID, err)
 		}
 	})
 	
@@ -379,7 +376,7 @@ func main() {
 	channelManager.SetChannelUpdateNotifyCallback(func(channelID string, addedLocalReceivers []string) {
 		ch, err := channelManager.GetChannel(channelID)
 		if err != nil {
-			log.Printf("⚠️ channel update notify: channel %s not found: %v", channelID, err)
+			log.Printf("[WARN] Channel update callback: channel %s not found: %v", channelID, err)
 			return
 		}
 		notification := &pb.ChannelNotification{
@@ -394,9 +391,7 @@ func main() {
 		}
 		for _, connID := range addedLocalReceivers {
 			if err := channelService.NotificationManager.Notify(connID, notification); err != nil {
-				log.Printf("⚠️ Failed to notify locally added receiver %s after channel update: %v", connID, err)
-			} else {
-				log.Printf("✓ Notified locally added receiver %s of channel update (channel %s)", connID, channelID)
+				log.Printf("[WARN] Channel update callback: failed to notify receiver %s: %v", connID, err)
 			}
 		}
 	})
@@ -416,9 +411,9 @@ func main() {
 	// 注册内核间通信服务（多内核网络核心服务）
 	kernelService := server.NewKernelServiceServer(multiKernelManager, channelManager, registry, channelService.NotificationManager, auditLog)
 	pb.RegisterKernelServiceServer(grpcServer, kernelService)
-	log.Println("✓ Kernel-to-kernel service registered")
+	log.Println("[OK] Kernel-to-kernel service registered")
 
-	log.Println("✓ gRPC services registered")
+	log.Println("[OK] gRPC services registered")
 
 	// 创建引导服务（允许无证书连接，用于首次注册）
 	bootstrapCreds, err := security.NewBootstrapServerTransportCredentials(mtlsConfig)
@@ -444,9 +439,9 @@ func main() {
 	}
 	
 	go func() {
-		log.Printf("🔓 Bootstrap server started on %s (for certificate registration)", bootstrapAddress)
+		log.Printf("[INFO] Bootstrap server started on %s (for certificate registration)", bootstrapAddress)
 		if err := bootstrapServer.Serve(bootstrapListener); err != nil {
-			log.Printf("Bootstrap server error: %v", err)
+			log.Printf("[ERROR] Bootstrap server error: %v", err)
 		}
 	}()
 
@@ -463,25 +458,25 @@ func main() {
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		<-sigChan
 
-		log.Println("\nShutting down gracefully...")
+		log.Println("[INFO] Shutting down gracefully...")
 		bootstrapServer.GracefulStop()
 		grpcServer.GracefulStop()
 		auditLog.Close()
-		log.Println("Shutdown complete")
+		log.Println("[OK] Shutdown complete")
 		os.Exit(0)
 	}()
 
-	log.Printf("🚀 Trusted Data Space Kernel started on %s", address)
+	log.Printf("[INFO] Trusted Data Space Kernel started on %s", address)
 
 	// 默认进入交互模式，除非指定-daemon参数
 	if *daemon {
-		log.Println("Running in daemon mode (background service only)...")
-		log.Println("Waiting for connector connections...")
+		log.Println("[INFO] Running in daemon mode (background service only)...")
+		log.Println("[INFO] Waiting for connector connections...")
 	} else {
-		log.Println("Starting interactive management console...")
-		log.Println("✓ gRPC server is running in the background")
-		log.Println("✓ Interactive commands are enabled")
-		log.Println("✓ Ready to accept connector connections")
+		log.Println("[INFO] Starting interactive management console...")
+		log.Println("[OK] gRPC server is running in the background")
+		log.Println("[OK] Interactive commands are enabled")
+		log.Println("[OK] Ready to accept connector connections")
 		go runInteractiveKernelShell(config, channelManager, registry, multiKernelManager, multiHopConfigManager)
 	}
 
@@ -499,7 +494,7 @@ func runInteractiveKernelShell(config *Config, channelManager *circulation.Chann
 	scanner := bufio.NewScanner(os.Stdin)
 
 	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Println("🚀 Trusted Data Space Kernel - Interactive Management Console")
+	fmt.Println("Trusted Data Space Kernel - Interactive Management Console")
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Printf("Kernel ID: %s\n", kernelID)
 	fmt.Println("Multi-kernel: enabled (default)")
@@ -829,7 +824,7 @@ func handleConnectKernel(multiKernelManager *server.MultiKernelManager, args []s
 			// 检查是否是待审批错误，格式: "multi-hop pending: ..."
 			if strings.Contains(err.Error(), "multi-hop pending:") {
 				errMsg := err.Error()
-				fmt.Printf("\n⚠️  Multi-hop connection requires approval(s):\n\n")
+				fmt.Printf("\n[WARN]  Multi-hop connection requires approval(s):\n\n")
 				fmt.Printf("  %s\n\n", errMsg)
 				fmt.Printf("Required actions:\n")
 				fmt.Printf("1. Go to each target kernel and run: approve-request <request_id>\n")
@@ -839,7 +834,7 @@ func handleConnectKernel(multiKernelManager *server.MultiKernelManager, args []s
 			// 检查是否是待审批错误，格式: "hop X/Y pending: ..."
 			if strings.Contains(err.Error(), "hop ") && strings.Contains(err.Error(), "pending") {
 				errMsg := err.Error()
-				fmt.Printf("\n⚠️  Multi-hop connection requires approval(s):\n\n")
+				fmt.Printf("\n[WARN]  Multi-hop connection requires approval(s):\n\n")
 				fmt.Printf("  %s\n\n", errMsg)
 				fmt.Printf("Required actions:\n")
 				fmt.Printf("1. Go to the intermediate/target kernel(s) and approve the request(s)\n")
@@ -1055,7 +1050,7 @@ func handleLoadRoute(configManager *server.MultiHopConfigManager, args []string)
 		return
 	}
 
-	fmt.Printf("✓ Multi-hop route '%s' loaded successfully\n", config.RouteName)
+	fmt.Printf("[OK] Multi-hop route '%s' loaded successfully\n", config.RouteName)
 	fmt.Printf("  Name: %s\n", config.Name)
 	fmt.Printf("  Description: %s\n", config.Description)
 	fmt.Printf("  Hops: %d\n", len(config.Hops))
@@ -1100,7 +1095,7 @@ func handleConnectRoute(multiKernelManager *server.MultiKernelManager, configMan
 		return
 	}
 
-	fmt.Printf("✓ Multi-hop route '%s' connected successfully\n", routeName)
+	fmt.Printf("[OK] Multi-hop route '%s' connected successfully\n", routeName)
 }
 
 // handleEnableRoute 处理启用多跳路由命令
@@ -1128,7 +1123,7 @@ func handleEnableRoute(configManager *server.MultiHopConfigManager, args []strin
 		return
 	}
 
-	fmt.Printf("✓ Route '%s' enabled\n", routeName)
+	fmt.Printf("[OK] Route '%s' enabled\n", routeName)
 }
 
 // handleDisableRoute 处理禁用多跳路由命令
@@ -1156,7 +1151,7 @@ func handleDisableRoute(configManager *server.MultiHopConfigManager, args []stri
 		return
 	}
 
-	fmt.Printf("✓ Route '%s' disabled\n", routeName)
+	fmt.Printf("[OK] Route '%s' disabled\n", routeName)
 }
 
 // handleRouteInfo 处理显示路由详细信息命令

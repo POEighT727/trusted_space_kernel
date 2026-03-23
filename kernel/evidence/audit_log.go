@@ -309,7 +309,7 @@ func (al *AuditLog) SubmitBasicEvidenceWithMetadata(sourceID string, eventType E
 		for attempt := 1; attempt <= 3; attempt++ {
 			if err := al.store.Store(record); err != nil {
 				lastErr = err
-				log.Printf("⚠️ Failed to store evidence in database (attempt %d/3): %v", attempt, err)
+				log.Printf("[WARN] Failed to store evidence in database (attempt %d/3): %v", attempt, err)
 				if attempt < 3 {
 					time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 					continue
@@ -320,7 +320,7 @@ func (al *AuditLog) SubmitBasicEvidenceWithMetadata(sourceID string, eventType E
 			}
 		}
 		if lastErr != nil {
-			log.Printf("⚠️ Failed to store evidence in database after 3 attempts: %v", lastErr)
+			log.Printf("[WARN] Failed to store evidence in database after 3 attempts: %v", lastErr)
 		}
 	}
 
@@ -358,7 +358,7 @@ func (al *AuditLog) SubmitBasicEvidenceWithRetry(sourceID string, eventType Even
 	// 生成数字签名
 	signature, err := al.generateEvidenceSignature(sourceID, string(eventType), channelID, dataHash, tempTimestamp.Unix())
 	if err != nil {
-		log.Printf("⚠️  Failed to generate signature for evidence: %v", err)
+		log.Printf("[WARN]  Failed to generate signature for evidence: %v", err)
 		signature = ""
 	}
 
@@ -393,7 +393,7 @@ func (al *AuditLog) SubmitBasicEvidenceWithRetry(sourceID string, eventType Even
 		for attempt := 1; attempt <= maxRetries; attempt++ {
 			if err := al.store.Store(record); err != nil {
 				lastErr = err
-				log.Printf("⚠️ Failed to store evidence in database (attempt %d/%d): %v", attempt, maxRetries, err)
+				log.Printf("[WARN] Failed to store evidence in database (attempt %d/%d): %v", attempt, maxRetries, err)
 				if attempt < maxRetries {
 					time.Sleep(time.Duration(attempt) * 500 * time.Millisecond) // 指数退避
 					continue
@@ -404,7 +404,7 @@ func (al *AuditLog) SubmitBasicEvidenceWithRetry(sourceID string, eventType Even
 			}
 		}
 		if lastErr != nil {
-			log.Printf("⚠️ Failed to store evidence in database after %d attempts: %v", maxRetries, lastErr)
+			log.Printf("[WARN] Failed to store evidence in database after %d attempts: %v", maxRetries, lastErr)
 		}
 	}
 
@@ -432,7 +432,7 @@ func (al *AuditLog) SubmitBasicEvidenceWithRetry(sourceID string, eventType Even
 	// 持久化到文件（可选，本地备份）
 	if al.persistent && al.logFile != nil {
 		if err := al.writeRecordToFile(record); err != nil {
-			log.Printf("⚠️ Failed to persist record to file: %v", err)
+			log.Printf("[WARN] Failed to persist record to file: %v", err)
 		}
 	}
 
@@ -553,7 +553,7 @@ func (al *AuditLog) QueryByChannel(channelID string, startTime, endTime time.Tim
 
 		records, err := al.store.GetByChannel(channelID, startTimePtr, endTimePtr)
 		if err != nil {
-			log.Printf("⚠️ Failed to query evidence from database: %v", err)
+			log.Printf("[WARN] Failed to query evidence from database: %v", err)
 			return []*EvidenceRecord{}
 		}
 
@@ -589,7 +589,7 @@ func (al *AuditLog) QueryByFlowID(flowID string, startTime, endTime time.Time, l
 
 		records, err := al.store.GetByFlowID(flowID, startTimePtr, endTimePtr)
 		if err != nil {
-			log.Printf("⚠️ Failed to query evidence by flow_id from database: %v", err)
+			log.Printf("[WARN] Failed to query evidence by flow_id from database: %v", err)
 			return []*EvidenceRecord{}
 		}
 
@@ -625,7 +625,7 @@ func (al *AuditLog) QueryBySource(sourceID string, startTime, endTime time.Time,
 
 		records, err := al.store.GetBySource(sourceID, startTimePtr, endTimePtr)
 		if err != nil {
-			log.Printf("⚠️ Failed to query evidence from database: %v", err)
+			log.Printf("[WARN] Failed to query evidence from database: %v", err)
 			return []*EvidenceRecord{}
 		}
 
@@ -661,7 +661,7 @@ func (al *AuditLog) QueryByTarget(targetID string, startTime, endTime time.Time,
 
 		records, err := al.store.GetByTarget(targetID, startTimePtr, endTimePtr)
 		if err != nil {
-			log.Printf("⚠️ Failed to query evidence from database: %v", err)
+			log.Printf("[WARN] Failed to query evidence from database: %v", err)
 			return []*EvidenceRecord{}
 		}
 
@@ -697,7 +697,7 @@ func (al *AuditLog) QueryByDirection(direction EvidenceDirection, startTime, end
 
 		records, err := al.store.GetByDirection(direction, startTimePtr, endTimePtr)
 		if err != nil {
-			log.Printf("⚠️ Failed to query evidence from database: %v", err)
+			log.Printf("[WARN] Failed to query evidence from database: %v", err)
 			return []*EvidenceRecord{}
 		}
 
@@ -746,7 +746,7 @@ func (al *AuditLog) QueryByEventType(eventType EventType, startTime, endTime tim
 
 		records, err := al.store.GetByEventType(eventType, startTimePtr, endTimePtr)
 		if err != nil {
-			log.Printf("⚠️ Failed to query evidence from database: %v", err)
+			log.Printf("[WARN] Failed to query evidence from database: %v", err)
 			return []*EvidenceRecord{}
 		}
 
@@ -839,7 +839,7 @@ func (al *AuditLog) SignFlow(flowID string) (*EvidenceRecord, error) {
 	// 如果有持久化存储，更新数据库
 	if al.store != nil {
 		if err := al.store.Update(lastRecord); err != nil {
-			log.Printf("⚠️ Failed to update flow signature in database: %v", err)
+			log.Printf("[WARN] Failed to update flow signature in database: %v", err)
 		}
 	}
 

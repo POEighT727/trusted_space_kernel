@@ -56,7 +56,7 @@ func NewDBManager(conf MySQLConfig) (*DBManager, error) {
 		return nil, fmt.Errorf("failed to init tables: %w", err)
 	}
 
-	log.Println("✓ MySQL database connected successfully")
+	log.Println("[OK] MySQL database connected successfully")
 	return manager, nil
 }
 

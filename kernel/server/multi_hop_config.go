@@ -72,7 +72,7 @@ func NewMultiHopConfigManager(configDir string) (*MultiHopConfigManager, error) 
 
 	// 加载现有配置
 	if err := manager.loadAllConfigs(); err != nil {
-		log.Printf("⚠ Failed to load existing multi-hop configs: %v", err)
+		log.Printf("[WARN] Failed to load existing multi-hop configs: %v", err)
 	}
 
 	return manager, nil
@@ -135,7 +135,7 @@ func (m *MultiHopConfigManager) SaveConfig(config *MultiHopConfigFile) error {
 	// 更新内存缓存
 	m.configs[config.RouteName] = config
 
-	log.Printf("✓ Multi-hop route config saved: %s", config.RouteName)
+	log.Printf("[OK] Multi-hop route config saved: %s", config.RouteName)
 	return nil
 }
 
@@ -188,7 +188,7 @@ func (m *MultiHopConfigManager) DeleteConfig(routeName string) error {
 	delete(m.configs, routeName)
 	delete(m.routes, routeName)
 
-	log.Printf("✓ Multi-hop route config deleted: %s", routeName)
+	log.Printf("[OK] Multi-hop route config deleted: %s", routeName)
 	return nil
 }
 
@@ -258,7 +258,7 @@ func (m *MultiHopConfigManager) UpdateRouteStatus(routeName string, status strin
 	route.Status = status
 	route.UpdatedAt = time.Now()
 
-	log.Printf("✓ Route %s status updated to: %s", routeName, status)
+	log.Printf("[OK] Route %s status updated to: %s", routeName, status)
 	return nil
 }
 
@@ -282,14 +282,14 @@ func (m *MultiHopConfigManager) loadAllConfigs() error {
 
 		routeName := file.Name()[:len(file.Name())-5] // 移除.json后缀
 		if _, err := m.LoadConfig(routeName); err != nil {
-			log.Printf("⚠ Failed to load config for route %s: %v", routeName, err)
+			log.Printf("[WARN] Failed to load config for route %s: %v", routeName, err)
 			continue
 		}
 		loadedCount++
 	}
 
 	if loadedCount > 0 {
-		log.Printf("✓ Loaded %d multi-hop route configs from %s", loadedCount, m.configDir)
+		log.Printf("[OK] Loaded %d multi-hop route configs from %s", loadedCount, m.configDir)
 	}
 	return nil
 }

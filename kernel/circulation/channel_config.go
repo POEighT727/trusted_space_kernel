@@ -104,7 +104,7 @@ func (cm *ChannelConfigManager) SaveConfig(config *ChannelConfigFile) error {
 	// 更新内存缓存
 	cm.configs[config.ChannelName] = config
 
-	log.Printf("✓ Channel config saved: %s", config.ChannelName)
+	log.Printf("[OK] Channel config saved: %s", config.ChannelName)
 	return nil
 }
 
@@ -156,7 +156,7 @@ func (cm *ChannelConfigManager) DeleteConfig(channelID string) error {
 	// 从内存中删除
 	delete(cm.configs, channelID)
 
-	log.Printf("✓ Channel config deleted: %s", channelID)
+	log.Printf("[OK] Channel config deleted: %s", channelID)
 	return nil
 }
 
@@ -241,7 +241,7 @@ func (cm *ChannelConfigManager) SetDefaultEvidenceConfig(config *EvidenceConfig)
 
 	if config != nil {
 		cm.defaultConfig = config
-		log.Printf("✓ Default evidence config updated")
+		log.Printf("[OK] Default evidence config updated")
 	}
 }
 
@@ -283,7 +283,7 @@ func (cm *ChannelConfigManager) loadAllConfigs() error {
 	}
 
 	if loadedCount > 0 {
-		log.Printf("✓ Loaded %d channel configs from %s", loadedCount, cm.configDir)
+		log.Printf("[OK] Loaded %d channel configs from %s", loadedCount, cm.configDir)
 	}
 	return nil
 }
@@ -370,13 +370,13 @@ func (cm *ChannelConfigManager) CleanupOldConfigs(maxVersions int) error {
 			}
 
 			if channelCleanupCount > 0 {
-				log.Printf("🧹 Cleaned up %d old config files for channel %s", channelCleanupCount, channelID)
+				log.Printf("[INFO] Cleaned up %d old config files for channel %s", channelCleanupCount, channelID)
 			}
 		}
 	}
 
 	if cleanupCount > 0 {
-		log.Printf("🧹 Total cleaned up %d old channel config files", cleanupCount)
+		log.Printf("[INFO] Total cleaned up %d old channel config files", cleanupCount)
 	}
 
 	return nil

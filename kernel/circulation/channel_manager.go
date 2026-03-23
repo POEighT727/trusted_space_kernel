@@ -333,7 +333,7 @@ func (cm *ChannelManager) SetChannelCreatedCallback(callback func(*Channel)) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.notifyChannelCreated = callback
-	log.Printf("✓ Channel creation callback set in ChannelManager")
+	log.Printf("[OK] Channel creation callback set in ChannelManager")
 }
 
 // SetConfigManager 设置频道配置管理器
@@ -341,7 +341,7 @@ func (cm *ChannelManager) SetConfigManager(configManager *ChannelConfigManager) 
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.configManager = configManager
-	log.Printf("✓ Channel config manager set")
+	log.Printf("[OK] Channel config manager set")
 }
 
 // SetForwardToKernel 设置将要用于跨内核转发数据的回调函数（由上层多内核管理器设置）
@@ -358,7 +358,7 @@ func (cm *ChannelManager) SetGetNextHopKernel(fn func(currentKernelID, targetKer
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.GetNextHopKernel = fn
-	log.Printf("✓ Multi-hop route callback set in ChannelManager")
+	log.Printf("[OK] Multi-hop route callback set in ChannelManager")
 }
 
 // SetPermissionChangeCallback 设置权限变更回调
@@ -366,7 +366,7 @@ func (cm *ChannelManager) SetPermissionChangeCallback(callback func(channelID, c
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.permissionChangeCallback = callback
-	log.Printf("✓ Permission change callback set in ChannelManager")
+	log.Printf("[OK] Permission change callback set in ChannelManager")
 }
 
 // SetChannelUpdateNotifyCallback sets a callback that is invoked after a
@@ -418,7 +418,7 @@ func (cm *ChannelManager) SetDefaultEvidenceConfig(config *EvidenceConfig) error
 	}
 
 	cm.configManager.SetDefaultEvidenceConfig(config)
-	log.Printf("✓ Default evidence config updated in ChannelManager")
+	log.Printf("[OK] Default evidence config updated in ChannelManager")
 	return nil
 }
 
@@ -555,7 +555,7 @@ func (cm *ChannelManager) AcceptChannelProposal(channelID, accepterID string) er
 	// 检查频道状态 - 如果已经是 active 状态，直接返回成功
 	// 注意：虽然返回成功，但如果是从远端转发来的 accept，可能需要重新通知本地参与者
 	if channel.Status == ChannelStatusActive {
-		log.Printf("✓ Channel %s is already active, accept request processed", channelID)
+		log.Printf("[OK] Channel %s is already active, accept request processed", channelID)
 		return nil
 	}
 
@@ -863,7 +863,7 @@ func (cm *ChannelManager) CreateChannelFromConfig(configFilePath string) (*Chann
 		go cm.notifyChannelCreated(channel)
 	}
 
-	log.Printf("✓ Channel created from config file: %s", configFilePath)
+	log.Printf("[OK] Channel created from config file: %s", configFilePath)
 	return channel, nil
 }
 
@@ -908,7 +908,7 @@ func (cm *ChannelManager) SaveChannelConfig(channelID, name, description string)
 			return fmt.Errorf("failed to write config file: %v", err)
 		}
 
-		log.Printf("✓ Channel config saved: %s", channel.ConfigFilePath)
+		log.Printf("[OK] Channel config saved: %s", channel.ConfigFilePath)
 		return nil
 	}
 
@@ -1543,7 +1543,7 @@ func (c *Channel) PushData(packet *DataPacket) error {
 			if err := c.manager.forwardToKernel(actualTargetKernel, outPacket, packet.IsFinal); err != nil {
 				log.Printf("⚠ Failed to forward packet to kernel %s: %v", actualTargetKernel, err)
 			} else {
-				log.Printf("✓ Successfully forwarded packet to kernel %s (actual target: %s)", actualTargetKernel, rk)
+				log.Printf("[OK] Successfully forwarded packet to kernel %s (actual target: %s)", actualTargetKernel, rk)
 			}
 		}
 	}
@@ -1602,7 +1602,7 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 					// 成功发送暂存数据
 				case <-time.After(1 * time.Second):
 					// 超时，跳过
-					log.Printf("⚠️ Timeout sending buffered packet to %s", subscriberID)
+					log.Printf("[WARN] Timeout sending buffered packet to %s", subscriberID)
 				}
 			}
 		}
@@ -1878,7 +1878,7 @@ func (cm *ChannelManager) CleanupExpiredConnectorBuffers(maxAge time.Duration) i
 			delete(cm.lastActivity, connectorID)
 			delete(cm.connectorStatus, connectorID)
 			cleanupCount++
-			log.Printf("🧹 Cleaned up expired buffers for offline connector %s", connectorID)
+			log.Printf("[INFO] Cleaned up expired buffers for offline connector %s", connectorID)
 		}
 	}
 
@@ -1896,12 +1896,12 @@ func (cm *ChannelManager) StartBufferCleanupRoutine() {
 			case <-ticker.C:
 				cleanupCount := cm.CleanupExpiredConnectorBuffers(1 * time.Hour) // 清理1小时前离线的连接器缓冲
 				if cleanupCount > 0 {
-					log.Printf("🧹 Cleaned up buffers for %d offline connectors", cleanupCount)
+					log.Printf("[INFO] Cleaned up buffers for %d offline connectors", cleanupCount)
 				}
 			}
 		}
 	}()
-	log.Println("✓ Started connector buffer cleanup routine")
+	log.Println("[OK] Started connector buffer cleanup routine")
 }
 
 // ------------------------------------------------------------
@@ -1947,7 +1947,7 @@ func (c *Channel) RequestChannelSubscription(subscriberID, role, reason string) 
 
 	c.permissionRequests = append(c.permissionRequests, request)
 
-	log.Printf("✓ Channel subscription requested: %s -> %s (%s)", subscriberID, c.ChannelID, role)
+	log.Printf("[OK] Channel subscription requested: %s -> %s (%s)", subscriberID, c.ChannelID, role)
 	return request, nil
 }
 
@@ -2048,7 +2048,7 @@ func (c *Channel) ApproveChannelSubscription(approverID, requestID string) (stri
 	// 注意：不再删除请求，以便其他批准方法（如 ApprovePermissionChange）也能看到请求已处理
 	// c.permissionRequests = append(c.permissionRequests[:requestIndex], c.permissionRequests[requestIndex+1:]...)
 
-	log.Printf("✓ Channel subscription approved: %s -> %s (%s)", request.TargetID, c.ChannelID, request.ChangeType)
+	log.Printf("[OK] Channel subscription approved: %s -> %s (%s)", request.TargetID, c.ChannelID, request.ChangeType)
 
 	// 通知远程内核频道已更新（发送方/接收方列表已变更）
 	go c.notifyRemoteKernelsOfChannelUpdate()
@@ -2079,7 +2079,7 @@ func (c *Channel) RejectChannelSubscription(approverID, requestID, reason string
 			req.RejectedAt = &now
 			req.RejectReason = reason
 
-			log.Printf("✓ Channel subscription rejected: %s -> %s (reason: %s)", req.TargetID, c.ChannelID, reason)
+			log.Printf("[OK] Channel subscription rejected: %s -> %s (reason: %s)", req.TargetID, c.ChannelID, reason)
 			return nil
 		}
 	}
@@ -2487,7 +2487,7 @@ func (c *Channel) StorePermissionRequestFromRemote(permReq *PermissionRequestMes
 	}
 
 	c.permissionRequests = append(c.permissionRequests, request)
-	log.Printf("✓ Stored permission request %s from remote kernel (requester: %s)", request.RequestID, requesterID)
+	log.Printf("[OK] Stored permission request %s from remote kernel (requester: %s)", request.RequestID, requesterID)
 }
 
 // StartCleanupRoutine 启动清理协程
@@ -2682,7 +2682,7 @@ func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
 		if err := c.manager.forwardToKernel(kernelID, packet, false); err != nil {
 			log.Printf("⚠ Failed to notify kernel %s of channel update: %v", kernelID, err)
 		} else {
-			log.Printf("✓ Notified kernel %s of channel update for channel %s", kernelID, c.ChannelID)
+			log.Printf("[OK] Notified kernel %s of channel update for channel %s", kernelID, c.ChannelID)
 		}
 	}
 }
@@ -2732,7 +2732,7 @@ func (c *Channel) handleChannelUpdate(update *ChannelUpdateMessage) {
 		}
 	}
 
-	log.Printf("✓ Channel %s updated: senders=%v, receivers=%v, status=%s",
+	log.Printf("[OK] Channel %s updated: senders=%v, receivers=%v, status=%s",
 		c.ChannelID, c.SenderIDs, c.ReceiverIDs, c.Status)
 
 	// Collect newly added local receivers so the server layer can notify them.
@@ -2815,7 +2815,7 @@ func (c *Channel) sendControlMessage(channel *Channel, message ControlMessage) {
 	// 推送到频道的缓冲队列
 	select {
 	case channel.dataQueue <- packet:
-		log.Printf("✓ Control message sent to channel %s: %s", channel.ChannelID, message.MessageType)
+		log.Printf("[OK] Control message sent to channel %s: %s", channel.ChannelID, message.MessageType)
 	default:
 		log.Printf("⚠ Channel %s queue full, message dropped", channel.ChannelID)
 	}
@@ -2896,7 +2896,7 @@ func (c *Channel) forwardControlMessageToRemoteKernels(packet *DataPacket) {
 		if err := c.manager.forwardToKernel(kernelID, packet, false); err != nil {
 			log.Printf("⚠ Failed to forward control message to kernel %s: %v", kernelID, err)
 		} else {
-			log.Printf("✓ Forwarded control message to kernel %s", kernelID)
+			log.Printf("[OK] Forwarded control message to kernel %s", kernelID)
 		}
 	}
 }

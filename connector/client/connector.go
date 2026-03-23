@@ -40,7 +40,6 @@ type LocalChannelInfo struct {
 	Encrypted    bool
 	Participants []string // 保留兼容性
 	CreatedAt    int64
-	IsEvidenceChannel bool // 是否为存证频道
 }
 
 // Connector 连接器客户端
@@ -74,10 +73,6 @@ type Connector struct {
 	processedNotificationsMu sync.RWMutex
 	processedNotifications   map[string]bool // key: channelID, value: 是否已处理过通知
 	skippedNotifications     map[string]int  // key: channelID, value: 跳过次数
-
-	// 存证存储配置
-	evidenceLocalStorage bool   // 是否启用本地存证存储
-	evidenceStoragePath  string // 本地存证存储路径
 }
 
 // Config 连接器配置
@@ -90,10 +85,6 @@ type Config struct {
 	ClientCertPath string
 	ClientKeyPath  string
 	ServerName     string
-
-	// 存证存储配置
-	EvidenceLocalStorage bool   // 是否启用本地存证存储
-	EvidenceStoragePath  string // 本地存证存储路径
 	// 可选：当前连接器所属的内核ID（用于跨内核发现）
 	KernelID string
 	// 是否向其他内核公开自己的信息，默认为true（使用指针以支持可选字段）
@@ -143,8 +134,6 @@ func NewConnector(config *Config) (*Connector, error) {
 		subscriptions: make(map[string]bool),
 		processedNotifications: make(map[string]bool),
 		skippedNotifications: make(map[string]int),
-		evidenceLocalStorage: config.EvidenceLocalStorage,
-		evidenceStoragePath:  config.EvidenceStoragePath,
 	}
 
 	return connector, nil
@@ -169,8 +158,8 @@ func (c *Connector) Connect() error {
 	}
 
 	c.sessionToken = resp.SessionToken
-	log.Printf("✓ Connected to kernel (version: %s)", resp.KernelVersion)
-	log.Printf("✓ Session token: %s", c.sessionToken)
+	log.Printf("[OK] Connected to kernel (version: %s)", resp.KernelVersion)
+	log.Printf("[OK] Session token: %s", c.sessionToken)
 
 	// 启动心跳
 	go c.startHeartbeat()
@@ -259,18 +248,14 @@ func (c *Connector) RecordChannelFromNotification(notification *pb.ChannelNotifi
 		participants = []string{notification.CreatorId}
 	}
 
-	// 检查是否为存证频道（主题以"-evidence"结尾）
-	isEvidenceChannel := strings.HasSuffix(notification.DataTopic, "-evidence")
-
 	c.addOrUpdateLocalChannel(&LocalChannelInfo{
-		ChannelID:         notification.ChannelId,
-		DataTopic:         notification.DataTopic,
-		CreatorID:         notification.CreatorId,
-		Participants:      participants,
-		CreatedAt:         notification.CreatedAt,
-		IsEvidenceChannel: isEvidenceChannel,
+		ChannelID:    notification.ChannelId,
+		DataTopic:    notification.DataTopic,
+		CreatorID:    notification.CreatorId,
+		Participants: participants,
+		CreatedAt:   notification.CreatedAt,
 	})
-	}
+}
 
 // ListLocalChannels 列出本地已知的频道信息
 func (c *Connector) ListLocalChannels() []*LocalChannelInfo {
@@ -321,7 +306,7 @@ func (c *Connector) SendData(channelID string, data [][]byte) error {
 			return fmt.Errorf("packet %d failed: %s", i, status.Message)
 		}
 
-		log.Printf("✓ Packet %d sent successfully", i+1)
+		log.Printf("[OK] Packet %d sent successfully", i+1)
 	}
 
 	// 关闭发送流
@@ -329,7 +314,7 @@ func (c *Connector) SendData(channelID string, data [][]byte) error {
 		return fmt.Errorf("failed to close send: %w", err)
 	}
 
-	log.Printf("✓ All data sent successfully")
+	log.Printf("[OK] All data sent successfully")
 	return nil
 }
 
@@ -430,28 +415,23 @@ func (c *Connector) ReceiveData(channelID string, handler func(*pb.DataPacket) e
 		return fmt.Errorf("failed to subscribe: %w", err)
 	}
 
-	log.Printf("✓ Subscribed to channel: %s", channelID)
+	log.Printf("[OK] Subscribed to channel: %s", channelID)
 	log.Println("Waiting for data...")
 
 	for {
 		packet, err := stream.Recv()
 		if err == io.EOF {
-			log.Println("✓ Stream closed")
+			log.Println("[OK] Stream closed")
 			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("receive error: %w", err)
 		}
 
-		log.Printf("✓ Received packet #%d (%d bytes)", packet.SequenceNumber, len(packet.Payload))
+		log.Printf("[OK] Received packet #%d (%d bytes)", packet.SequenceNumber, len(packet.Payload))
 
 		// 在统一频道模式下，根据payload内容判断消息类型
-		if c.isEvidenceData(packet.Payload) {
-			// 存证数据：继续使用原有逻辑
-			if err := c.processEvidencePacket(packet); err != nil {
-				log.Printf("⚠ Failed to process evidence packet: %v", err)
-			}
-		} else if c.isControlMessage(packet.Payload) {
+		if c.isControlMessage(packet.Payload) {
 			// 控制消息：处理控制消息
 			if err := c.processControlPacket(packet); err != nil {
 				log.Printf("⚠ Failed to process control packet: %v", err)
@@ -467,117 +447,6 @@ func (c *Connector) ReceiveData(channelID string, handler func(*pb.DataPacket) e
 	}
 }
 
-// ReceiveEvidenceData 接收存证频道数据并本地存储
-func (c *Connector) ReceiveEvidenceData(channelID string) error {
-	// 检查是否已经在本地标记为订阅状态（避免重复调用）
-	c.subscriptionsMu.Lock()
-	if c.subscriptions[channelID] {
-		c.subscriptionsMu.Unlock()
-		return fmt.Errorf("already subscribed to evidence channel: %s", channelID)
-	}
-	// 标记开始订阅（即使内核已经记录了订阅，也要防止客户端重复调用）
-	c.subscriptions[channelID] = true
-	c.subscriptionsMu.Unlock()
-
-	// 确保在函数结束时清理订阅标记
-	defer func() {
-		c.subscriptionsMu.Lock()
-		delete(c.subscriptions, channelID)
-		c.subscriptionsMu.Unlock()
-	}()
-
-	stream, err := c.channelSvc.SubscribeData(c.ctx, &pb.SubscribeRequest{
-		ConnectorId: c.connectorID,
-		ChannelId:   channelID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to subscribe to evidence channel: %w", err)
-	}
-
-	log.Printf("✓ Subscribed to evidence channel: %s", channelID)
-
-	// 初始化本地存证存储
-	if err := c.initializeEvidenceStorage(); err != nil {
-		log.Printf("⚠ Failed to initialize evidence storage: %v", err)
-		// 继续运行，但不存储数据
-	}
-
-	for {
-		packet, err := stream.Recv()
-		if err == io.EOF {
-			log.Println("✓ Evidence channel closed")
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("evidence channel receive error: %w", err)
-		}
-
-		// 只处理证据数据，跳过其他类型的数据
-		if c.isEvidenceData(packet.Payload) {
-			// 处理存证数据
-			if err := c.processEvidencePacket(packet); err != nil {
-				log.Printf("⚠ Failed to process evidence packet: %v", err)
-			}
-		} else {
-			// 跳过非证据数据
-			// log.Printf("⏭️ Skipped non-evidence packet #%d in evidence channel %s", packet.SequenceNumber, channelID)
-		}
-	}
-}
-
-// ReceiveControlData 接收控制频道数据并处理控制消息
-func (c *Connector) ReceiveControlData(channelID string) error {
-	// 检查是否已经在本地标记为订阅状态（避免重复调用）
-	c.subscriptionsMu.Lock()
-	if c.subscriptions[channelID] {
-		c.subscriptionsMu.Unlock()
-		return fmt.Errorf("already subscribed to control channel: %s", channelID)
-	}
-	// 标记开始订阅（即使内核已经记录了订阅，也要防止客户端重复调用）
-	c.subscriptions[channelID] = true
-	c.subscriptionsMu.Unlock()
-
-	// 确保在函数结束时清理订阅标记
-	defer func() {
-		c.subscriptionsMu.Lock()
-		delete(c.subscriptions, channelID)
-		c.subscriptionsMu.Unlock()
-	}()
-
-	stream, err := c.channelSvc.SubscribeData(c.ctx, &pb.SubscribeRequest{
-		ConnectorId: c.connectorID,
-		ChannelId:   channelID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to subscribe to control channel: %w", err)
-	}
-
-	log.Printf("✓ Subscribed to control channel: %s", channelID)
-	log.Println("Waiting for control messages...")
-
-	for {
-		packet, err := stream.Recv()
-		if err == io.EOF {
-			log.Println("✓ Control channel closed")
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("control channel receive error: %w", err)
-		}
-
-		// 只处理控制消息，跳过其他类型的数据
-		if c.isControlMessage(packet.Payload) {
-			// 处理控制消息
-			if err := c.processControlPacket(packet); err != nil {
-				log.Printf("⚠ Failed to process control packet: %v", err)
-			}
-		} else {
-			// 跳过非控制消息
-			// log.Printf("⏭️ Skipped non-control packet #%d in control channel %s", packet.SequenceNumber, channelID)
-		}
-	}
-}
-
 // processControlPacket 处理接收到的控制消息数据包
 func (c *Connector) processControlPacket(packet *pb.DataPacket) error {
 	// 控制消息由connector/cmd/main.go中的handleControlMessage处理
@@ -586,194 +455,6 @@ func (c *Connector) processControlPacket(packet *pb.DataPacket) error {
 		packet.ChannelId, packet.SequenceNumber, len(packet.Payload))
 
 	// 控制消息的具体处理逻辑在UI层（main.go）实现
-	return nil
-}
-
-// processEvidencePacket 处理接收到的存证数据包
-func (c *Connector) processEvidencePacket(packet *pb.DataPacket) error {
-	// 反序列化存证记录
-	var record struct {
-		TxID        string            `json:"tx_id"`
-		ConnectorID string            `json:"connector_id"`
-		EventType   string            `json:"event_type"`
-		ChannelID   string            `json:"channel_id"`
-		DataHash    string            `json:"data_hash"`
-		Signature   string            `json:"signature"`
-		Timestamp   string            `json:"timestamp"`
-		Metadata    map[string]string `json:"metadata"`
-		Hash        string            `json:"hash"`
-		EventID     string            `json:"event_id"`
-	}
-
-	if err := json.Unmarshal(packet.Payload, &record); err != nil {
-		return fmt.Errorf("failed to unmarshal evidence record: %w", err)
-	}
-
-	// 验证存证数据的完整性
-	if err := c.verifyEvidenceRecord(&record); err != nil {
-		log.Printf("⚠ Evidence record verification failed: %v", err)
-		// 继续处理，但记录警告
-	} else {
-		// 减少证据验证成功的日志输出
-	}
-
-	// 本地存储存证数据
-	if err := c.storeEvidenceRecord(&record); err != nil {
-		return fmt.Errorf("failed to store evidence record: %w", err)
-	}
-
-	return nil
-}
-
-// verifyEvidenceRecord 验证存证记录的完整性
-func (c *Connector) verifyEvidenceRecord(record *struct {
-	TxID        string            `json:"tx_id"`
-	ConnectorID string            `json:"connector_id"`
-	EventType   string            `json:"event_type"`
-	ChannelID   string            `json:"channel_id"`
-	DataHash    string            `json:"data_hash"`
-	Signature   string            `json:"signature"`
-	Timestamp   string            `json:"timestamp"`
-	Metadata    map[string]string `json:"metadata"`
-	Hash        string            `json:"hash"`
-	EventID     string            `json:"event_id"`
-}) error {
-	// 解析时间戳
-	timestamp, err := time.Parse(time.RFC3339Nano, record.Timestamp)
-	if err != nil {
-		return fmt.Errorf("failed to parse timestamp: %w", err)
-	}
-
-	// 重新计算哈希值（与kernel端保持一致）
-	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%d|%s",
-		record.TxID,
-		record.ConnectorID,
-		record.EventType,
-		record.ChannelID,
-		record.DataHash,
-		record.Signature,
-		timestamp.Unix(),
-		record.EventID,
-	)
-
-	// 如果有metadata，包含在哈希中
-	if len(record.Metadata) > 0 {
-		metadataJSON, _ := json.Marshal(record.Metadata)
-		data += "|" + string(metadataJSON)
-	}
-
-	hash := sha256.Sum256([]byte(data))
-	calculatedHash := hex.EncodeToString(hash[:])
-
-	// 比较哈希值
-	if calculatedHash != record.Hash {
-		return fmt.Errorf("hash mismatch: expected %s, got %s", record.Hash, calculatedHash)
-	}
-
-	return nil
-}
-
-// initializeEvidenceStorage 初始化本地存证存储
-func (c *Connector) initializeEvidenceStorage() error {
-	// 检查是否启用本地存证存储
-	if !c.evidenceLocalStorage {
-		return nil // 不启用本地存储
-	}
-
-	// 确定存储目录
-	evidenceDir := c.evidenceStoragePath
-	if evidenceDir == "" {
-		evidenceDir = "./evidence" // 默认路径
-	}
-
-	// 确保存证目录存在
-	if err := os.MkdirAll(evidenceDir, 0755); err != nil {
-		return fmt.Errorf("failed to create evidence directory: %w", err)
-	}
-
-	// 检查存证文件是否存在，如果不存在则创建
-	evidenceFile := filepath.Join(evidenceDir, "evidence.log")
-	if _, err := os.Stat(evidenceFile); os.IsNotExist(err) {
-		file, err := os.OpenFile(evidenceFile, os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return fmt.Errorf("failed to create evidence file: %w", err)
-		}
-		file.Close()
-		log.Printf("✓ Created evidence storage file: %s", evidenceFile)
-	}
-
-	return nil
-}
-
-// storeEvidenceRecord 本地存储存证记录
-func (c *Connector) storeEvidenceRecord(record *struct {
-	TxID        string            `json:"tx_id"`
-	ConnectorID string            `json:"connector_id"`
-	EventType   string            `json:"event_type"`
-	ChannelID   string            `json:"channel_id"`
-	DataHash    string            `json:"data_hash"`
-	Signature   string            `json:"signature"`
-	Timestamp   string            `json:"timestamp"`
-	Metadata    map[string]string `json:"metadata"`
-	Hash        string            `json:"hash"`
-	EventID     string            `json:"event_id"`
-}) error {
-	// 检查是否启用本地存证存储
-	if !c.evidenceLocalStorage {
-		return nil // 不启用本地存储
-	}
-
-	// 验证存证记录的数字签名（可选，但推荐）
-	// 注意：如果连接器ID带有kernel前缀（跨内核场景），跳过签名验证
-	// 源内核已通过mTLS验证连接器身份，接收内核信任源内核的验证结果
-	if record.Signature != "" && !strings.Contains(record.ConnectorID, ":") {
-		// 同内核场景：验证签名
-		timestamp, err := time.Parse(time.RFC3339Nano, record.Timestamp)
-		if err != nil {
-			log.Printf("⚠️  无法解析存证时间戳: %v", err)
-		} else {
-			// 调用内核验证签名
-			valid, message, err := c.verifyEvidenceSignature(record.ConnectorID, record.EventType, record.ChannelID, record.DataHash, record.Signature, timestamp.Unix())
-			if err != nil {
-				log.Printf("⚠️  签名验证调用失败: %v", err)
-			} else if !valid {
-				log.Printf("⚠️  存证记录签名验证失败: %s", message)
-				// 可以选择不存储无效签名的记录
-				return fmt.Errorf("evidence signature verification failed: %s", message)
-			} else {
-				// 减少签名验证成功的详细日志
-			}
-		}
-	} else if strings.Contains(record.ConnectorID, ":") {
-		// 跨内核场景：跳过签名验证（源内核已验证）
-		log.Printf("⚠️  Skipping signature verification for cross-kernel evidence record (connector: %s)", record.ConnectorID)
-	}
-
-	// 确定存储目录
-	evidenceDir := c.evidenceStoragePath
-	if evidenceDir == "" {
-		evidenceDir = "./evidence" // 默认路径
-	}
-
-	evidenceFile := filepath.Join(evidenceDir, "evidence.log")
-
-	file, err := os.OpenFile(evidenceFile, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open evidence file: %w", err)
-	}
-	defer file.Close()
-
-	// 将记录序列化为JSON并写入文件
-	recordData, err := json.Marshal(record)
-	if err != nil {
-		return fmt.Errorf("failed to marshal evidence record: %w", err)
-	}
-
-	if _, err := file.Write(append(recordData, '\n')); err != nil {
-		return fmt.Errorf("failed to write evidence record: %w", err)
-	}
-
-	// 减少本地存储成功的日志输出
 	return nil
 }
 
@@ -791,7 +472,7 @@ func (c *Connector) CloseChannel(channelID string) error {
 		return fmt.Errorf("close channel failed: %s", resp.Message)
 	}
 
-	log.Printf("✓ Channel closed: %s", channelID)
+	log.Printf("[OK] Channel closed: %s", channelID)
 	return nil
 }
 
@@ -814,7 +495,7 @@ func (c *Connector) SubmitEvidence(eventType, channelID, dataHash, signature str
 		return "", fmt.Errorf("evidence not committed: %s", resp.Message)
 	}
 
-	log.Printf("✓ Evidence committed: %s", resp.EvidenceTxId)
+	log.Printf("[OK] Evidence committed: %s", resp.EvidenceTxId)
 	return resp.EvidenceTxId, nil
 }
 
@@ -851,7 +532,7 @@ func (c *Connector) queryEvidenceWithRequest(req *pb.QueryRequest) ([]*pb.Eviden
 		return nil, fmt.Errorf("failed to query evidence: %w", err)
 	}
 
-	log.Printf("✓ Found %d evidence records", resp.TotalCount)
+	log.Printf("[OK] Found %d evidence records", resp.TotalCount)
 	return resp.Logs, nil
 }
 
@@ -1020,7 +701,7 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 
 						log.Printf("📢 频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
 							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
-						log.Printf("✓ 您可以开始发送数据: 'sendto %s <data>'", notification.ChannelId)
+						log.Printf("[OK] 您可以开始发送数据: 'sendto %s <data>'", notification.ChannelId)
 					} else if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_REJECTED {
 						// 频道提议已被拒绝
 						log.Printf("❌ 频道提议已被拒绝: %s (创建者: %s)",
@@ -1075,86 +756,40 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
 
 					// 自动订阅逻辑
-						go func(chID string, isEvidence bool, isControl bool) {
-							if isEvidence {
-								// 存证频道的特殊处理
-								err := c.ReceiveEvidenceData(chID)
-								if err != nil {
-									log.Printf("❌ 存证频道自动订阅失败: %v", err)
-								} else {
-									log.Printf("✓ 存证频道 %s 已关闭", chID)
-								}
-							} else if isControl {
-								// 控制频道的特殊处理
-								err := c.ReceiveControlData(chID)
-								if err != nil {
-									log.Printf("❌ 控制频道自动订阅失败: %v", err)
-								} else {
-									log.Printf("✓ 控制频道 %s 已关闭", chID)
+					go func(chID string) {
+						// 创建文件接收器（用于自动接收文件）
+						outputDir := "./received"
+						if err := os.MkdirAll(outputDir, 0755); err != nil {
+							log.Printf("⚠ 创建接收目录失败: %v", err)
+						}
+						fileReceiver := NewFileReceiver(outputDir, func(filePath, fileHash string) {
+							log.Printf("[OK] 文件自动接收并保存成功: %s (哈希: %s)", filePath, fileHash)
+							fmt.Printf("\n[OK] 文件自动接收并保存成功:\n")
+							fmt.Printf("  文件路径: %s\n", filePath)
+							fmt.Printf("  文件哈希: %s\n", fileHash)
+						})
+
+						// 自动订阅并接收数据
+						err := c.ReceiveData(chID, func(packet *pb.DataPacket) error {
+							// 检查是否是文件传输数据包
+							if IsFileTransferPacket(packet.Payload) {
+								// 处理文件传输数据包
+								if err := fileReceiver.HandleFilePacket(packet); err != nil {
+									log.Printf("⚠ 处理文件数据包失败: %v", err)
 								}
 							} else {
-								// 普通数据频道的处理
-								// 创建文件接收器（用于自动接收文件）
-								outputDir := "./received"
-								if err := os.MkdirAll(outputDir, 0755); err != nil {
-									log.Printf("⚠ 创建接收目录失败: %v", err)
-								}
-								fileReceiver := NewFileReceiver(outputDir, func(filePath, fileHash string) {
-									log.Printf("✓ 文件自动接收并保存成功: %s (哈希: %s)", filePath, fileHash)
-									fmt.Printf("\n✓ 文件自动接收并保存成功:\n")
-									fmt.Printf("  文件路径: %s\n", filePath)
-									fmt.Printf("  文件哈希: %s\n", fileHash)
-								})
-
-								// 自动订阅并接收数据
-								err := c.ReceiveData(chID, func(packet *pb.DataPacket) error {
-									// 检查是否是文件传输数据包
-									if IsFileTransferPacket(packet.Payload) {
-										// 处理文件传输数据包
-										if err := fileReceiver.HandleFilePacket(packet); err != nil {
-											log.Printf("⚠ 处理文件数据包失败: %v", err)
-										}
-									} else {
-										// 普通数据包，显示文本
-										payloadStr := string(packet.Payload)
-
-										// 检查是否是存证数据（JSON格式且包含特定字段）
-										isEvidenceData := strings.Contains(payloadStr, `"event_type"`) &&
-											strings.Contains(payloadStr, `"tx_id"`) &&
-											strings.Contains(payloadStr, `"signature"`)
-
-										if isEvidenceData {
-											// 存证数据，简化显示
-											var evidenceBrief struct {
-												EventType   string `json:"event_type"`
-												ConnectorID string `json:"connector_id"`
-												TxID        string `json:"tx_id"`
-											}
-											if err := json.Unmarshal(packet.Payload, &evidenceBrief); err == nil {
-												log.Printf("📋 [频道: %s, 序列号: %d] 存证记录: %s (%s) - TxID: %s",
-													chID, packet.SequenceNumber, evidenceBrief.EventType,
-													evidenceBrief.ConnectorID, evidenceBrief.TxID[:8]+"...")
-												fmt.Printf("📋 [序列号: %d] 存证记录: %s (%s)\n",
-													packet.SequenceNumber, evidenceBrief.EventType, evidenceBrief.ConnectorID)
-											} else {
-												log.Printf("📋 [频道: %s, 序列号: %d] 存证数据 (%d bytes)", chID, packet.SequenceNumber, len(packet.Payload))
-												fmt.Printf("📋 [序列号: %d] 存证数据 (%d bytes)\n", packet.SequenceNumber, len(packet.Payload))
-											}
-										} else {
-											// 普通数据，显示完整内容
-											log.Printf("📦 [频道: %s, 序列号: %d] 数据: %s", chID, packet.SequenceNumber, payloadStr)
-											fmt.Printf("📦 [序列号: %d] 数据: %s\n", packet.SequenceNumber, payloadStr)
-										}
-									}
-									return nil
-								})
-								if err != nil {
-									log.Printf("❌ 自动订阅失败: %v", err)
-								} else {
-									log.Printf("✓ 频道 %s 已关闭", chID)
-								}
+								// 普通数据包，显示文本
+								log.Printf("📦 [频道: %s, 序列号: %d] 数据: %s", chID, packet.SequenceNumber, string(packet.Payload))
+								fmt.Printf("📦 [序列号: %d] 数据: %s\n", packet.SequenceNumber, string(packet.Payload))
 							}
-						}(notification.ChannelId, false, false)
+							return nil
+						})
+						if err != nil {
+							log.Printf("❌ 自动订阅失败: %v", err)
+						} else {
+							log.Printf("[OK] 频道 %s 已关闭", chID)
+						}
+					}(notification.ChannelId)
 					} else if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_REJECTED {
 						// 频道提议已被拒绝
 						log.Printf("❌ 频道提议已被拒绝: %s (创建者: %s)",
@@ -1365,7 +1000,7 @@ func (c *Connector) RequestPermissionChange(channelID, changeType, targetID, rea
 		return nil, fmt.Errorf("failed to request permission change: %w", err)
 	}
 
-	log.Printf("✓ Permission change request submitted: %s", resp.RequestId)
+	log.Printf("[OK] Permission change request submitted: %s", resp.RequestId)
 	return resp, nil
 }
 
@@ -1382,7 +1017,7 @@ func (c *Connector) ApprovePermissionChange(channelID, requestID string) (*pb.Ap
 
 	// 只有在服务器返回成功时才打印成功日志
 	if resp.Success {
-		log.Printf("✓ Permission change approved: %s", requestID)
+		log.Printf("[OK] Permission change approved: %s", requestID)
 	} else {
 		log.Printf("✗ Permission change approval failed: %s", resp.Message)
 	}
@@ -1401,7 +1036,7 @@ func (c *Connector) RejectPermissionChange(channelID, requestID, reason string) 
 		return nil, fmt.Errorf("failed to reject permission change: %w", err)
 	}
 
-	log.Printf("✓ Permission change rejected: %s", requestID)
+	log.Printf("[OK] Permission change rejected: %s", requestID)
 	return resp, nil
 }
 
@@ -1415,7 +1050,7 @@ func (c *Connector) GetPermissionRequests(channelID string) (*pb.GetPermissionRe
 		return nil, fmt.Errorf("failed to get permission requests: %w", err)
 	}
 
-	log.Printf("✓ Retrieved %d permission requests", len(resp.Requests))
+	log.Printf("[OK] Retrieved %d permission requests", len(resp.Requests))
 	return resp, nil
 }
 
@@ -1496,7 +1131,7 @@ func (c *Connector) CreateChannelFromConfig(configFilePath string) (*ChannelConf
 		}
 		if !alreadyInReceivers {
 			config.ReceiverIDs = append(config.ReceiverIDs, externalConnectorID)
-			log.Printf("✓ 外部存证连接器 %s 已自动添加到接收方列表", externalConnectorID)
+			log.Printf("[OK] 外部存证连接器 %s 已自动添加到接收方列表", externalConnectorID)
 		}
 	}
 
@@ -1536,7 +1171,7 @@ func (c *Connector) CreateChannelFromConfig(configFilePath string) (*ChannelConf
 		return nil, fmt.Errorf("failed to propose channel: %s", resp.Message)
 	}
 
-	log.Printf("✓ Channel created from config file: %s (%s)", config.ChannelName, configFilePath)
+	log.Printf("[OK] Channel created from config file: %s (%s)", config.ChannelName, configFilePath)
 	return &config, nil
 }
 
@@ -1582,7 +1217,7 @@ func (c *Connector) ProposeChannel(senderIDs []string, receiverIDs []string, dat
 		return "", "", fmt.Errorf("channel proposal failed: %s", resp.Message)
 	}
 
-	log.Printf("✓ Channel proposed: %s (proposal: %s)", resp.ChannelId, resp.ProposalId)
+	log.Printf("[OK] Channel proposed: %s (proposal: %s)", resp.ChannelId, resp.ProposalId)
 
 	// 创建者自动接受提议
 	if resp.ProposalId != "" {
@@ -1590,7 +1225,7 @@ func (c *Connector) ProposeChannel(senderIDs []string, receiverIDs []string, dat
 			log.Printf("⚠ 创建者自动接受提议失败: %v", err)
 			// 不返回错误，继续执行，因为提议已经创建成功
 		} else {
-			log.Printf("✓ 创建者已自动接受频道提议: %s", resp.ChannelId)
+			log.Printf("[OK] 创建者已自动接受频道提议: %s", resp.ChannelId)
 		}
 	}
 
@@ -1629,7 +1264,7 @@ func (c *Connector) AcceptChannelProposal(channelID, proposalID string) error {
 		return fmt.Errorf("accept channel proposal failed: %s", resp.Message)
 	}
 
-	log.Printf("✓ Channel proposal accepted: %s (evidence hash: %s)", channelID, proposalID)
+	log.Printf("[OK] Channel proposal accepted: %s (evidence hash: %s)", channelID, proposalID)
 
 	// 注意：频道可能还没有完全激活（需要所有参与方确认）
 	// 状态更新将通过通知机制异步处理
@@ -1653,7 +1288,7 @@ func (c *Connector) RejectChannelProposal(channelID, proposalID, reason string) 
 		return fmt.Errorf("reject channel proposal failed: %s", resp.Message)
 	}
 
-	log.Printf("✓ Channel proposal rejected: %s", channelID)
+	log.Printf("[OK] Channel proposal rejected: %s", channelID)
 
 	// 从本地记录中移除频道
 	c.removeLocalChannel(channelID)
@@ -1824,7 +1459,7 @@ func (c *Connector) SendFile(channelID string, filePath string, targetIDs []stri
 		}
 
 		sequence++
-		log.Printf("  ✓ 已发送块 %d/%d", chunkIndex+1, totalChunks)
+		log.Printf("  [OK] 已发送块 %d/%d", chunkIndex+1, totalChunks)
 	}
 
 	// 发送文件尾
@@ -1862,7 +1497,7 @@ func (c *Connector) SendFile(channelID string, filePath string, targetIDs []stri
 		return fmt.Errorf("failed to close send: %w", err)
 	}
 
-	log.Printf("✓ 文件发送完成: %s", fileName)
+	log.Printf("[OK] 文件发送完成: %s", fileName)
 	return nil
 }
 
@@ -1975,7 +1610,7 @@ func (fr *FileReceiver) handleFileChunk(jsonData []byte) error {
 
 	fr.transfersMu.Unlock()
 
-	log.Printf("  ✓ 已接收块 %d/%d (文件: %s)", chunk.ChunkIndex+1, totalChunks, fileName)
+	log.Printf("  [OK] 已接收块 %d/%d (文件: %s)", chunk.ChunkIndex+1, totalChunks, fileName)
 
 	// 检查是否接收完所有块
 	if receivedChunks >= totalChunks {
@@ -2008,7 +1643,7 @@ func (fr *FileReceiver) handleFileEnd(jsonData []byte) error {
 					info, err := file.Info()
 					if err == nil && time.Since(info.ModTime()) < 30*time.Second {
 						fr.transfersMu.Unlock()
-						log.Printf("✓ 检测到最近完成的文件传输，忽略重复的FileEnd包 (传输ID: %s, 文件: %s)", end.TransferID, file.Name())
+						log.Printf("[OK] 检测到最近完成的文件传输，忽略重复的FileEnd包 (传输ID: %s, 文件: %s)", end.TransferID, file.Name())
 						return nil
 					}
 				}
@@ -2097,7 +1732,7 @@ func (fr *FileReceiver) assembleFile(transferID string) error {
 		return fmt.Errorf("file hash mismatch: expected %s, got %s", fileHash, receivedHash)
 	}
 
-	log.Printf("✓ 文件接收完成: %s (大小: %d 字节, 哈希验证通过)", outputPath, fileSize)
+	log.Printf("[OK] 文件接收完成: %s (大小: %d 字节, 哈希验证通过)", outputPath, fileSize)
 
 	// 调用完成回调
 	if fr.onComplete != nil {
@@ -2121,29 +1756,6 @@ func IsControlMessage(payload []byte) bool {
 		strings.Contains(payloadStr, `"timestamp":`)
 }
 
-// verifyEvidenceSignature 验证存证记录的数字签名
-func (c *Connector) verifyEvidenceSignature(connectorID, eventType, channelID, dataHash, signature string, timestamp int64) (bool, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// 调用内核的签名验证服务
-	resp, err := c.evidenceSvc.VerifyEvidenceSignature(ctx, &pb.VerifySignatureRequest{
-		RequesterId: c.connectorID, // 使用当前连接器的ID作为请求者
-		ConnectorId: connectorID,
-		EventType:   eventType,
-		ChannelId:   channelID,
-		DataHash:    dataHash,
-		Signature:   signature,
-		Timestamp:   timestamp,
-	})
-
-	if err != nil {
-		return false, "", fmt.Errorf("failed to verify signature: %w", err)
-	}
-
-	return resp.Valid, resp.Message, nil
-}
-
 // IsChannelParticipant 检查当前连接器是否是指定频道的参与者
 func (c *Connector) IsChannelParticipant(channelID string) (bool, error) {
 	c.channelsMu.RLock()
@@ -2162,30 +1774,7 @@ func (c *Connector) IsChannelParticipant(channelID string) (bool, error) {
 	return false, nil
 }
 
-// isEvidenceChannel 检查是否为存证频道
-func (c *Connector) isEvidenceChannel(channelID string) bool {
-	c.channelsMu.RLock()
-	defer c.channelsMu.RUnlock()
-
-	channel, exists := c.channels[channelID]
-	if !exists {
-		return false
-	}
-
-	return channel.IsEvidenceChannel
-}
-
 // isControlChannel 函数已移除，在统一频道模式下不再需要
-
-// isEvidenceData 检查数据包是否为证据数据
-func (c *Connector) isEvidenceData(payload []byte) bool {
-	payloadStr := string(payload)
-
-	// 检查是否包含证据数据的特征字段
-	return strings.Contains(payloadStr, `"event_type"`) &&
-		strings.Contains(payloadStr, `"tx_id"`) &&
-		strings.Contains(payloadStr, `"signature"`)
-}
 
 // isControlMessage 检查是否为控制消息
 func (c *Connector) isControlMessage(payload []byte) bool {
@@ -2222,7 +1811,7 @@ func (c *Connector) RequestChannelAccess(channelID, role, reason string) error {
 		return fmt.Errorf("subscription request failed: %s", resp.Message)
 	}
 
-	log.Printf("✓ Subscription request submitted for channel %s (request ID: %s)", channelID, resp.RequestId)
+	log.Printf("[OK] Subscription request submitted for channel %s (request ID: %s)", channelID, resp.RequestId)
 	return nil
 }
 

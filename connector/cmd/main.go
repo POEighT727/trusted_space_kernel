@@ -42,11 +42,6 @@ type Config struct {
 		ServerName     string `yaml:"server_name"`
 	} `yaml:"security"`
 
-	Evidence struct {
-		LocalStorage bool   `yaml:"local_storage"` // 是否启用本地存证存储
-		StoragePath  string `yaml:"storage_path"`  // 本地存证存储路径
-	} `yaml:"evidence"`
-
 	Channel struct {
 		ConfigDir string `yaml:"config_dir"` // 频道配置文件目录
 	} `yaml:"channel"`
@@ -102,7 +97,7 @@ func main() {
 			log.Fatalf("保存CA证书失败: %v", err)
 		}
 		
-		fmt.Println("✓ 证书已保存")
+		fmt.Println("[OK] 证书已保存")
 	}
 
 	// 创建连接器
@@ -127,8 +122,6 @@ func main() {
 		ClientCertPath: config.Security.ClientCertPath,
 		ClientKeyPath:  config.Security.ClientKeyPath,
 		ServerName:     config.Security.ServerName,
-		EvidenceLocalStorage: config.Evidence.LocalStorage,
-		EvidenceStoragePath:  config.Evidence.StoragePath,
 		KernelID: func() string {
 			if config.Kernel.ID != "" {
 				return config.Kernel.ID
@@ -153,7 +146,7 @@ func main() {
 	if err := os.MkdirAll(channelConfigDir, 0755); err != nil {
 		log.Fatalf("Failed to create channel config directory %s: %v", channelConfigDir, err)
 	}
-	fmt.Printf("✓ 频道配置目录已创建: %s\n", channelConfigDir)
+	fmt.Printf("[OK] 频道配置目录已创建: %s\n", channelConfigDir)
 
 	// 将配置目录路径存储在连接器中（如果需要的话）
 	// 这里可以考虑将channelConfigDir传递给连接器客户端
@@ -164,7 +157,7 @@ func main() {
 		log.Fatalf("连接失败: %v", err)
 	}
 
-	fmt.Printf("✓ 连接成功！连接器ID: %s\n", config.Connector.ID)
+	fmt.Printf("[OK] 连接成功！连接器ID: %s\n", config.Connector.ID)
 	
 	// 启动自动通知监听（所有连接器都会自动等待频道创建通知）
 	fmt.Println("正在启动自动通知监听...")
@@ -207,10 +200,10 @@ func main() {
 	}); err != nil {
 		log.Printf("⚠ 启动自动通知监听失败: %v", err)
 	} else {
-		fmt.Println("✓ 自动通知监听已启动（连接器状态: active，将自动订阅频道）")
+		fmt.Println("[OK] 自动通知监听已启动（连接器状态: active，将自动订阅频道）")
 	}
 	
-	fmt.Println("✓ 已进入交互模式，输入 'help' 查看可用命令")
+	fmt.Println("[OK] 已进入交互模式，输入 'help' 查看可用命令")
 	fmt.Println()
 
 	// 优雅关闭
@@ -372,7 +365,7 @@ func handleList(connector *client.Connector) {
 		// 合并连接器列表
 		allConnectors := append(connectors, crossConnectors...)
 		connectors = allConnectors
-		fmt.Printf("✓ 包含 %d 个跨内核连接器\n", len(crossConnectors))
+		fmt.Printf("[OK] 包含 %d 个跨内核连接器\n", len(crossConnectors))
 	}
 
 	if len(connectors) == 0 {
@@ -525,7 +518,7 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 				fmt.Printf("❌ 创建频道失败: %v\n", err)
 				return
 			}
-			fmt.Printf("✓ 频道创建提议已提交\n")
+			fmt.Printf("[OK] 频道创建提议已提交\n")
 			fmt.Printf("  频道名称: %s\n", config.ChannelName)
 			fmt.Printf("  创建者: %s\n", config.CreatorID)
 			fmt.Printf("  发送方: %v\n", config.SenderIDs)
@@ -568,7 +561,7 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 			fmt.Printf("❌ 跨内核频道创建失败: %v\n", err)
 			return
 		}
-		fmt.Printf("✓ 跨内核频道已创建: %s\n", chID)
+		fmt.Printf("[OK] 跨内核频道已创建: %s\n", chID)
 		return
 	}
 
@@ -579,7 +572,7 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 		return
 	}
 
-	fmt.Printf("✓ 频道创建提议已提交\n")
+	fmt.Printf("[OK] 频道创建提议已提交\n")
 	fmt.Printf("  频道名称: %s\n", config.ChannelName)
 	fmt.Printf("  创建者: %s\n", config.CreatorID)
 	fmt.Printf("  发送方: %v\n", config.SenderIDs)
@@ -687,7 +680,7 @@ func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 			fmt.Printf("❌ 跨内核频道创建失败: %v\n", err)
 			return
 		}
-		fmt.Printf("✓ 跨内核频道已创建: %s\n", chID)
+		fmt.Printf("[OK] 跨内核频道已创建: %s\n", chID)
 		// 本地记录将在通知中异步完成
 	} else {
 		channelID, proposalID, err := connector.ProposeChannel(senderIDs, receiverIDs, "", approverID, reason)
@@ -696,7 +689,7 @@ func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 			return
 		}
 
-		fmt.Printf("✓ 频道提议创建成功\n")
+		fmt.Printf("[OK] 频道提议创建成功\n")
 		fmt.Printf("  频道ID: %s\n", channelID)
 		fmt.Printf("  提议ID: %s\n", proposalID)
 		// 显示需要哪些参与方确认（创建者自动接受，不需要确认）
@@ -758,7 +751,7 @@ func handleAcceptProposal(connector *client.Connector, args []string) {
 		return
 	}
 
-	fmt.Printf("✓ 已确认频道提议 %s\n", proposalID)
+	fmt.Printf("[OK] 已确认频道提议 %s\n", proposalID)
 	fmt.Println("  等待其他参与方确认，频道将自动激活...")
 }
 
@@ -786,7 +779,7 @@ func handleRejectProposal(connector *client.Connector, args []string) {
 		return
 	}
 
-	fmt.Printf("✓ 频道提议已拒绝，频道将被关闭: %s\n", reason)
+	fmt.Printf("[OK] 频道提议已拒绝，频道将被关闭: %s\n", reason)
 }
 
 // handleCreateChannel removed - direct channel creation is not allowed
@@ -869,7 +862,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 		return
 	}
 
-	fmt.Printf("✓ 频道状态验证通过，可以发送数据\n")
+	fmt.Printf("[OK] 频道状态验证通过，可以发送数据\n")
 
 	// 检查第二个参数是否是文件路径
 	if len(args) >= 2 {
@@ -900,7 +893,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 					return
 				}
 
-				fmt.Printf("✓ 文件发送成功: %s\n", filePath)
+				fmt.Printf("[OK] 文件发送成功: %s\n", filePath)
 				return
 			}
 		}
@@ -921,7 +914,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 	fmt.Println("发送格式: <数据> (广播给所有订阅者) 或 @<接收者ID> <数据> (指定接收者)")
 	fmt.Println("输入 'END' 结束发送")
 
-	fmt.Println("✓ 实时发送已就绪，开始输入数据...")
+	fmt.Println("[OK] 实时发送已就绪，开始输入数据...")
 
 	// 读取并实时发送数据
 	scanner := bufio.NewScanner(os.Stdin)
@@ -978,9 +971,9 @@ func handleSendTo(connector *client.Connector, args []string) {
 
 		packetCount++
 		if len(targetIDs) > 0 {
-			fmt.Printf("✓ [%d] 已发送到 %v: %s\n", packetCount, targetIDs, data)
+			fmt.Printf("[OK] [%d] 已发送到 %v: %s\n", packetCount, targetIDs, data)
 		} else {
-			fmt.Printf("✓ [%d] 已广播: %s\n", packetCount, data)
+			fmt.Printf("[OK] [%d] 已广播: %s\n", packetCount, data)
 		}
 	}
 
@@ -989,7 +982,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 		return
 	}
 
-	fmt.Printf("✓ 共发送 %d 条数据\n", packetCount)
+	fmt.Printf("[OK] 共发送 %d 条数据\n", packetCount)
 }
 
 // handleSubscribe 处理订阅频道命令
@@ -1065,7 +1058,7 @@ func handleSubscribe(connector *client.Connector, args []string) {
 
 	if isParticipant {
 		// 已经是频道参与者，直接订阅
-		fmt.Printf("✓ 您已经是频道 %s 的参与者，正在订阅...\n", channelID)
+		fmt.Printf("[OK] 您已经是频道 %s 的参与者，正在订阅...\n", channelID)
 	} else {
 		// 不是频道参与者，需要申请加入
 		if role == "" {
@@ -1084,14 +1077,14 @@ func handleSubscribe(connector *client.Connector, args []string) {
 			return
 		}
 
-		fmt.Println("✓ 加入申请已发送，等待审批...")
+		fmt.Println("[OK] 加入申请已发送，等待审批...")
 		fmt.Println("   审批通过后您将自动获得订阅权限")
 		return
 	}
 
 	// 创建文件接收器
 	fileReceiver := client.NewFileReceiver(outputDir, func(filePath, fileHash string) {
-		fmt.Printf("\n✓ 文件接收并保存成功:\n")
+		fmt.Printf("\n[OK] 文件接收并保存成功:\n")
 		fmt.Printf("  文件路径: %s\n", filePath)
 		fmt.Printf("  文件哈希: %s\n", fileHash)
 	})
@@ -1144,11 +1137,11 @@ func handleSubscribe(connector *client.Connector, args []string) {
 		if err != nil {
 			fmt.Printf("❌ 接收失败: %v\n", err)
 		} else {
-			fmt.Printf("✓ 频道 %s 已关闭\n", channelID)
+			fmt.Printf("[OK] 频道 %s 已关闭\n", channelID)
 		}
 	}()
 
-	fmt.Println("✓ 已订阅，等待数据... (输入任意命令继续)")
+	fmt.Println("[OK] 已订阅，等待数据... (输入任意命令继续)")
 }
 
 // handleStatus 处理状态命令
@@ -1172,7 +1165,7 @@ func handleStatus(connector *client.Connector, args []string) {
 		return
 	}
 
-	fmt.Printf("✓ 连接器状态已设置为: %s\n", newStatus)
+	fmt.Printf("[OK] 连接器状态已设置为: %s\n", newStatus)
 	if newStatus == "active" {
 		fmt.Println("  → 连接器将自动订阅新创建的频道")
 	} else {
@@ -1227,7 +1220,7 @@ func handleRequestPermission(connector *client.Connector, args []string) {
 		return
 	}
 
-	fmt.Printf("✓ 权限变更申请已提交\n")
+	fmt.Printf("[OK] 权限变更申请已提交\n")
 	fmt.Printf("  请求ID: %s\n", resp.RequestId)
 	fmt.Println("  等待批准者审批...")
 }
@@ -1250,7 +1243,7 @@ func handleApprovePermission(connector *client.Connector, args []string) {
 		// 如果权限变更批准失败，尝试批准订阅申请（作为备用方案）
 		resp, err := connector.ApproveChannelSubscription(channelID, requestID)
 		if err == nil && resp.Success {
-			fmt.Printf("✓ 订阅申请已批准: %s\n", requestID)
+			fmt.Printf("[OK] 订阅申请已批准: %s\n", requestID)
 			fmt.Println("  申请者现在可以订阅该频道")
 			return
 		}
@@ -1263,7 +1256,7 @@ func handleApprovePermission(connector *client.Connector, args []string) {
 		// 权限变更批准失败，尝试订阅申请
 		resp, err := connector.ApproveChannelSubscription(channelID, requestID)
 		if err == nil && resp.Success {
-			fmt.Printf("✓ 订阅申请已批准: %s\n", requestID)
+			fmt.Printf("[OK] 订阅申请已批准: %s\n", requestID)
 			fmt.Println("  申请者现在可以订阅该频道")
 			return
 		}
@@ -1272,7 +1265,7 @@ func handleApprovePermission(connector *client.Connector, args []string) {
 		return
 	}
 
-	fmt.Printf("✓ 权限变更已批准: %s\n", requestID)
+	fmt.Printf("[OK] 权限变更已批准: %s\n", requestID)
 }
 
 // handleRejectPermission 处理拒绝权限变更/订阅申请命令
@@ -1291,7 +1284,7 @@ func handleRejectPermission(connector *client.Connector, args []string) {
 	// 首先尝试拒绝订阅申请（如果适用）
 	resp, err := connector.RejectChannelSubscription(channelID, requestID, reason)
 	if err == nil && resp.Success {
-		fmt.Printf("✓ 订阅申请已拒绝: %s\n", requestID)
+		fmt.Printf("[OK] 订阅申请已拒绝: %s\n", requestID)
 		fmt.Printf("  拒绝理由: %s\n", reason)
 		return
 	}
@@ -1308,7 +1301,7 @@ func handleRejectPermission(connector *client.Connector, args []string) {
 		return
 	}
 
-	fmt.Printf("✓ 权限变更已拒绝: %s\n", requestID)
+	fmt.Printf("[OK] 权限变更已拒绝: %s\n", requestID)
 	fmt.Printf("  拒绝理由: %s\n", reason)
 }
 
