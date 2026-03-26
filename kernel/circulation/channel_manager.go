@@ -37,6 +37,7 @@ const (
 	MessageTypeData     MessageType = "data"     // 业务数据消息
 	MessageTypeControl  MessageType = "control"  // 控制消息
 	MessageTypeEvidence MessageType = "evidence" // 存证数据消息
+	MessageTypeAck      MessageType = "ack"      // ACK 消息
 )
 
 // ChannelProposal 频道提议信息
@@ -139,9 +140,13 @@ type DataPacket struct {
 	Timestamp      int64
 	SenderID       string     // 发送方ID
 	TargetIDs      []string   // 目标接收者ID列表（为空则广播给所有订阅者）
-	MessageType    MessageType // 消息类型（数据/控制/存证）
+	MessageType    MessageType // 消息类型（数据/控制/存证/ack）
 	FlowID         string    // 业务流程ID，用于跟踪完整的数据传输过程
 	IsFinal        bool      // 是否是最后一个数据包（流结束标志）
+	DataHash       string    // 业务数据哈希（由内核计算并填充）
+	// ACK 专用字段
+	IsAck          bool      // 是否是 ACK 数据包
+	AckPrevSignature string  // ACK 中 prev_signature（上一跳签名）
 }
 
 // PermissionChangeRequest 权限变更请求
@@ -1261,6 +1266,8 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		// fall through to normal subscriber distribution
 	} else if packet.MessageType == MessageTypeEvidence {
 		// 证据消息由内核发送，不应该被阻止，跳过验证
+	} else if packet.MessageType == MessageTypeAck {
+		// ACK 消息由内核转发，不应该被阻止，跳过验证
 	} else {
 		// 验证发送方是否有权限发送
 		if !c.CanSend(packet.SenderID) {
@@ -1292,7 +1299,9 @@ func (c *Channel) PushData(packet *DataPacket) error {
 				connectorPart := parts[1]
 				remoteTargetsByKernel[kernelPart] = append(remoteTargetsByKernel[kernelPart], connectorPart)
 			} else {
-				if c.CanReceive(targetID) {
+				// ACK 消息需要发送给原始发送方（发送方不是接收方，CanReceive 返回 false）
+				// 绕过 CanReceive 检查，直接添加到本地目标
+				if c.CanReceive(targetID) || packet.IsAck {
 					localTargets = append(localTargets, targetID)
 					if _, subscribed := c.subscribers[targetID]; !subscribed {
 						if c.manager != nil && !c.manager.IsConnectorOnline(targetID) {
@@ -1437,8 +1446,9 @@ func (c *Channel) PushData(packet *DataPacket) error {
 	shouldBuffer := false
 	if len(packet.TargetIDs) > 0 {
 		// 检查指定的目标接收者是否有未订阅但在线的
+		// ACK 消息的目标是发送方（CanReceive 返回 false），也参与缓冲判断
 		for _, targetID := range packet.TargetIDs {
-			if c.CanReceive(targetID) {
+			if c.CanReceive(targetID) || packet.IsAck {
 				if _, subscribed := c.subscribers[targetID]; !subscribed {
 					// 只有在线但未订阅的才需要频道级别缓冲
 					if c.manager == nil || c.manager.IsConnectorOnline(targetID) {
@@ -1541,7 +1551,7 @@ func (c *Channel) PushData(packet *DataPacket) error {
 			}
 
 			if err := c.manager.forwardToKernel(actualTargetKernel, outPacket, packet.IsFinal); err != nil {
-				log.Printf("⚠ Failed to forward packet to kernel %s: %v", actualTargetKernel, err)
+				log.Printf("[WARN] Failed to forward packet to kernel %s: %v", actualTargetKernel, err)
 			} else {
 				log.Printf("[OK] Successfully forwarded packet to kernel %s (actual target: %s)", actualTargetKernel, rk)
 			}
@@ -1596,7 +1606,7 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 	go func() {
 		for _, packet := range allBufferedPackets {
 			// 检查是否应该发送给此订阅者
-			if shouldSendToSubscriber(packet, subscriberID) {
+			if c.shouldSendToSubscriber(packet, subscriberID) {
 				select {
 				case subChan <- packet:
 					// 成功发送暂存数据
@@ -1612,7 +1622,28 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 }
 
 // shouldSendToSubscriber 判断是否应该将数据包发送给订阅者
-func shouldSendToSubscriber(packet *DataPacket, subscriberID string) bool {
+func (c *Channel) shouldSendToSubscriber(packet *DataPacket, subscriberID string) bool {
+	// 不发送给发送方自己
+	if subscriberID == packet.SenderID {
+		return false
+	}
+
+	// 不发送给其他发送方（业务数据只应流向接收方）
+	// 只有 ACK 消息和证据消息才需要发送给发送方（用于确认）
+	if !packet.IsAck && packet.MessageType != MessageTypeEvidence {
+		for _, senderID := range c.SenderIDs {
+			// 处理跨内核格式 (kernelID:connectorID -> connectorID)
+			checkID := senderID
+			if strings.Contains(senderID, ":") {
+				parts := strings.SplitN(senderID, ":", 2)
+				checkID = parts[1]
+			}
+			if checkID == subscriberID {
+				return false
+			}
+		}
+	}
+
 	// 如果目标列表为空，广播给所有订阅者
 	if len(packet.TargetIDs) == 0 {
 		return true
@@ -1658,7 +1689,7 @@ func (c *Channel) startDataDistribution() {
 		// 分发到订阅者（根据目标列表）
 		for subscriberID, subChan := range subscribers {
 			// 检查是否应该发送给此订阅者
-			if shouldSendToSubscriber(packet, subscriberID) {
+			if c.shouldSendToSubscriber(packet, subscriberID) {
 				select {
 				case subChan <- packet:
 					// 成功发送
@@ -1700,9 +1731,9 @@ func (c *Channel) SubscribeWithRecovery(subscriberID string, isRestartRecovery b
 		return nil, fmt.Errorf("channel is not active")
 	}
 
-	// 验证订阅者是否是接收方
-	if !c.CanReceive(subscriberID) {
-		return nil, fmt.Errorf("subscriber %s is not authorized to receive data from this channel", subscriberID)
+	// 验证订阅者是参与者（sender 或 receiver 都可以订阅，用于接收数据和 ACK）
+	if !c.IsParticipant(subscriberID) {
+		return nil, fmt.Errorf("subscriber %s is not a participant of this channel", subscriberID)
 	}
 
 	// 检查是否已订阅
@@ -1789,7 +1820,7 @@ func (cm *ChannelManager) MarkConnectorOffline(connectorID string) {
 	defer cm.connectorMu.Unlock()
 
 	cm.connectorStatus[connectorID] = ConnectorStatusOffline
-	log.Printf("📴 Connector %s marked as offline", connectorID)
+	log.Printf("[INFO] Connector %s marked as offline", connectorID)
 }
 
 // IsConnectorOnline 检查连接器是否在线
@@ -2451,7 +2482,7 @@ func (c *Channel) StorePermissionRequestFromRemote(permReq *PermissionRequestMes
 	// 检查请求是否已经存在（避免重复存储）
 	for _, req := range c.permissionRequests {
 		if req.RequestID == permReq.RequestID {
-			log.Printf("ℹ️ Permission request %s already exists locally, skipping", permReq.RequestID)
+			log.Printf("[INFO] Permission request %s already exists locally, skipping", permReq.RequestID)
 			return
 		}
 	}
@@ -2668,7 +2699,7 @@ func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
 
 		msgBytes, err := json.Marshal(msg)
 		if err != nil {
-			log.Printf("⚠ Failed to marshal channel update message: %v", err)
+			log.Printf("[WARN] Failed to marshal channel update message: %v", err)
 			continue
 		}
 
@@ -2680,7 +2711,7 @@ func (c *Channel) notifyRemoteKernelsOfChannelUpdate() {
 		}
 
 		if err := c.manager.forwardToKernel(kernelID, packet, false); err != nil {
-			log.Printf("⚠ Failed to notify kernel %s of channel update: %v", kernelID, err)
+			log.Printf("[WARN] Failed to notify kernel %s of channel update: %v", kernelID, err)
 		} else {
 			log.Printf("[OK] Notified kernel %s of channel update for channel %s", kernelID, c.ChannelID)
 		}
@@ -2796,7 +2827,7 @@ func (c *Channel) broadcastChannelProposal(proposal *ChannelProposal) {
 func (c *Channel) sendControlMessage(channel *Channel, message ControlMessage) {
 	messageData, err := json.Marshal(message)
 	if err != nil {
-		log.Printf("⚠ Failed to marshal control message: %v", err)
+		log.Printf("[WARN] Failed to marshal control message: %v", err)
 		return
 	}
 
@@ -2817,7 +2848,7 @@ func (c *Channel) sendControlMessage(channel *Channel, message ControlMessage) {
 	case channel.dataQueue <- packet:
 		log.Printf("[OK] Control message sent to channel %s: %s", channel.ChannelID, message.MessageType)
 	default:
-		log.Printf("⚠ Channel %s queue full, message dropped", channel.ChannelID)
+		log.Printf("[WARN] Channel %s queue full, message dropped", channel.ChannelID)
 	}
 
 	// 对于权限请求和权限批准结果，需要转发到远程内核
@@ -2830,13 +2861,13 @@ func (c *Channel) sendControlMessage(channel *Channel, message ControlMessage) {
 // forwardControlMessageToRemoteKernels 转发控制消息到远程内核
 func (c *Channel) forwardControlMessageToRemoteKernels(packet *DataPacket) {
 	if c.manager == nil || c.manager.forwardToKernel == nil {
-		log.Printf("⚠ forwardControlMessageToRemoteKernels: forwardToKernel is nil, cannot forward")
+		log.Printf("[WARN] forwardControlMessageToRemoteKernels: forwardToKernel is nil, cannot forward")
 		return
 	}
 
 	// 获取当前内核ID
 	currentKernelID := c.manager.kernelID
-	log.Printf("📨 forwardControlMessageToRemoteKernels: currentKernelID=%s, SenderIDs=%v, ReceiverIDs=%v", 
+	log.Printf("[INFO] forwardControlMessageToRemoteKernels: currentKernelID=%s, SenderIDs=%v, ReceiverIDs=%v", 
 		currentKernelID, c.SenderIDs, c.ReceiverIDs)
 
 	// 对于权限请求，如果发送方没有内核前缀，添加当前内核前缀
@@ -2891,10 +2922,10 @@ func (c *Channel) forwardControlMessageToRemoteKernels(packet *DataPacket) {
 	}
 
 	// 转发到所有远程内核
-	log.Printf("📨 forwardControlMessageToRemoteKernels: remoteKernels=%v", remoteKernels)
+	log.Printf("[INFO] forwardControlMessageToRemoteKernels: remoteKernels=%v", remoteKernels)
 	for kernelID := range remoteKernels {
 		if err := c.manager.forwardToKernel(kernelID, packet, false); err != nil {
-			log.Printf("⚠ Failed to forward control message to kernel %s: %v", kernelID, err)
+			log.Printf("[WARN] Failed to forward control message to kernel %s: %v", kernelID, err)
 		} else {
 			log.Printf("[OK] Forwarded control message to kernel %s", kernelID)
 		}

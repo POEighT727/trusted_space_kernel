@@ -56,6 +56,9 @@ service ChannelService {
   rpc ApprovePermissionChange (ApprovePermissionChangeRequest) returns (ApprovePermissionChangeResponse); // 批准权限变更
   rpc RejectPermissionChange (RejectPermissionChangeRequest) returns (RejectPermissionChangeResponse);   // 拒绝权限变更
   rpc GetPermissionRequests (GetPermissionRequestsRequest) returns (GetPermissionRequestsResponse);     // 获取权限变更请求列表
+
+  // ACK 发送：接收方（connector-B）发送 ACK 给内核，内核转发给发送方（connector-A）
+  rpc SendAck (AckPacket) returns (SendAckResponse);
 }
 
 message CreateChannelRequest {
@@ -83,14 +86,17 @@ message CreateChannelResponse {
 message DataPacket {
   string channel_id = 1;
   int64 sequence_number = 2;
-  bytes payload = 3;            // 加密的数据载荷
-  string signature = 4;         // 发送方对payload的数字签名
+  bytes payload = 3;            // 原始数据载荷
+  string signature = 4;         // 当前节点对 (data_hash + 上一跳签名) 的 RSA 签名
   int64 timestamp = 5;
   string sender_id = 6;         // 发送方ID
   repeated string target_ids = 7; // 目标接收者ID列表（为空则广播给所有订阅者）
   string sender_kernel_id = 8;  // 发送方内核ID（跨内核时使用）
   string flow_id = 9;           // 业务流程ID，用于跟踪完整的数据传输过程
   bool is_final = 10;           // 是否是最后一个数据包（流结束标志）
+  string data_hash = 11;        // 当前节点计算的 SHA256 业务数据哈希
+  bool is_ack = 12;             // 是否是 ACK 数据包（用于反向通道）
+  string ack_prev_signature = 13; // ACK 中 prev_signature（上一跳签名，用于签名链）
 }
 
 message TransferStatus {
@@ -98,6 +104,22 @@ message TransferStatus {
   int64 last_sequence_received = 2;
   bool success = 3;
   string message = 4;
+}
+
+// ACK 数据包（接收方 connector-B 发送，内核转发给发送方 connector-A）
+message AckPacket {
+  string channel_id = 1;      // 频道ID
+  string data_hash = 2;       // 被确认的数据包的 data_hash（接收方记录的）
+  string sender_id = 3;       // 发送方ID（connector-A）
+  string sender_kernel_id = 4; // 发送方所在内核ID（跨内核时使用）
+  string signature = 5;       // 当前节点（接收方 connector-B）对 data_hash 的签名
+  int64 timestamp = 6;
+  string flow_id = 7;        // 业务流程ID
+}
+
+message SendAckResponse {
+  bool success = 1;
+  string message = 2;
 }
 
 message SubscribeRequest {

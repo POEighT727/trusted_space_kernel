@@ -29,3 +29,11 @@ channel:
   # 如果为空，将自动创建 ./channels/{connector_id} 目录
   config_dir: "./channels/connector-A"
 
+database:
+  enabled: true       # 是否启用数据库
+  host: "localhost"
+  port: 3306
+  user: "root"
+  password: "123456"
+  database: "connector_a"  # 连接器自己的数据库名
+

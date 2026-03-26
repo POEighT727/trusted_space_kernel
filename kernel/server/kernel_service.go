@@ -770,15 +770,18 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 	flowID := req.DataPacket.GetFlowId()
 
 	dataPacket := &circulation.DataPacket{
-		ChannelID:      req.DataPacket.ChannelId,
-		SequenceNumber: req.DataPacket.SequenceNumber,
-		Payload:        req.DataPacket.Payload,
-		Signature:      req.DataPacket.Signature,
-		Timestamp:      req.DataPacket.Timestamp,
-		SenderID:       req.DataPacket.SenderId,
-		TargetIDs:      req.DataPacket.TargetIds,
-		FlowID:         flowID,
-		IsFinal:        req.GetIsFinal(),
+		ChannelID:       req.DataPacket.ChannelId,
+		SequenceNumber:  req.DataPacket.SequenceNumber,
+		Payload:         req.DataPacket.Payload,
+		Signature:       req.DataPacket.Signature,
+		Timestamp:       req.DataPacket.Timestamp,
+		SenderID:        req.DataPacket.SenderId,
+		TargetIDs:       req.DataPacket.TargetIds,
+		FlowID:          flowID,
+		IsFinal:         req.GetIsFinal(),
+		DataHash:        req.DataPacket.GetDataHash(),
+		IsAck:           req.DataPacket.GetIsAck(),
+		AckPrevSignature: req.DataPacket.GetAckPrevSignature(),
 	}
 
 	// 根据 payload 内容判断消息类型
@@ -789,6 +792,11 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 			dataPacket.MessageType = circulation.MessageTypeControl
 			dataCategory = "control"
 		}
+	}
+	// ACK 消息设置 MessageType
+	if req.DataPacket.GetIsAck() {
+		dataPacket.MessageType = circulation.MessageTypeAck
+		dataCategory = "control"
 	}
 	err = channel.PushData(dataPacket)
 	if err != nil {
@@ -852,20 +860,20 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 				"data_category": dataCategory,
 			}
 
-			// 记录存证：kernel-1 -> kernel-2 (DATA_RECEIVE)，带 flow_id 和 data_hash
+			// 记录存证：kernel-1 -> kernel-2 (DATA_SEND，A 的数据转发链路)
 			if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
-				req.SourceKernelId, // source: kernel-1 (发送方)
-				evidence.EventTypeDataReceive,
+				req.SourceKernelId,
+				evidence.EventTypeDataSend,
 				req.ChannelId,
 				hex.EncodeToString(finalHash[:]),
 				evidence.DirectionInternal,
-				currentKernelID, // target: kernel-2 (接收方内核)
+				currentKernelID,
 				flowID,
 				metadata,
 			); err != nil {
-				log.Printf("[WARN] Failed to submit kernel->kernel DATA_RECEIVE evidence: %v", err)
+				log.Printf("[WARN] Failed to submit kernel->kernel DATA_SEND evidence: %v", err)
 			} else {
-				log.Printf("Recorded kernel->kernel DATA_RECEIVE: %s -> %s, flow: %s", req.SourceKernelId, currentKernelID, flowID)
+				log.Printf("Recorded kernel->kernel DATA_SEND: %s -> %s, flow: %s", req.SourceKernelId, currentKernelID, flowID)
 			}
 
 			// 记录存证：kernel-2 -> kernel-3 (DATA_SEND) - 多跳转发存证
@@ -875,14 +883,14 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 				if s.multiKernelManager != nil && s.multiKernelManager.multiHopConfigManager != nil {
 					nextKernel, _, _, hopIndex, totalHops, found := s.multiKernelManager.multiHopConfigManager.GetNextHop(currentKernelID, originalTargetKernelID)
 					if found && nextKernel != "" {
-						// 记录转发存证：当前内核 -> 下一跳内核
+						// 记录转发存证：当前内核 -> 下一跳内核（A 的数据转发链路）
 						if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
-							currentKernelID, // source: 当前内核
+							currentKernelID,
 							evidence.EventTypeDataSend,
 							req.ChannelId,
 							hex.EncodeToString(finalHash[:]),
 							evidence.DirectionInternal,
-							nextKernel, // target: 下一跳内核
+							nextKernel,
 							flowID,
 							metadata,
 						); err != nil {
@@ -895,7 +903,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 				}
 			}
 
-			// 记录存证：kernel-2 -> connector-U (DATA_RECEIVE)，带 flow_id 和 data_hash
+			// 记录存证：kernel-2 -> connector-U (DATA_RECEIVE，B 收到数据，B 相关）
 			for _, receiverID := range channel.ReceiverIDs {
 				// 跳过远程接收者
 				if strings.Contains(receiverID, ":") {
@@ -910,7 +918,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 					targetConnectorID = parts[1]
 				}
 				if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
-					currentKernelID,
+					currentKernelID, // source: 当前内核（执行转发操作）
 					evidence.EventTypeDataReceive,
 					req.ChannelId,
 					hex.EncodeToString(finalHash[:]),
@@ -919,7 +927,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 					flowID,
 					metadata,
 				); err != nil {
-					log.Printf("[WARN] Failed to submit kernel->connector DATA_RECEIVE evidence: %v", err)
+					log.Printf("[WARN] Failed to submit kernel->connector DATA_RECEIVE (B receives): %v", err)
 				}
 			}
 

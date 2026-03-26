@@ -56,57 +56,25 @@ func NewDBManager(conf MySQLConfig) (*DBManager, error) {
 		return nil, fmt.Errorf("failed to init tables: %w", err)
 	}
 
-	log.Println("[OK] MySQL database connected successfully")
+	log.Println("[OK] Connector MySQL database connected successfully")
 	return manager, nil
 }
 
 // initTables 初始化表结构
 func (m *DBManager) initTables() error {
-	// 创建证据记录表（内核级别存证）
-	evidenceTableSQL := `
-	CREATE TABLE IF NOT EXISTS evidence_records (
-		id BIGINT AUTO_INCREMENT PRIMARY KEY,
-		event_id VARCHAR(36) NOT NULL COMMENT '事件实例ID',
-		event_type VARCHAR(50) NOT NULL COMMENT '事件类型',
-		timestamp TIMESTAMP(6) NOT NULL COMMENT '时间戳',
-		source_id VARCHAR(100) NOT NULL COMMENT '事件来源ID（连接器或内核）',
-		target_id VARCHAR(100) DEFAULT '' COMMENT '目标ID（直接下一跳：内核或连接器）',
-		channel_id VARCHAR(36) DEFAULT '' COMMENT '频道ID',
-		flow_id VARCHAR(36) DEFAULT '' COMMENT '业务流程ID',
-		data_hash VARCHAR(128) DEFAULT '' COMMENT '数据哈希',
-		signature TEXT COMMENT '签名（流模式下仅在流结束时生成）',
-		hash VARCHAR(128) NOT NULL COMMENT '记录内容哈希',
-		prev_hash VARCHAR(128) DEFAULT '' COMMENT '上一条记录的哈希（哈希链）',
-		metadata JSON COMMENT '元数据',
-		INDEX idx_event_id (event_id),
-		INDEX idx_event_type (event_type),
-		INDEX idx_source_id (source_id),
-		INDEX idx_target_id (target_id),
-		INDEX idx_channel_id (channel_id),
-		INDEX idx_flow_id (flow_id),
-		INDEX idx_timestamp (timestamp)
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='内核存证记录表';`
-
-	if _, err := m.db.Exec(evidenceTableSQL); err != nil {
-		return fmt.Errorf("failed to create evidence_records table: %w", err)
-	}
-
-	// 创建业务数据哈希链记录表
+	// 创建业务数据哈希链表
 	businessChainTableSQL := `
 	CREATE TABLE IF NOT EXISTS business_data_chain (
 		id BIGINT AUTO_INCREMENT PRIMARY KEY,
-		connector_id VARCHAR(100) NOT NULL COMMENT '连接器ID',
-		channel_id VARCHAR(36) NOT NULL COMMENT '频道ID',
-		data_hash VARCHAR(128) NOT NULL DEFAULT '' COMMENT '业务数据包的哈希（ACK记录为空）',
+		channel_id VARCHAR(36) NOT NULL,
+		data_hash VARCHAR(128) NOT NULL DEFAULT '' COMMENT '当前业务数据包的哈希（ACK记录为空）',
 		prev_data_hash VARCHAR(128) NOT NULL DEFAULT '' COMMENT '前一个数据包的哈希',
-		prev_signature TEXT NOT NULL COMMENT '上一跳（kernel/connector）的RSA签名',
+		prev_signature TEXT NOT NULL COMMENT '上一跳的RSA签名（ACK记录中为上一跳ACK签名）',
 		signature TEXT NOT NULL COMMENT '当前节点对data_hash的RSA签名',
 		timestamp DATETIME(6) NOT NULL COMMENT '时间戳',
-		INDEX idx_connector_channel (connector_id, channel_id),
 		INDEX idx_channel_id (channel_id),
-		INDEX idx_connector_id (connector_id),
 		INDEX idx_data_hash (data_hash)
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='业务数据哈希链记录表';`
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='业务数据哈希链表';`
 
 	if _, err := m.db.Exec(businessChainTableSQL); err != nil {
 		return fmt.Errorf("failed to create business_data_chain table: %w", err)
@@ -119,7 +87,6 @@ func (m *DBManager) initTables() error {
 		`ALTER TABLE business_data_chain MODIFY COLUMN prev_data_hash VARCHAR(128) NOT NULL DEFAULT ''`,
 	}
 	for _, stmt := range alterSQLs {
-		// 忽略错误（如果列已经有 DEFAULT '' 或类型不同，ALTER 可能失败，这是安全的）
 		m.db.Exec(stmt)
 	}
 

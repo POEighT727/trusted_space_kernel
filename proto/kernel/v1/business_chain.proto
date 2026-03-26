@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package trusted_space.kernel.v1;
+
+option go_package = "github.com/trusted-space/kernel/api/v1;kernelv1";
+
+// ------------------------------------------------------------
+// 业务数据哈希链服务 (Business Chain Service)
+// 用于连接器和内核之间的业务数据哈希链交互
+// 注意：data_hash 的计算和签名已集成到 StreamData 流式传输过程中，
+// 此服务仅用于查询和同步操作
+// ------------------------------------------------------------
+service BusinessChainService {
+  // 获取最新哈希：连接器从内核获取指定频道的最新data_hash（用于本地无记录时同步）
+  rpc GetLastDataHash(GetLastDataHashRequest) returns (GetLastDataHashResponse);
+
+  // 查询哈希链：连接器查询指定频道的完整哈希链
+  rpc QueryChain(QueryChainRequest) returns (QueryChainResponse);
+}
+
+// ------------------------------------------------------------
+// 获取最新哈希相关消息定义
+// ------------------------------------------------------------
+message GetLastDataHashRequest {
+  string connector_id = 1;  // 连接器ID
+  string channel_id = 2;   // 频道ID
+}
+
+message GetLastDataHashResponse {
+  bool success = 1;
+  string last_data_hash = 2; // 最新data_hash（如果是第一个包则为空字符串）
+  string message = 3;
+}
+
+// ------------------------------------------------------------
+// 查询哈希链相关消息定义
+// ------------------------------------------------------------
+message QueryChainRequest {
+  string connector_id = 1;  // 连接器ID
+  string channel_id = 2;   // 频道ID
+  int32 limit = 3;         // 限制返回记录数
+}
+
+message ChainRecord {
+  int64 id = 1;
+  string channel_id = 2;
+  string data_hash = 3;       // 业务数据哈希，ACK记录为空
+  string prev_data_hash = 4;  // 前一个数据包的哈希
+  string prev_signature = 5;  // 上一跳（kernel/connector）的 RSA 签名
+  string signature = 6;       // 当前节点对 data_hash 的 RSA 签名
+  int64 timestamp = 7;
+}
+
+message QueryChainResponse {
+  bool success = 1;
+  string message = 2;
+  repeated ChainRecord records = 3;
+  int32 total_count = 4;
+}

@@ -284,15 +284,18 @@ func main() {
 	channelManager.SetForwardToKernel(func(kernelID string, packet *circulation.DataPacket, isFinal bool) error {
 		// 将 circulation.DataPacket 转为 pb.DataPacket
 		pbPacket := &pb.DataPacket{
-			ChannelId:      packet.ChannelID,
-			SequenceNumber: packet.SequenceNumber,
-			Payload:        packet.Payload,
-			Signature:      packet.Signature,
-			Timestamp:      packet.Timestamp,
-			SenderId:       packet.SenderID,
-			TargetIds:      packet.TargetIDs,
-			FlowId:         packet.FlowID,
-			IsFinal:        isFinal, // 传递流结束标志
+			ChannelId:       packet.ChannelID,
+			SequenceNumber:   packet.SequenceNumber,
+			Payload:         packet.Payload,
+			Signature:       packet.Signature,
+			Timestamp:       packet.Timestamp,
+			SenderId:        packet.SenderID,
+			TargetIds:       packet.TargetIDs,
+			FlowId:          packet.FlowID,
+			IsFinal:         isFinal, // 传递流结束标志
+			DataHash:        packet.DataHash,
+			IsAck:           packet.IsAck,
+			AckPrevSignature: packet.AckPrevSignature,
 		}
 		return multiKernelManager.ForwardData(kernelID, pbPacket, isFinal)
 	})
@@ -343,7 +346,7 @@ func main() {
 	)
 
 	// 注册服务
-	channelService := server.NewChannelServiceServer(channelManager, policyEngine, registry, auditLog, multiKernelManager)
+	channelService := server.NewChannelServiceServer(channelManager, policyEngine, registry, auditLog, multiKernelManager, dbManager)
 	
 	// 设置权限变更回调：当权限被批准时，通知被添加的连接器（含跨内核转发）
 	channelManager.SetPermissionChangeCallback(func(channelID, connectorID, changeType string) {
@@ -403,6 +406,14 @@ func main() {
 
 	evidenceService := server.NewEvidenceServiceServer(auditLog, channelManager)
 	pb.RegisterEvidenceServiceServer(grpcServer, evidenceService)
+
+	// 注册业务数据哈希链服务
+	businessChainService := server.NewBusinessChainServiceServer(dbManager)
+	pb.RegisterBusinessChainServiceServer(grpcServer, businessChainService)
+	log.Println("[OK] Business chain service registered")
+
+	// 将业务哈希链服务注入到 ChannelService
+	channelService.SetBusinessChainService(businessChainService)
 
 	// 将 ChannelService 的 NotificationManager 注入到 MultiKernelManager，供内核间服务使用
 	multiKernelManager.SetNotificationManager(channelService.NotificationManager)

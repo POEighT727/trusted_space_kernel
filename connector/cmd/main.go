@@ -45,6 +45,15 @@ type Config struct {
 	Channel struct {
 		ConfigDir string `yaml:"config_dir"` // 频道配置文件目录
 	} `yaml:"channel"`
+
+	Database struct {
+		Enabled  bool   `yaml:"enabled"`  // 是否启用数据库
+		Host     string `yaml:"host"`
+		Port     int    `yaml:"port"`
+		User     string `yaml:"user"`
+		Password string `yaml:"password"`
+		Database string `yaml:"database"`
+	} `yaml:"database"`
 }
 
 func main() {
@@ -130,6 +139,13 @@ func main() {
 			return os.Getenv("KERNEL_ID")
 		}(),
 		Exposed: exposed,
+		// 数据库配置
+		DatabaseEnabled:  config.Database.Enabled,
+		DatabaseHost:     config.Database.Host,
+		DatabasePort:     config.Database.Port,
+		DatabaseUser:     config.Database.User,
+		DatabasePassword: config.Database.Password,
+		DatabaseName:     config.Database.Database,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create connector: %v", err)
@@ -165,13 +181,13 @@ func main() {
 		// 通知回调：根据协商状态显示不同消息
 		switch notification.NegotiationStatus {
 		case pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_PROPOSED:
-			fmt.Printf("\n📋 收到频道提议通知:\n")
+			fmt.Printf("\n[INFO] 收到频道提议通知:\n")
 		case pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED:
-			fmt.Printf("\n📢 频道已正式创建并激活:\n")
+			fmt.Printf("\n[INFO] 频道已正式创建并激活:\n")
 		case pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_REJECTED:
-			fmt.Printf("\n❌ 频道提议已被拒绝:\n")
+			fmt.Printf("\n[ERROR] 频道提议已被拒绝:\n")
 		default:
-			fmt.Printf("\n📢 收到频道通知:\n")
+			fmt.Printf("\n[INFO] 收到频道通知:\n")
 		}
 
 		fmt.Printf("   频道ID: %s\n", notification.ChannelId)
@@ -198,7 +214,7 @@ func main() {
 			}
 		}
 	}); err != nil {
-		log.Printf("⚠ 启动自动通知监听失败: %v", err)
+		log.Printf("[WARN] 启动自动通知监听失败: %v", err)
 	} else {
 		fmt.Println("[OK] 自动通知监听已启动（连接器状态: active，将自动订阅频道）")
 	}
@@ -711,25 +727,6 @@ func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 		}
 		fmt.Println("  创建者已自动接受，等待其他参与方确认后频道将自动激活...")
 	}
-
-	// 显示需要哪些参与方确认（创建者自动接受，不需要确认）
-	fmt.Println("  需要以下参与方确认:")
-	selfID := connector.GetID()
-	hasOthers := false
-	for _, senderID := range senderIDs {
-		if senderID != selfID { // 创建者自己不需要确认
-			fmt.Printf("    - 发送方 %s 需要确认\n", senderID)
-			hasOthers = true
-		}
-	}
-	for _, receiverID := range receiverIDs {
-		fmt.Printf("    - 接收方 %s 需要确认\n", receiverID)
-		hasOthers = true
-	}
-	if !hasOthers {
-		fmt.Println("    - 无（所有参与方都是创建者自己）")
-	}
-	fmt.Println("  创建者已自动接受，等待其他参与方确认后频道将自动激活...")
 }
 
 
@@ -1046,7 +1043,7 @@ func handleSubscribe(connector *client.Connector, args []string) {
 
 	// 创建输出目录
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		fmt.Printf("⚠ 创建接收目录失败: %v\n", err)
+		fmt.Printf("[WARN] 创建接收目录失败: %v\n", err)
 	}
 
 	// 检查是否已经是频道参与者
@@ -1116,12 +1113,12 @@ func handleSubscribe(connector *client.Connector, args []string) {
 			if client.IsFileTransferPacket(packet.Payload) {
 				// 处理文件传输数据包
 				if err := fileReceiver.HandleFilePacket(packet); err != nil {
-					log.Printf("⚠ 处理文件数据包失败: %v", err)
+					log.Printf("[WARN] 处理文件数据包失败: %v", err)
 				}
 			} else if client.IsControlMessage(packet.Payload) {
 				// 处理控制消息
 				if err := handleControlMessage(packet); err != nil {
-					log.Printf("⚠ 处理控制消息失败: %v", err)
+					log.Printf("[WARN] 处理控制消息失败: %v", err)
 				}
 			} else {
 				// 普通数据包，显示文本
@@ -1129,7 +1126,7 @@ func handleSubscribe(connector *client.Connector, args []string) {
 				if packet.SenderId != "" {
 					senderInfo = fmt.Sprintf("来自 %s, ", packet.SenderId)
 				}
-				fmt.Printf("📦 [序列号: %d] %s数据: %s\n", packet.SequenceNumber, senderInfo, string(packet.Payload))
+				fmt.Printf("[DATA] [序列号: %d] %s数据: %s\n", packet.SequenceNumber, senderInfo, string(packet.Payload))
 			}
 			return nil
 		})
@@ -1658,7 +1655,7 @@ func handleControlMessage(packet *pb.DataPacket) error {
 
 	case "channel_proposal":
 		if message.ChannelProposal != nil {
-			fmt.Printf("📋 [控制消息] 频道提议广播:\n")
+			fmt.Printf("[INFO] [控制消息] 频道提议广播:\n")
 			fmt.Printf("   提议ID: %s\n", message.ChannelProposal.ProposalID)
 			fmt.Printf("   频道ID: %s\n", message.ChannelProposal.ChannelID)
 			fmt.Printf("   创建者: %s\n", message.ChannelProposal.CreatorID)
@@ -1670,7 +1667,7 @@ func handleControlMessage(packet *pb.DataPacket) error {
 		}
 
 	default:
-		fmt.Printf("📢 [控制消息] 未知类型: %s\n", message.MessageType)
+		fmt.Printf("[WARN] [控制消息] 未知类型: %s\n", message.MessageType)
 	}
 
 	return nil

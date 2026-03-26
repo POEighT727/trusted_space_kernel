@@ -27,11 +27,10 @@ const (
 	EventTypeConnectorHeartbeat   EventType = "CONNECTOR_HEARTBEAT"   // 连接器心跳
 
 	// 数据传输事件（兼容旧接口）
-	EventTypeDataSend       EventType = "DATA_SEND"       // 数据发送
-	EventTypeDataReceive    EventType = "DATA_RECEIVE"    // 数据接收
-	EventTypeDataForward    EventType = "DATA_FORWARD"    // 数据转发（跨内核转发）
-	EventTypeTransferStart  EventType = "TRANSFER_START"  // 传输开始（兼容旧接口）
-	EventTypeTransferEnd    EventType = "TRANSFER_END"    // 传输结束（兼容旧接口）
+	EventTypeDataSend      EventType = "DATA_SEND"    // 数据发送
+	EventTypeDataReceive  EventType = "DATA_RECEIVE"  // 数据接收
+	EventTypeTransferStart EventType = "TRANSFER_START" // 传输开始（兼容旧接口）
+	EventTypeTransferEnd   EventType = "TRANSFER_END"   // 传输结束（兼容旧接口）
 
 	// 频道管理事件
 	EventTypeChannelCreated EventType = "CHANNEL_CREATED" // 频道创建
@@ -62,6 +61,9 @@ const (
 	EventTypeInterconnectRequested EventType = "INTERCONNECT_REQUESTED" // 内核互联请求
 	EventTypeInterconnectApproved  EventType = "INTERCONNECT_APPROVED"  // 内核互联批准
 	EventTypeInterconnectRejected EventType = "INTERCONNECT_REJECTED" // 内核互联拒绝
+
+	// ACK 事件
+	EventTypeAckReceived EventType = "ACK_RECEIVED" // 接收方 ACK 到达内核并转发
 
 	// 其他兼容旧接口
 	EventTypePolicyViolation    EventType = "POLICY_VIOLATION"     // 策略违规
@@ -850,7 +852,7 @@ func (al *AuditLog) SignFlow(flowID string) (*EvidenceRecord, error) {
 	}
 	al.mu.Unlock()
 
-	log.Printf("✅ Flow signature generated for flow_id: %s, chain_tail_hash: %s", flowID, chainTailHash)
+	log.Printf("[OK] Flow signature generated for flow_id: %s, chain_tail_hash: %s", flowID, chainTailHash)
 	return lastRecord, nil
 }
 

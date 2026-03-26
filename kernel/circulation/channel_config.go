@@ -62,7 +62,7 @@ func NewChannelConfigManager(configDir string) (*ChannelConfigManager, error) {
 
 	// 加载现有配置
 	if err := manager.loadAllConfigs(); err != nil {
-		log.Printf("⚠ Failed to load existing configs: %v", err)
+		log.Printf("[WARN] Failed to load existing configs: %v", err)
 	}
 
 	return manager, nil
@@ -276,7 +276,7 @@ func (cm *ChannelConfigManager) loadAllConfigs() error {
 
 		channelID := file.Name()[:len(file.Name())-5] // 移除.json后缀
 		if _, err := cm.LoadConfig(channelID); err != nil {
-			log.Printf("⚠ Failed to load config for channel %s: %v", channelID, err)
+			log.Printf("[WARN] Failed to load config for channel %s: %v", channelID, err)
 			continue
 		}
 		loadedCount++
@@ -362,7 +362,7 @@ func (cm *ChannelConfigManager) CleanupOldConfigs(maxVersions int) error {
 			for i := maxVersions; i < len(files); i++ {
 				filepath := filepath.Join(cm.configDir, files[i].Name())
 				if err := os.Remove(filepath); err != nil {
-					log.Printf("⚠ Failed to remove old config file %s: %v", filepath, err)
+					log.Printf("[WARN] Failed to remove old config file %s: %v", filepath, err)
 				} else {
 					channelCleanupCount++
 					cleanupCount++

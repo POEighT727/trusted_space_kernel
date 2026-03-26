@@ -2,8 +2,13 @@ package client
 
 import (
 	"context"
-	"crypto/tls"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,6 +23,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
+	conn_db "github.com/trusted-space/kernel/connector/database"
 	pb "github.com/trusted-space/kernel/proto/kernel/v1"
 )
 
@@ -44,20 +50,21 @@ type LocalChannelInfo struct {
 
 // Connector 连接器客户端
 type Connector struct {
-	connectorID  string
-	entityType   string
-	publicKey    string
-	serverAddr   string
-	status       ConnectorStatus // 连接器状态，默认为active
-	kernelID     string // 可选：连接器所在内核ID（用于跨内核发现请求）
-	exposed      *bool  // 是否向其他内核公开自己的信息，默认为true（使用指针以支持可选字段）
+	connectorID        string
+	entityType         string
+	publicKey          string
+	serverAddr         string
+	status             ConnectorStatus // 连接器状态，默认为active
+	kernelID           string          // 可选：连接器所在内核ID（用于跨内核发现请求）
+	exposed            *bool           // 是否向其他内核公开自己的信息，默认为true（使用指针以支持可选字段）
+	clientKeyPath      string          // connector 私钥路径（用于签名）
 
 	conn         *grpc.ClientConn
 	identitySvc  pb.IdentityServiceClient
 	channelSvc   pb.ChannelServiceClient
 	evidenceSvc  pb.EvidenceServiceClient
 	kernelSvc    pb.KernelServiceClient
-	
+
 	sessionToken string
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -73,6 +80,11 @@ type Connector struct {
 	processedNotificationsMu sync.RWMutex
 	processedNotifications   map[string]bool // key: channelID, value: 是否已处理过通知
 	skippedNotifications     map[string]int  // key: channelID, value: 跳过次数
+
+	// 业务数据哈希链管理器
+	businessChainManager *conn_db.BusinessChainManager
+	// 业务哈希链服务客户端（用于与内核通信）
+	businessChainSvc pb.BusinessChainServiceClient
 }
 
 // Config 连接器配置
@@ -89,6 +101,13 @@ type Config struct {
 	KernelID string
 	// 是否向其他内核公开自己的信息，默认为true（使用指针以支持可选字段）
 	Exposed *bool
+	// 数据库配置
+	DatabaseEnabled  bool
+	DatabaseHost     string
+	DatabasePort     int
+	DatabaseUser     string
+	DatabasePassword string
+	DatabaseName     string
 }
 
 // NewConnector 创建新的连接器
@@ -122,18 +141,40 @@ func NewConnector(config *Config) (*Connector, error) {
 		serverAddr:  config.ServerAddr,
 		kernelID:    config.KernelID,
 		exposed:     config.Exposed, // 是否向其他内核公开自己的信息（传递指针）
+		clientKeyPath: config.ClientKeyPath, // 用于签名
 		status:      ConnectorStatusActive, // 默认状态为active
 		conn:        conn,
 		identitySvc: pb.NewIdentityServiceClient(conn),
 		channelSvc:  pb.NewChannelServiceClient(conn),
 		evidenceSvc: pb.NewEvidenceServiceClient(conn),
 		kernelSvc:   pb.NewKernelServiceClient(conn),
+		businessChainSvc: pb.NewBusinessChainServiceClient(conn),
 		ctx:         ctx,
 		cancel:      cancel,
 		channels:     make(map[string]*LocalChannelInfo),
 		subscriptions: make(map[string]bool),
 		processedNotifications: make(map[string]bool),
 		skippedNotifications: make(map[string]int),
+	}
+
+	// 初始化业务数据哈希链管理器
+	if config.DatabaseEnabled {
+		dbConfig := conn_db.MySQLConfig{
+			Host:     config.DatabaseHost,
+			Port:     config.DatabasePort,
+			User:     config.DatabaseUser,
+			Password: config.DatabasePassword,
+			Database: config.DatabaseName,
+		}
+		dbManager, err := conn_db.NewDBManager(dbConfig)
+		if err != nil {
+			cancel()
+			conn.Close()
+			return nil, fmt.Errorf("failed to initialize connector database: %w", err)
+		}
+		store := conn_db.NewMySQLStore(dbManager.GetDB())
+		connector.businessChainManager = conn_db.NewBusinessChainManager(store)
+		log.Println("[OK] Connector business chain manager initialized")
 	}
 
 	return connector, nil
@@ -182,9 +223,9 @@ func (c *Connector) startHeartbeat() {
 				Timestamp:   time.Now().Unix(),
 			})
 			if err != nil {
-				log.Printf("⚠ Heartbeat failed: %v", err)
+				log.Printf("[WARN] Heartbeat failed: %v", err)
 			} else if !resp.Acknowledged {
-				log.Printf("⚠ Heartbeat not acknowledged")
+				log.Printf("[WARN] Heartbeat not acknowledged")
 			}
 		}
 	}
@@ -278,18 +319,32 @@ func (c *Connector) SendData(channelID string, data [][]byte) error {
 
 	// 发送数据包
 	for i, chunk := range data {
-		// 计算签名（这里简化为数据哈希）
-		hash := sha256.Sum256(chunk)
-		signature := hex.EncodeToString(hash[:])
+		// 如果启用了业务哈希链，计算 data_hash 并签名
+		var dataHash, connectorSig string
+		if c.HasBusinessChainManager() {
+			dataHash, connectorSig, err = c.connectorRecordBusinessData(channelID, chunk)
+			if err != nil {
+				log.Printf("[WARN] Failed to record business data, continuing without hash chain: %v", err)
+			}
+		}
 
 		packet := &pb.DataPacket{
 			ChannelId:      channelID,
 			SequenceNumber: int64(i + 1),
 			Payload:        chunk,
-			Signature:      signature,
 			Timestamp:      time.Now().Unix(),
 			SenderId:       c.connectorID,
 			TargetIds:      []string{}, // 空列表表示广播给所有订阅者
+		}
+
+		// 业务哈希链信息放入 DataPacket
+		if dataHash != "" && connectorSig != "" {
+			packet.DataHash = dataHash
+			packet.Signature = connectorSig // connector 的 RSA 签名
+		} else {
+			// 兼容：无业务哈希链时，使用简单的 hash 作为 signature
+			hash := sha256.Sum256(chunk)
+			packet.Signature = hex.EncodeToString(hash[:])
 		}
 
 		if err := stream.Send(packet); err != nil {
@@ -349,19 +404,34 @@ func (rs *RealtimeSender) SendLine(data []byte) error {
 // SendLineTo 发送一行数据到指定接收者（实时）
 func (rs *RealtimeSender) SendLineTo(data []byte, targetIDs []string) error {
 	rs.sequence++
-	
-	// 计算签名
-	hash := sha256.Sum256(data)
-	signature := hex.EncodeToString(hash[:])
+
+	// 如果启用了业务哈希链，计算 data_hash 并签名
+	var dataHash, connectorSig string
+	var err error
+	if rs.connector.HasBusinessChainManager() {
+		dataHash, connectorSig, err = rs.connector.connectorRecordBusinessData(rs.channelID, data)
+		if err != nil {
+			log.Printf("[WARN] Failed to record business data, continuing without hash chain: %v", err)
+		}
+	}
 
 	packet := &pb.DataPacket{
 		ChannelId:      rs.channelID,
 		SequenceNumber: rs.sequence,
 		Payload:        data,
-		Signature:      signature,
 		Timestamp:      time.Now().Unix(),
 		SenderId:       rs.connector.connectorID,
 		TargetIds:      targetIDs, // 指定目标接收者，空列表表示广播
+	}
+
+	// 业务哈希链信息放入 DataPacket
+	if dataHash != "" && connectorSig != "" {
+		packet.DataHash = dataHash
+		packet.Signature = connectorSig // connector 的 RSA 签名
+	} else {
+		// 兼容：无业务哈希链时，使用简单的 hash 作为 signature
+		hash := sha256.Sum256(data)
+		packet.Signature = hex.EncodeToString(hash[:])
 	}
 
 	if err := rs.stream.Send(packet); err != nil {
@@ -372,11 +442,11 @@ func (rs *RealtimeSender) SendLineTo(data []byte, targetIDs []string) error {
 	go func() {
 		status, err := rs.stream.Recv()
 		if err != nil {
-			log.Printf("⚠ 确认接收失败: %v", err)
+			log.Printf("[WARN] 确认接收失败: %v", err)
 			return
 		}
 		if !status.Success {
-			log.Printf("⚠ 数据包发送失败: %s", status.Message)
+			log.Printf("[WARN] 数据包发送失败: %s", status.Message)
 		}
 	}()
 
@@ -430,18 +500,68 @@ func (c *Connector) ReceiveData(channelID string, handler func(*pb.DataPacket) e
 
 		log.Printf("[OK] Received packet #%d (%d bytes)", packet.SequenceNumber, len(packet.Payload))
 
+		// connector-B 接收时：如果启用了业务哈希链，提取 data_hash 和上一跳签名，写入本地 business_data_chain
+		if c.HasBusinessChainManager() && packet.DataHash != "" && !packet.IsAck {
+			prevSignatureHex := ""
+			if packet.AckPrevSignature != "" {
+				prevSignatureHex = packet.AckPrevSignature
+			} else {
+				prevSignatureHex = packet.Signature
+			}
+			if err := c.connectorReceiveBusinessData(channelID, packet.DataHash, prevSignatureHex); err != nil {
+				log.Printf("[WARN] Failed to record received business data: %v", err)
+			}
+			// 接收方生成并发送 ACK
+			go c.sendAckForData(channelID, packet.DataHash, packet.Signature, packet.FlowId)
+		}
+
+		// ACK 数据包：写入本地 business_data_chain
+		if c.HasBusinessChainManager() && packet.IsAck && packet.DataHash != "" {
+			if err := c.recordAckFromKernel(channelID, packet.DataHash, packet.Signature, packet.AckPrevSignature); err != nil {
+				log.Printf("[WARN] Failed to record ACK: %v", err)
+			}
+		}
+
 		// 在统一频道模式下，根据payload内容判断消息类型
 		if c.isControlMessage(packet.Payload) {
 			// 控制消息：处理控制消息
 			if err := c.processControlPacket(packet); err != nil {
-				log.Printf("⚠ Failed to process control packet: %v", err)
+				log.Printf("[WARN] Failed to process control packet: %v", err)
 			}
 		} else {
 			// 业务数据：调用处理函数
 			if handler != nil {
 				if err := handler(packet); err != nil {
-					log.Printf("⚠ Handler error: %v", err)
+					log.Printf("[WARN] Handler error: %v", err)
 				}
+			}
+		}
+	}
+}
+
+// receiveDataSilent 发送方静默订阅频道数据（仅用于接收 ACK，不打印任何日志）
+func (c *Connector) receiveDataSilent(channelID string) error {
+	stream, err := c.channelSvc.SubscribeData(c.ctx, &pb.SubscribeRequest{
+		ConnectorId: c.connectorID,
+		ChannelId:   channelID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to subscribe: %w", err)
+	}
+
+	for {
+		packet, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("receive error: %w", err)
+		}
+
+		// 收到 ACK 数据包：写入本地 business_data_chain
+		if c.HasBusinessChainManager() && packet.IsAck && packet.DataHash != "" {
+			if err := c.recordAckFromKernel(channelID, packet.DataHash, packet.Signature, packet.AckPrevSignature); err != nil {
+				log.Printf("[WARN] Failed to record ACK: %v", err)
 			}
 		}
 	}
@@ -451,7 +571,7 @@ func (c *Connector) ReceiveData(channelID string, handler func(*pb.DataPacket) e
 func (c *Connector) processControlPacket(packet *pb.DataPacket) error {
 	// 控制消息由connector/cmd/main.go中的handleControlMessage处理
 	// 这里只需要记录日志，不需要特殊处理
-	log.Printf("📢 [控制频道: %s, 序列号: %d] 收到控制消息 (%d bytes)",
+	log.Printf("[INFO] [控制频道: %s, 序列号: %d] 收到控制消息 (%d bytes)",
 		packet.ChannelId, packet.SequenceNumber, len(packet.Payload))
 
 	// 控制消息的具体处理逻辑在UI层（main.go）实现
@@ -589,7 +709,7 @@ func (c *Connector) SetStatus(status ConnectorStatus) error {
 			Status:      string(status),
 		})
 		if err != nil {
-			log.Printf("⚠ 同步状态到内核失败: %v", err)
+			log.Printf("[WARN] 同步状态到内核失败: %v", err)
 		}
 	}
 
@@ -605,7 +725,7 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 			// 持续等待通知
 			notifyChan, err := c.WaitForChannelNotification()
 			if err != nil {
-				log.Printf("⚠ 等待通知失败: %v，5秒后重试...", err)
+				log.Printf("[WARN] 等待通知失败: %v，5秒后重试...", err)
 				time.Sleep(5 * time.Second)
 				continue
 			}
@@ -677,43 +797,48 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 						if isCreator {
 							// 创建者应该已经在提议时自动接受，这里不应该收到提议通知
 							// 如果意外收到，说明已经自动接受了
-							log.Printf("📋 频道提议已创建: %s (您是创建者，已自动接受)", notification.ChannelId)
-							log.Printf("ℹ 等待其他参与方接受提议...")
+						log.Printf("[INFO] 频道提议已创建: %s (您是创建者，已自动接受)", notification.ChannelId)
+						log.Printf("[INFO] 等待其他参与方接受提议...")
 						} else {
 							// 收到提议通知，需要接受提议
 							// 格式化参与者列表显示
 							senderInfo := fmt.Sprintf("%v", notification.SenderIds)
 							receiverInfo := fmt.Sprintf("%v", notification.ReceiverIds)
 
-							log.Printf("📋 收到频道提议: %s (创建者: %s, 发送方: %s, 接收方: %s)",
-								notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
-							log.Printf("ℹ 频道提议需要确认。作为发送方，您需要接受此提议")
-							if notification.ProposalId != "" {
-								log.Printf("ℹ 请使用 'accept %s %s' 接受频道提议", notification.ChannelId, notification.ProposalId)
-							}
-							log.Printf("ℹ 所有参与方接受后，频道将被激活，您可以开始发送数据")
-						}
-					} else if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED {
-						// 频道已正式创建
-						// 格式化参与者列表显示
-						senderInfo := fmt.Sprintf("%v", notification.SenderIds)
-						receiverInfo := fmt.Sprintf("%v", notification.ReceiverIds)
-
-						log.Printf("📢 频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
+						log.Printf("[INFO] 收到频道提议: %s (创建者: %s, 发送方: %s, 接收方: %s)",
 							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
-						log.Printf("[OK] 您可以开始发送数据: 'sendto %s <data>'", notification.ChannelId)
+						log.Printf("[INFO] 频道提议需要确认。作为发送方，您需要接受此提议")
+						if notification.ProposalId != "" {
+							log.Printf("[INFO] 请使用 'accept %s %s' 接受频道提议", notification.ChannelId, notification.ProposalId)
+						}
+						log.Printf("[INFO] 所有参与方接受后，频道将被激活，您可以开始发送数据")
+						}
+				} else if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED {
+					// 频道已正式创建
+					// 格式化参与者列表显示
+					senderInfo := fmt.Sprintf("%v", notification.SenderIds)
+					receiverInfo := fmt.Sprintf("%v", notification.ReceiverIds)
+
+					log.Printf("[INFO] 频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
+						notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
+					log.Printf("[OK] 您可以开始发送数据: 'sendto %s <data>'", notification.ChannelId)
+
+					// 作为发送方订阅频道，用于接收接收方的 ACK
+					go func(chID string) {
+						_ = c.receiveDataSilent(chID)
+					}(notification.ChannelId)
 					} else if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_REJECTED {
 						// 频道提议已被拒绝
-						log.Printf("❌ 频道提议已被拒绝: %s (创建者: %s)",
+						log.Printf("[ERROR] 频道提议已被拒绝: %s (创建者: %s)",
 							notification.ChannelId, notification.CreatorId)
-						log.Printf("ℹ 频道协商已终止，无法使用此频道")
+						log.Printf("[INFO] 频道协商已终止，无法使用此频道")
 					}
 					continue
 				}
 
 				// 如果当前连接器不是接收方，跳过自动订阅
 				if !isReceiver {
-					log.Printf("ℹ 收到频道创建通知，但当前连接器既不是发送方也不是接收方，跳过")
+					log.Printf("[INFO] 收到频道创建通知，但当前连接器既不是发送方也不是接收方，跳过")
 					continue
 				}
 
@@ -729,20 +854,20 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 					if isCreator {
 						// 创建者已经自动接受，不需要显示额外信息
 						// onNotification回调已经显示了通知，这里不再重复显示
-						log.Printf("ℹ 等待其他参与方接受提议...")
+						log.Printf("[INFO] 等待其他参与方接受提议...")
 					} else {
 						// 收到提议通知，需要接受提议
 						// 格式化参与者列表显示
 						senderInfo := fmt.Sprintf("%v", notification.SenderIds)
 						receiverInfo := fmt.Sprintf("%v", notification.ReceiverIds)
 
-						log.Printf("📋 收到频道提议: %s (创建者: %s, 发送方: %s, 接收方: %s)",
+						log.Printf("[INFO] 收到频道提议: %s (创建者: %s, 发送方: %s, 接收方: %s)",
 							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
-						log.Printf("ℹ 频道提议需要确认。作为接收方，您需要接受此提议")
+						log.Printf("[INFO] 频道提议需要确认。作为接收方，您需要接受此提议")
 						if notification.ProposalId != "" {
-							log.Printf("ℹ 请使用 'accept %s %s' 接受频道提议", notification.ChannelId, notification.ProposalId)
+							log.Printf("[INFO] 请使用 'accept %s %s' 接受频道提议", notification.ChannelId, notification.ProposalId)
 						}
-						log.Printf("ℹ 所有参与方接受后，频道将被激活并自动开始接收数据")
+						log.Printf("[INFO] 所有参与方接受后，频道将被激活并自动开始接收数据")
 					}
 				} else if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED {
 
@@ -752,7 +877,7 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 					receiverInfo := fmt.Sprintf("%v", notification.ReceiverIds)
 
 					// 统一频道模式
-					log.Printf("📢 统一频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
+					log.Printf("[INFO] 统一频道已正式创建: %s (创建者: %s, 发送方: %s, 接收方: %s)",
 							notification.ChannelId, notification.CreatorId, senderInfo, receiverInfo)
 
 					// 自动订阅逻辑
@@ -760,7 +885,7 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 						// 创建文件接收器（用于自动接收文件）
 						outputDir := "./received"
 						if err := os.MkdirAll(outputDir, 0755); err != nil {
-							log.Printf("⚠ 创建接收目录失败: %v", err)
+							log.Printf("[WARN] 创建接收目录失败: %v", err)
 						}
 						fileReceiver := NewFileReceiver(outputDir, func(filePath, fileHash string) {
 							log.Printf("[OK] 文件自动接收并保存成功: %s (哈希: %s)", filePath, fileHash)
@@ -775,29 +900,29 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 							if IsFileTransferPacket(packet.Payload) {
 								// 处理文件传输数据包
 								if err := fileReceiver.HandleFilePacket(packet); err != nil {
-									log.Printf("⚠ 处理文件数据包失败: %v", err)
+									log.Printf("[WARN] 处理文件数据包失败: %v", err)
 								}
 							} else {
 								// 普通数据包，显示文本
-								log.Printf("📦 [频道: %s, 序列号: %d] 数据: %s", chID, packet.SequenceNumber, string(packet.Payload))
-								fmt.Printf("📦 [序列号: %d] 数据: %s\n", packet.SequenceNumber, string(packet.Payload))
+							log.Printf("[DATA] [频道: %s, 序列号: %d] 数据: %s", chID, packet.SequenceNumber, string(packet.Payload))
+							fmt.Printf("[DATA] [序列号: %d] 数据: %s\n", packet.SequenceNumber, string(packet.Payload))
 							}
 							return nil
 						})
 						if err != nil {
-							log.Printf("❌ 自动订阅失败: %v", err)
+							log.Printf("[ERROR] 自动订阅失败: %v", err)
 						} else {
 							log.Printf("[OK] 频道 %s 已关闭", chID)
 						}
 					}(notification.ChannelId)
 					} else if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_REJECTED {
 						// 频道提议已被拒绝
-						log.Printf("❌ 频道提议已被拒绝: %s (创建者: %s)",
+						log.Printf("[ERROR] 频道提议已被拒绝: %s (创建者: %s)",
 							notification.ChannelId, notification.CreatorId)
-						log.Printf("ℹ 频道协商已终止，无法使用此频道")
+						log.Printf("[INFO] 频道协商已终止，无法使用此频道")
 					} else {
 						// inactive 或其他状态：不显示详细通知，只记录简单日志
-						log.Printf("ℹ 收到频道创建通知 (频道: %s, 创建者: %s)，但连接器状态为 %s，不会自动订阅。请手动使用 'receive %s' 订阅",
+						log.Printf("[INFO] 收到频道创建通知 (频道: %s, 创建者: %s)，但连接器状态为 %s，不会自动订阅。请手动使用 'receive %s' 订阅",
 							notification.ChannelId, notification.CreatorId, c.status, notification.ChannelId)
 					}
 				}
@@ -928,7 +1053,7 @@ func (c *Connector) WaitForChannelNotification() (<-chan *pb.ChannelNotification
 		for {
 			notification, err := stream.Recv()
 			if err != nil {
-				log.Printf("⚠ 通知接收错误: %v", err)
+				log.Printf("[WARN] 通知接收错误: %v", err)
 				return
 			}
 			notifyChan <- notification
@@ -1222,7 +1347,7 @@ func (c *Connector) ProposeChannel(senderIDs []string, receiverIDs []string, dat
 	// 创建者自动接受提议
 	if resp.ProposalId != "" {
 		if err := c.AcceptChannelProposal(resp.ChannelId, resp.ProposalId); err != nil {
-			log.Printf("⚠ 创建者自动接受提议失败: %v", err)
+			log.Printf("[WARN] 创建者自动接受提议失败: %v", err)
 			// 不返回错误，继续执行，因为提议已经创建成功
 		} else {
 			log.Printf("[OK] 创建者已自动接受频道提议: %s", resp.ChannelId)
@@ -1658,7 +1783,7 @@ func (fr *FileReceiver) handleFileEnd(jsonData []byte) error {
 	transferID := end.TransferID
 
 	if receivedChunks < totalChunks {
-		log.Printf("⚠ 文件传输结束，但只接收到 %d/%d 块 (传输ID: %s)", receivedChunks, totalChunks, transferID)
+		log.Printf("[WARN] 文件传输结束，但只接收到 %d/%d 块 (传输ID: %s)", receivedChunks, totalChunks, transferID)
 	}
 
 	fr.transfersMu.Unlock()
@@ -1852,3 +1977,322 @@ func (c *Connector) RejectChannelSubscription(channelID, requestID, reason strin
 	return resp, nil
 }
 
+// =============================================================================
+// 业务数据哈希链相关方法
+// =============================================================================
+
+// HasBusinessChainManager 检查是否启用了业务哈希链
+func (c *Connector) HasBusinessChainManager() bool {
+	return c.businessChainManager != nil
+}
+
+// GetBusinessChainManager 获取业务哈希链管理器
+func (c *Connector) GetBusinessChainManager() *conn_db.BusinessChainManager {
+	return c.businessChainManager
+}
+
+// GetLastDataHashFromKernel 从内核获取指定频道的最新data_hash
+func (c *Connector) GetLastDataHashFromKernel(channelID string) (string, error) {
+	if c.businessChainSvc == nil {
+		return "", fmt.Errorf("business chain service not available")
+	}
+
+	resp, err := c.businessChainSvc.GetLastDataHash(c.ctx, &pb.GetLastDataHashRequest{
+		ConnectorId: c.connectorID,
+		ChannelId:   channelID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get last data hash from kernel: %w", err)
+	}
+	if !resp.Success {
+		return "", fmt.Errorf("failed to get last data hash: %s", resp.Message)
+	}
+
+	return resp.LastDataHash, nil
+}
+
+// SyncDataHashFromKernel 从内核同步最新data_hash到本地
+// 用于连接器重启后或本地无记录时同步状态
+func (c *Connector) SyncDataHashFromKernel(channelID string) error {
+	if c.businessChainManager == nil {
+		return fmt.Errorf("business chain manager not initialized")
+	}
+
+	lastHash, err := c.GetLastDataHashFromKernel(channelID)
+	if err != nil {
+		return fmt.Errorf("failed to get last data hash from kernel: %w", err)
+	}
+
+	// 如果内核也没有记录，则不需要同步
+	if lastHash == "" {
+		log.Printf("[OK] No data hash to sync from kernel for channel %s", channelID)
+		return nil
+	}
+
+	// 检查是否已有同步记录
+	existingRecord, err := c.businessChainManager.GetLastDataHash(channelID)
+	if err != nil {
+		return fmt.Errorf("failed to check existing record: %w", err)
+	}
+
+	// 如果本地已有记录且哈希相同，不需要重复同步
+	if existingRecord == lastHash {
+		log.Printf("[OK] Local hash already synced with kernel for channel %s", channelID)
+		return nil
+	}
+
+	// 记录同步信息（由后续数据包更新 prev_hash）
+	log.Printf("[OK] Synced data hash from kernel: channel=%s, last_hash=%s", channelID, lastHash)
+	return nil
+}
+
+// QueryBusinessChain 查询业务哈希链
+func (c *Connector) QueryBusinessChain(channelID string, limit int32) ([]*conn_db.BusinessChainRecord, error) {
+	if c.businessChainManager == nil {
+		return nil, fmt.Errorf("business chain manager not initialized")
+	}
+
+	records, err := c.businessChainManager.GetChainRecords(channelID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query chain: %w", err)
+	}
+
+	return records, nil
+}
+
+// GetBusinessChainRecordsFromKernel 从内核查询业务哈希链
+func (c *Connector) GetBusinessChainRecordsFromKernel(channelID string, limit int32) ([]*pb.ChainRecord, error) {
+	if c.businessChainSvc == nil {
+		return nil, fmt.Errorf("business chain service not available")
+	}
+
+	resp, err := c.businessChainSvc.QueryChain(c.ctx, &pb.QueryChainRequest{
+		ConnectorId: c.connectorID,
+		ChannelId:   channelID,
+		Limit:       limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query chain from kernel: %w", err)
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("failed to query chain: %s", resp.Message)
+	}
+
+	return resp.Records, nil
+}
+
+// =============================================================================
+// 文件传输协议常量
+// =============================================================================
+
+// =============================================================================
+// 签名相关辅助方法
+// =============================================================================
+
+// loadPrivateKey 加载 RSA 私钥
+func (c *Connector) loadPrivateKey(keyPath string) (*rsa.PrivateKey, error) {
+	keyData, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read private key file: %w", err)
+	}
+
+	block, _ := pem.Decode(keyData)
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode PEM block")
+	}
+
+	rsaKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		key, err2 := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err2 != nil {
+			return nil, fmt.Errorf("failed to parse private key: PKCS1=%v, PKCS8=%v", err, err2)
+		}
+		var ok bool
+		rsaKey, ok = key.(*rsa.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("private key is not RSA")
+		}
+	}
+
+	return rsaKey, nil
+}
+
+// signData 使用 RSA 私钥对数据进行签名
+func (c *Connector) signData(data []byte, privateKey *rsa.PrivateKey) ([]byte, error) {
+	hash := sha256.Sum256(data)
+	return rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, hash[:], nil)
+}
+
+// connectorSignDataHash connector 对 dataHash 进行签名
+// 输入: dataHash（原始字节）+ prevSignature（上一跳签名，可为空）
+// 签名输入: dataHash + prevSignature（原始字节拼接）
+func (c *Connector) connectorSignDataHash(dataHash []byte, prevSignature []byte) ([]byte, error) {
+	privateKey, err := c.loadPrivateKey(c.clientKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load connector private key: %w", err)
+	}
+
+	// 签名输入: dataHash + prevSignature（原始字节拼接，不哈希）
+	signInput := append(dataHash, prevSignature...)
+	return c.signData(signInput, privateKey)
+}
+
+// connectorSignDataHashHex connector 对 dataHash 进行签名，返回 hex 编码
+func (c *Connector) connectorSignDataHashHex(dataHash string, prevSignatureHex string) (string, error) {
+	privateKey, err := c.loadPrivateKey(c.clientKeyPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to load connector private key: %w", err)
+	}
+
+	// 签名输入: dataHash + prevSignature（原始字节拼接，不哈希）
+	signInput := append([]byte(dataHash), []byte(prevSignatureHex)...)
+	hash := sha256.Sum256(signInput)
+	signature, err := rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, hash[:], nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to sign: %w", err)
+	}
+	return hex.EncodeToString(signature), nil
+}
+
+// connectorRecordBusinessData connector 记录业务数据哈希链（connector-A 发送时调用）
+// 返回: dataHash（hex），signature（hex）
+func (c *Connector) connectorRecordBusinessData(channelID string, data []byte) (dataHash, signature string, err error) {
+	if c.businessChainManager == nil {
+		return "", "", fmt.Errorf("business chain manager not initialized")
+	}
+
+	// 1. 获取频道上一条记录
+	prevRecord, err := c.businessChainManager.GetLastRecord(channelID)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get last record: %w", err)
+	}
+
+	prevHash := ""
+	prevSignature := ""
+	if prevRecord != nil {
+		prevHash = prevRecord.DataHash
+		prevSignature = prevRecord.Signature
+	}
+
+	// 2. 计算 data_hash = SHA256(data + prevHash)
+	var hashInput []byte
+	if prevHash != "" {
+		hashInput = append(data, []byte(prevHash)...)
+	} else {
+		hashInput = data
+	}
+	hash := sha256.Sum256(hashInput)
+	dataHash = hex.EncodeToString(hash[:])
+
+	// 3. 签名: RSA_Sign(dataHash + prevHash)
+	var signInput []byte
+	if prevHash != "" {
+		signInput = append([]byte(dataHash), []byte(prevHash)...)
+	} else {
+		signInput = []byte(dataHash)
+	}
+	hash2 := sha256.Sum256(signInput)
+	privateKey, err := c.loadPrivateKey(c.clientKeyPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to load connector private key: %w", err)
+	}
+	sigBytes, err := rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, hash2[:], nil)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to sign: %w", err)
+	}
+	signature = hex.EncodeToString(sigBytes)
+
+	// 4. 写入本地 business_data_chain
+	err = c.businessChainManager.RecordChainData(channelID, dataHash, prevHash, prevSignature, signature)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to record chain data: %w", err)
+	}
+
+	return dataHash, signature, nil
+}
+
+// connectorReceiveBusinessData connector 接收业务数据时写入本地 business_data_chain
+// 从 packet.Signature 提取上一跳（kernel）的签名，记录 data_hash 和 prev_signature
+func (c *Connector) connectorReceiveBusinessData(channelID, dataHash, prevSignatureHex string) error {
+	if c.businessChainManager == nil {
+		return fmt.Errorf("business chain manager not initialized")
+	}
+
+	// 1. 获取频道上一条记录的 dataHash（用于 prev_hash）
+	prevHash, err := c.businessChainManager.GetLastDataHash(channelID)
+	if err != nil {
+		return fmt.Errorf("failed to get last data hash: %w", err)
+	}
+
+	// 2. 写入本地 business_data_chain
+	// prevSignature 是 kernel-2 的签名（来自 packet.Signature 或 packet.AckPrevSignature）
+	err = c.businessChainManager.RecordChainData(channelID, dataHash, prevHash, prevSignatureHex, "")
+	if err != nil {
+		return fmt.Errorf("failed to record chain data: %w", err)
+	}
+
+	return nil
+}
+
+// sendAckForData 接收方（connector-B）对收到的数据包生成并发送 ACK 给内核
+// dataHash: 被确认的数据包的 data_hash
+// kernelSignature: 上一跳（kernel）的签名，作为 ACK 签名输入的一部分
+// flowID: 业务流程ID
+func (c *Connector) sendAckForData(channelID, dataHash, kernelSignature, flowID string) {
+	if c.channelSvc == nil {
+		log.Printf("[WARN] Channel service not available, cannot send ACK")
+		return
+	}
+
+	prevSignature := kernelSignature
+
+	// 签名输入: dataHash + prevSignature（原始字节拼接）
+	// connector-B 使用自己的私钥签名
+	dataHashBytes, _ := hex.DecodeString(dataHash)
+	kernelSigBytes, _ := hex.DecodeString(kernelSignature)
+	signatureBytes, err := c.connectorSignDataHash(dataHashBytes, kernelSigBytes)
+	if err != nil {
+		log.Printf("[WARN] Failed to sign ACK: %v", err)
+		return
+	}
+	connectorSignature := hex.EncodeToString(signatureBytes)
+
+	// 记录 ACK 到本地 business_data_chain
+	if c.businessChainManager != nil {
+		if err := c.businessChainManager.HandleAck(channelID, prevSignature, connectorSignature); err != nil {
+			log.Printf("[WARN] Failed to record ACK locally: %v", err)
+		}
+	}
+
+	// 发送 ACK 给内核
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := c.channelSvc.SendAck(ctx, &pb.AckPacket{
+		ChannelId:  channelID,
+		DataHash:   dataHash,
+		SenderId:   c.connectorID,
+		Signature:  connectorSignature,
+		FlowId:     flowID,
+	})
+	if err != nil {
+		log.Printf("[WARN] Failed to send ACK for data_hash=%s: %v", dataHash, err)
+		return
+	}
+	if !resp.Success {
+		log.Printf("[WARN] ACK rejected by kernel: %s", resp.Message)
+		return
+	}
+	log.Printf("[OK] ACK sent")
+}
+
+// recordAckFromKernel 接收方（connector-B）从内核收到转发的 ACK，写入本地链
+// dataHash: 被确认的 data_hash
+// ackSignature: kernel 对 connectorSignature 的签名
+// prevSignature: connector-B 自己的签名（作为 prev_signature 记录）
+func (c *Connector) recordAckFromKernel(channelID, dataHash, ackSignature, prevSignature string) error {
+	if c.businessChainManager == nil {
+		return fmt.Errorf("business chain manager not initialized")
+	}
+	return c.businessChainManager.HandleAck(channelID, prevSignature, ackSignature)
+}
