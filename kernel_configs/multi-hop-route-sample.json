@@ -8,7 +8,7 @@
       "hop_id": 1,
       "from_kernel": "kernel-1",
       "to_kernel": "kernel-2",
-      "to_address": "192.168.202.136",
+      "to_address": "192.168.202.128",
       "to_port": 50053,
       "auto_connect": true
     },
@@ -16,7 +16,7 @@
       "hop_id": 2,
       "from_kernel": "kernel-2",
       "to_kernel": "kernel-3",
-      "to_address": "192.168.202.140",
+      "to_address": "192.168.202.129",
       "to_port": 50053,
       "auto_connect": true
     }

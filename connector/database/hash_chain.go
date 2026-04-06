@@ -95,7 +95,6 @@ func (m *BusinessChainManager) ReceiveAndSign(data []byte, channelID, sourceSign
 	if err != nil {
 		return "", fmt.Errorf("failed to save chain record: %w", err)
 	}
-
 	return signature, nil
 }
 
@@ -107,6 +106,18 @@ func (m *BusinessChainManager) HandleAck(channelID, prevSignature, signature str
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// 去重：同一 (channelID, prevSignature) 组合只记录一次
+	// 避免同一个 ACK 被多次调用 HandleAck（如 kernel-1 收到两个转发路径的 ACK）导致重复插入
+	existingRecords, err := m.store.GetRecordsByChannel(channelID)
+	if err == nil {
+		for _, rec := range existingRecords {
+			if rec.DataHash == "" && rec.PrevSignature == prevSignature {
+				// 已存在相同 prevSignature 的 ACK 记录，跳过
+				return nil
+			}
+		}
+	}
+
 	ackRecord := &BusinessChainRecord{
 		ChannelID:     channelID,
 		DataHash:      "", // ACK的data_hash为空
@@ -116,7 +127,7 @@ func (m *BusinessChainManager) HandleAck(channelID, prevSignature, signature str
 		Timestamp:     time.Now(),
 	}
 
-	_, err := m.store.AppendChainRecord(ackRecord)
+	_, err = m.store.AppendChainRecord(ackRecord)
 	if err != nil {
 		return fmt.Errorf("failed to save ack record: %w", err)
 	}
@@ -134,63 +145,19 @@ func (m *BusinessChainManager) GetLastDataHash(channelID string) (string, error)
 		return "", fmt.Errorf("failed to get last record: %w", err)
 	}
 	if record == nil {
-		return "", nil // 没有记录，返回空字符串
+		return "", nil
 	}
 	return record.DataHash, nil
 }
 
-// GetLastRecord 获取指定频道的最新记录（包含所有字段）
-func (m *BusinessChainManager) GetLastRecord(channelID string) (*BusinessChainRecord, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	record, err := m.store.GetLastRecordByChannel(channelID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get last record: %w", err)
-	}
-	return record, nil
-}
-
-// GetChainRecords 获取指定频道的完整哈希链
-func (m *BusinessChainManager) GetChainRecords(channelID string) ([]*BusinessChainRecord, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	records, err := m.store.GetRecordsByChannel(channelID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get chain records: %w", err)
-	}
-	return records, nil
-}
-
-// RecordChainData 记录业务数据哈希链（由 connector.RecordChainData 调用）
-// 接收方写入本地 business_data_chain
-func (m *BusinessChainManager) RecordChainData(channelID, dataHash, prevHash, prevSignature, signature string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	newRecord := &BusinessChainRecord{
-		ChannelID:     channelID,
-		DataHash:      dataHash,
-		PrevHash:      prevHash,
-		PrevSignature: prevSignature,
-		Signature:     signature,
-		Timestamp:     time.Now(),
-	}
-
-	_, err := m.store.AppendChainRecord(newRecord)
-	if err != nil {
-		return fmt.Errorf("failed to save chain record: %w", err)
-	}
-
-	return nil
-}
-
 // VerifyChain 验证哈希链的完整性
 func (m *BusinessChainManager) VerifyChain(channelID string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	records, err := m.store.GetRecordsByChannel(channelID)
 	if err != nil {
-		return false, fmt.Errorf("failed to get chain records: %w", err)
+		return false, fmt.Errorf("failed to get records: %w", err)
 	}
 
 	if len(records) == 0 {
@@ -209,12 +176,70 @@ func (m *BusinessChainManager) VerifyChain(channelID string) (bool, error) {
 			continue
 		}
 
-		// 验证prev_hash是否等于前一条记录的data_hash
-		if record.PrevHash != records[i-1].DataHash {
-			return false, fmt.Errorf("chain broken at record %d: expected prev_hash %s, got %s",
-				record.ID, records[i-1].DataHash, record.PrevHash)
+		// 找到前一条业务数据记录
+		prevRecord := records[i-1]
+		if prevRecord.DataHash == "" {
+			// 上一条是ACK记录，找更前面的记录
+			for j := i - 2; j >= 0; j-- {
+				if records[j].DataHash != "" {
+					prevRecord = records[j]
+					break
+				}
+			}
+		}
+
+		// 验证 prev_hash
+		if record.PrevHash != prevRecord.DataHash {
+			return false, fmt.Errorf("hash chain broken at record %d: expected prev_hash=%s, got %s",
+				record.ID, prevRecord.DataHash, record.PrevHash)
 		}
 	}
 
 	return true, nil
+}
+
+// GetLastRecord 获取指定频道的最新记录（含 ACK，用于取 prevSignature）
+func (m *BusinessChainManager) GetLastRecord(channelID string) (*BusinessChainRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.store.GetLastRecordWithAck(channelID)
+}
+
+// GetLastNonAckRecord 获取指定频道的最新业务记录（不含 ACK，用于取 prevHash）
+func (m *BusinessChainManager) GetLastNonAckRecord(channelID string) (*BusinessChainRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.store.GetLastRecordByChannel(channelID)
+}
+
+// GetChainRecords 获取指定频道的所有记录（含 ACK）
+func (m *BusinessChainManager) GetChainRecords(channelID string) ([]*BusinessChainRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.store.GetRecordsByChannel(channelID)
+}
+
+// RecordChainData 直接记录业务数据哈希链（由 connector 侧调用）
+// dataHash: 当前数据包的 data_hash
+// prevHash: 前一个数据包的 data_hash
+// prevSignature: 前一个数据包的签名
+// signature: 当前节点对 dataHash 的签名（可以为空）
+func (m *BusinessChainManager) RecordChainData(channelID, dataHash, prevHash, prevSignature, signature string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	record := &BusinessChainRecord{
+		ChannelID:     channelID,
+		DataHash:      dataHash,
+		PrevHash:      prevHash,
+		PrevSignature: prevSignature,
+		Signature:     signature,
+		Timestamp:     time.Now(),
+	}
+
+	_, err := m.store.AppendChainRecord(record)
+	if err != nil {
+		return fmt.Errorf("failed to record chain data: %w", err)
+	}
+	return nil
 }

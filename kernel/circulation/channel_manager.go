@@ -119,6 +119,11 @@ type Channel struct {
 	bufferMu      sync.RWMutex   // 暂存缓冲区的锁
 	maxBufferSize int           // 最大暂存数量
 
+	// 当前流 FlowId（在 SubscribeData 收包时设置，SendAck 时使用）
+	// 解决跨内核场景下 ACK 包丢失原始 FlowId 的问题
+	currentFlowID string
+	currentFlowMu sync.RWMutex
+
 	// 权限变更管理
 	permissionRequests []*PermissionChangeRequest // 权限变更请求列表
 	permissionMu       sync.RWMutex               // 权限变更锁
@@ -145,8 +150,12 @@ type DataPacket struct {
 	IsFinal        bool      // 是否是最后一个数据包（流结束标志）
 	DataHash       string    // 业务数据哈希（由内核计算并填充）
 	// ACK 专用字段
-	IsAck          bool      // 是否是 ACK 数据包
-	AckPrevSignature string  // ACK 中 prev_signature（上一跳签名）
+	IsAck bool // 是否是 ACK 数据包
+	// ACK_RECEIVED 防重标记：ForwardData 已记录后置 true，避免 SendAck 重复记录
+	AckEvidenceRecorded bool
+	// 发送完成回调：数据包成功发送给所有订阅者后调用
+	// 用于在 ReceiveData goroutine 处理完成后才记录 evidence，避免因果顺序错误
+	AfterSent func()
 }
 
 // PermissionChangeRequest 权限变更请求
@@ -201,6 +210,11 @@ type ChannelManager struct {
 	// 参数: currentKernelID(当前内核ID), targetKernelID(最终目标内核ID)
 	// 返回: nextKernelID(下一跳内核ID), address(下一跳地址), port(下一跳端口), hopIndex(当前第几跳), totalHops(总跳数), found(是否找到路由)
 	GetNextHopKernel func(currentKernelID, targetKernelID string) (nextKernelID, address string, port int, hopIndex, totalHops int, found bool)
+
+	// GetPreviousHopKernel 回调，用于获取反向路由的上一跳内核（ACK 反向转发用）
+	// 参数: sourceKernelID(当前内核ID)
+	// 返回: prevKernelID(上一跳内核ID), address(上一跳地址), port(上一跳端口), found(是否找到路由)
+	GetPreviousHopKernel func(sourceKernelID string) (prevKernelID, address string, port int, found bool)
 
 	// 当前内核ID（用于跨内核通信时判断是否需要转发）
 	kernelID string
@@ -366,6 +380,15 @@ func (cm *ChannelManager) SetGetNextHopKernel(fn func(currentKernelID, targetKer
 	log.Printf("[OK] Multi-hop route callback set in ChannelManager")
 }
 
+// SetGetPreviousHopKernel 设置获取反向路由上一跳的回调函数
+// 这个回调用于在多跳场景下确定 ACK 反向转发的下一跳目标
+func (cm *ChannelManager) SetGetPreviousHopKernel(fn func(sourceKernelID string) (prevKernelID, address string, port int, found bool)) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.GetPreviousHopKernel = fn
+	log.Printf("[OK] Multi-hop previous hop callback set in ChannelManager")
+}
+
 // SetPermissionChangeCallback 设置权限变更回调
 func (cm *ChannelManager) SetPermissionChangeCallback(callback func(channelID, connectorID, changeType string)) {
 	cm.mu.Lock()
@@ -407,6 +430,34 @@ func (c *Channel) GetRemoteKernelID(connectorID string) (kernelID string, ok boo
 	}
 	kernelID, ok = c.remoteReceivers[connectorID]
 	return kernelID, ok
+}
+
+// SetCurrentFlowID 设置当前流的 FlowId（SendAck 时用于获取原始 FlowId）
+func (c *Channel) SetCurrentFlowID(flowID string) {
+	c.currentFlowMu.Lock()
+	defer c.currentFlowMu.Unlock()
+	c.currentFlowID = flowID
+}
+
+// GetCurrentFlowID 获取当前流的 FlowId（SendAck 时使用）
+func (c *Channel) GetCurrentFlowID() string {
+	c.currentFlowMu.RLock()
+	defer c.currentFlowMu.RUnlock()
+	return c.currentFlowID
+}
+
+// GetOriginKernelID 获取原始发送内核 ID（用于 SendAck 多跳转发 ACK）
+// 从 SenderIDs 中查找带 kernel 前缀的发送者，返回第一个找到的内核 ID
+func (c *Channel) GetOriginKernelID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, senderID := range c.SenderIDs {
+		if strings.Contains(senderID, ":") {
+			parts := strings.SplitN(senderID, ":", 2)
+			return parts[0] // 返回 kernel ID
+		}
+	}
+	return ""
 }
 
 // GetConfigManager 获取频道配置管理器
@@ -1145,6 +1196,34 @@ func (c *Channel) CanReceive(connectorID string) bool {
 	return false
 }
 
+// IsSender 检查连接器是否是此频道的发送方
+func (c *Channel) IsSender(connectorID string) bool {
+	// 提取裸 connectorID（去掉 kernel 前缀）
+	rawConnectorID := connectorID
+	if idx := strings.LastIndex(connectorID, ":"); idx != -1 {
+		rawConnectorID = connectorID[idx+1:]
+	}
+
+	for _, senderID := range c.SenderIDs {
+		// 精确匹配或裸 ID 匹配
+		if connectorID == senderID {
+			return true
+		}
+		// 检查 senderID 是否是 "kernel:connector" 格式
+		if senderIdx := strings.LastIndex(senderID, ":"); senderIdx != -1 {
+			senderRaw := senderID[senderIdx+1:]
+			if rawConnectorID == senderRaw {
+				return true
+			}
+		}
+		// 也处理 senderID 不带内核前缀的情况
+		if rawConnectorID == senderID {
+			return true
+		}
+	}
+	return false
+}
+
 // GetChannel 获取频道
 func (cm *ChannelManager) GetChannel(channelID string) (*Channel, error) {
 	cm.mu.RLock()
@@ -1260,16 +1339,22 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		return fmt.Errorf("channel is not active")
 	}
 
-	// 对于控制消息和证据消息，跳过发送方权限验证
-	if packet.MessageType == MessageTypeControl {
-		// other control message types (permission_result, channel_proposal, etc.)
-		// fall through to normal subscriber distribution
+	// 权限检查：发送方必须是频道的发送方
+	// 注意：ACK 消息由内核转发，SenderID 是 connector-U（接收方），不是发送方 connector-A
+	// 因此 ACK 消息需要特殊处理，不能用 CanSend 验证
+	// 由于 MessageType 在 gRPC 转发时会丢失，改用 IsAck 字段判断
+	if packet.IsAck {
+		// ACK 消息由内核转发，跳过发送方权限验证
+		// IsAck 字段在 proto DataPacket 中定义，会正确序列化
 	} else if packet.MessageType == MessageTypeEvidence {
 		// 证据消息由内核发送，不应该被阻止，跳过验证
-	} else if packet.MessageType == MessageTypeAck {
-		// ACK 消息由内核转发，不应该被阻止，跳过验证
+	} else if packet.MessageType == MessageTypeControl {
+		// 控制消息可以由授权参与者发送
+		if !c.CanSend(packet.SenderID) {
+			return fmt.Errorf("sender %s is not authorized to send data in this channel", packet.SenderID)
+		}
 	} else {
-		// 验证发送方是否有权限发送
+		// 业务数据包需要验证发送方权限
 		if !c.CanSend(packet.SenderID) {
 			return fmt.Errorf("sender %s is not authorized to send data in this channel", packet.SenderID)
 		}
@@ -1277,10 +1362,19 @@ func (c *Channel) PushData(packet *DataPacket) error {
 
 	c.LastActivity = time.Now()
 
+	// 保存当前流的 FlowId（跨内核场景下 SendAck 时需要使用原始 FlowId）
+	// 条件：数据包有 FlowId 且不是 ACK 包（ACK 包的 FlowId 为空，会覆盖已保存的正确值）
+	if packet.FlowID != "" {
+		c.SetCurrentFlowID(packet.FlowID)
+	} else if packet.IsAck && c.GetCurrentFlowID() == "" {
+		// ACK 包但没有已保存的 flowID，记录警告（理论上不应该发生）
+		log.Printf("[WARN] PushData ACK with empty FlowId and no saved flowID: channelID=%s", packet.ChannelID)
+	}
+
 	// 不使用锁，直接检查 subscribers 和 remoteReceivers
 	// 因为证据消息是内核内部产生的，不涉及并发修改
 	hasSubscribers := len(c.subscribers) > 0
-	
+
 	// 确定需要接收此数据的目标接收者（多对多模式，支持所有接收方）
 	targetReceivers := make([]string, 0, len(c.ReceiverIDs))
 	targetReceivers = append(targetReceivers, c.ReceiverIDs...)
@@ -1288,10 +1382,73 @@ func (c *Channel) PushData(packet *DataPacket) error {
 	// 处理目标列表，支持远端目标格式 kernelID:connectorID
 	remoteTargetsByKernel := make(map[string][]string)
 	localTargets := make([]string, 0)
+
 	// offline 本地 targets
 	offlineTargets := make([]string, 0)
 
-	if len(packet.TargetIDs) > 0 {
+	// ================================================================
+	// ACK 反向路由（多跳场景）
+	// 数据流正向：kernel-1 → kernel-2 → kernel-3 → connector-X
+	// ACK 流反向：connector-X → kernel-3 → kernel-2 → kernel-1
+	//
+	// 正确的反向路由逻辑：
+	// - kernel-3: GetPreviousHop(kernel-3) 返回 kernel-2，转发到 kernel-2
+	// - kernel-2: GetPreviousHop(kernel-2) 返回 kernel-1，转发到 kernel-1
+	// - kernel-1: GetPreviousHop(kernel-1) 返回空，停止转发
+	//
+	// 使用 GetPreviousHopKernel(currentKernelID) 获取反向下一跳
+	// 签名追加由 kernel 层在 SendAck/ForwardData 中处理。
+	// ================================================================
+	isCrossKernelAck := false
+	if packet.IsAck {
+		currentKernelID := ""
+		if c.manager != nil {
+			currentKernelID = c.manager.kernelID
+		}
+		for _, targetID := range packet.TargetIDs {
+			if strings.Contains(targetID, ":") {
+				parts := strings.SplitN(targetID, ":", 2)
+				originKernel := parts[0]
+				// originKernel != currentKernelID 表示这是反向转发的 ACK，需要继续转发
+				if originKernel != "" && originKernel != currentKernelID {
+					// 需要反向转发：使用 GetPreviousHopKernel 获取当前内核的上一跳
+					// GetPreviousHopKernel(currentKernelID) 返回 currentKernelID 的上一跳
+					// 例如：kernel-2 调用 GetPreviousHopKernel(kernel-2) 返回 kernel-1
+					if c.manager != nil && c.manager.GetPreviousHopKernel != nil {
+						prevKernel, _, _, found := c.manager.GetPreviousHopKernel(currentKernelID)
+						if found && prevKernel != "" && prevKernel != currentKernelID {
+							isCrossKernelAck = true // 跳过本地队列
+							// 转发到反向下一跳（上一跳内核）
+							remoteTargetsByKernel[prevKernel] = []string{targetID}
+							localTargets = nil // ACK 不发给本地订阅者
+							log.Printf("[INFO] ACK reverse routing: %s -> %s (prev hop), origin=%s",
+								currentKernelID, prevKernel, targetID)
+							break
+						}
+					}
+				}
+			}
+		}
+		// 防止后续对空 TargetIDs 的 early return
+		if len(packet.TargetIDs) == 0 {
+			return nil
+		}
+	}
+
+	// 跨内核 ACK 跳过本地队列（避免 connector-A 本地订阅者收到 kernel-3 签名的 ACK）
+	if isCrossKernelAck {
+		hasSubscribers = false
+	}
+
+	// ACK 反向路由场景下，跳过正常的 TargetIDs 处理
+	// 因为 ACK 反向路由已经在上面处理过了
+	if isCrossKernelAck {
+		// 已经设置了 remoteTargetsByKernel 和 isCrossKernelAck
+		// 跳过正常的 TargetIDs 处理，避免重复添加
+		if len(remoteTargetsByKernel) == 0 {
+			return nil
+		}
+	} else if len(packet.TargetIDs) > 0 {
 		for _, targetID := range packet.TargetIDs {
 			if strings.Contains(targetID, ":") {
 				parts := strings.SplitN(targetID, ":", 2)
@@ -1467,10 +1624,17 @@ func (c *Channel) PushData(packet *DataPacket) error {
 	if hasSubscribers {
 		select {
 		case c.dataQueue <- packet:
-			// 成功推送到队列
+			// AfterSent 在数据包成功入队后立即调用（不依赖 startDataDistribution 的异步分发）
+			// 保证因果顺序：DATA_SEND 由 forwardToKernel 先记录，然后 AfterSent 才记录 DATA_RECEIVE
+			if packet.AfterSent != nil {
+				packet.AfterSent()
+			}
 		case <-time.After(5 * time.Second):
 			return fmt.Errorf("timeout pushing data to channel")
 		}
+	} else if packet.AfterSent != nil {
+		// 跨内核频道无本地订阅者时，也需要调用 AfterSent
+		packet.AfterSent()
 	}
 
 	if shouldBuffer {
@@ -1482,13 +1646,18 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		}
 		// 复制数据包以避免并发问题
 		bufferedPacket := &DataPacket{
-			ChannelID:      packet.ChannelID,
-			SequenceNumber: packet.SequenceNumber,
-			Payload:        make([]byte, len(packet.Payload)),
-			Signature:      packet.Signature,
-			Timestamp:      packet.Timestamp,
-			SenderID:       packet.SenderID,
-			TargetIDs:      make([]string, len(packet.TargetIDs)),
+			ChannelID:        packet.ChannelID,
+			SequenceNumber:  packet.SequenceNumber,
+			Payload:          make([]byte, len(packet.Payload)),
+			Signature:        packet.Signature,
+			Timestamp:        packet.Timestamp,
+			SenderID:         packet.SenderID,
+			TargetIDs:        make([]string, len(packet.TargetIDs)),
+			FlowID:           packet.FlowID,
+			IsFinal:          packet.IsFinal,
+			DataHash:            packet.DataHash,
+			AckEvidenceRecorded: packet.AckEvidenceRecorded,
+			AfterSent:        packet.AfterSent,
 		}
 		copy(bufferedPacket.Payload, packet.Payload)
 		copy(bufferedPacket.TargetIDs, packet.TargetIDs)
@@ -1520,7 +1689,7 @@ func (c *Channel) PushData(packet *DataPacket) error {
 			if found && nextKernel != "" {
 				// 使用多跳路由，只转发到下一跳
 				actualTargetKernel = nextKernel
-				log.Printf("🔄 Multi-hop: forwarding to next hop %s (hop %d/%d) instead of final target %s",
+				log.Printf("[INFO] Multi-hop: forwarding to next hop %s (hop %d/%d) instead of final target %s",
 					nextKernel, hopIndex, totalHops, rk)
 
 					// 如果是最后一跳，设置 IsFinal=true（通知下一跳这是最后一跳数据）
@@ -1529,32 +1698,49 @@ func (c *Channel) PushData(packet *DataPacket) error {
 				}
 			}
 
-			outPacket := &DataPacket{
-				ChannelID:      packet.ChannelID,
-				SequenceNumber: packet.SequenceNumber,
-				Payload:        make([]byte, len(packet.Payload)),
-				Signature:      packet.Signature,
-				Timestamp:      packet.Timestamp,
-				SenderID:       packet.SenderID,
-				TargetIDs:      make([]string, len(connectorIDs)),
-				MessageType:    packet.MessageType,
-				FlowID:         packet.FlowID,
-				IsFinal:        packet.IsFinal,
-			}
-			copy(outPacket.Payload, packet.Payload)
-			copy(outPacket.TargetIDs, connectorIDs)
+		outPacket := &DataPacket{
+			ChannelID:           packet.ChannelID,
+			SequenceNumber:     packet.SequenceNumber,
+			Payload:             make([]byte, len(packet.Payload)),
+			Signature:           "", // 稍后由 KernelSign 生成
+			Timestamp:           packet.Timestamp,
+			SenderID:            packet.SenderID,
+			TargetIDs:           make([]string, len(connectorIDs)),
+			MessageType:         packet.MessageType,
+			FlowID:              packet.FlowID,
+			IsFinal:             packet.IsFinal,
+			DataHash:            packet.DataHash,
+			IsAck:               packet.IsAck,
+			AckEvidenceRecorded: packet.AckEvidenceRecorded,
+			AfterSent:           packet.AfterSent,
+		}
+		copy(outPacket.Payload, packet.Payload)
+		copy(outPacket.TargetIDs, connectorIDs)
 
-			// 传递原始目标内核ID，用于存证记录
-			// 使用 TargetIDs 的第一个元素来传递原始目标
-			if len(connectorIDs) > 0 {
-				outPacket.TargetIDs[0] = rk + ":" + connectorIDs[0] // 格式: "最终目标内核:连接器"
-			}
-
-			if err := c.manager.forwardToKernel(actualTargetKernel, outPacket, packet.IsFinal); err != nil {
-				log.Printf("[WARN] Failed to forward packet to kernel %s: %v", actualTargetKernel, err)
+		// 传递原始目标内核ID，用于存证记录
+		// 使用 TargetIDs 的第一个元素来传递原始目标
+		// 若 connectorID 已经包含 kernel 前缀（ACK 反向路由场景），直接使用，不再重复 prepend
+		if len(connectorIDs) > 0 {
+			rawConnectorID := connectorIDs[0]
+			if strings.Contains(rawConnectorID, ":") {
+				// 已经是完整格式，直接使用
+				outPacket.TargetIDs[0] = rawConnectorID
 			} else {
-				log.Printf("[OK] Successfully forwarded packet to kernel %s (actual target: %s)", actualTargetKernel, rk)
+				// bare connector ID，需要 prepend kernel 前缀
+				outPacket.TargetIDs[0] = rk + ":" + rawConnectorID
 			}
+		}
+
+		// 转发签名 = business_data_chain 记录过的签名
+		// 直接使用 packet.Signature，保证转发包携带的签名和 business_data_chain 表记录的签名一致
+		// 下一跳 kernel 用此签名作为 prev_signature 计算自己的签名并写入自己的 business_data_chain
+		outPacket.Signature = packet.Signature
+		
+
+		// 转发到下一跳 kernel（kernel-2/3）
+		if err := c.manager.forwardToKernel(actualTargetKernel, outPacket, packet.IsFinal); err != nil {
+			log.Printf("[WARN] Failed to forward packet to kernel %s: %v", actualTargetKernel, err)
+		}
 		}
 	}
 
@@ -1571,8 +1757,9 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 		return nil, fmt.Errorf("channel is not active")
 	}
 
-	// 验证订阅者是否是接收方
-	if !c.CanReceive(subscriberID) {
+	// 发送方（原始数据发送者）需要订阅才能接收 ACK 确认
+	// 因此不能直接拒绝所有非接收方——ACK 消息需要发送给原始发送方
+	if !c.CanReceive(subscriberID) && !c.IsSender(subscriberID) {
 		return nil, fmt.Errorf("subscriber %s is not authorized to receive data from this channel", subscriberID)
 	}
 
@@ -1731,10 +1918,10 @@ func (c *Channel) SubscribeWithRecovery(subscriberID string, isRestartRecovery b
 		return nil, fmt.Errorf("channel is not active")
 	}
 
-	// 验证订阅者是参与者（sender 或 receiver 都可以订阅，用于接收数据和 ACK）
-	if !c.IsParticipant(subscriberID) {
-		return nil, fmt.Errorf("subscriber %s is not a participant of this channel", subscriberID)
-	}
+	// 发送方（原始数据发送者）需要订阅才能接收 ACK 确认
+	// 因此不能拒绝非参与者——ACK 消息需要发送给原始发送方
+	// 这里不再用 IsParticipant 检查，因为 AddParticipant 是空操作
+	// 直接允许订阅者加入（由调用方 SubscribeData 负责权限控制）
 
 	// 检查是否已订阅
 	if _, exists := c.subscribers[subscriberID]; exists {
@@ -1810,7 +1997,7 @@ func (cm *ChannelManager) MarkConnectorOnline(connectorID string) {
 
 	// 如果是从离线状态恢复，记录恢复事件
 	if oldStatus == ConnectorStatusOffline {
-		log.Printf("🔄 Connector %s recovered from offline state", connectorID)
+		log.Printf("[INFO] Connector %s recovered from offline state", connectorID)
 	}
 }
 
@@ -1859,13 +2046,16 @@ func (cm *ChannelManager) BufferDataForOfflineConnector(connectorID string, pack
 
 	// 复制数据包
 	bufferedPacket := &DataPacket{
-		ChannelID:      packet.ChannelID,
-		SequenceNumber: packet.SequenceNumber,
-		Payload:        make([]byte, len(packet.Payload)),
-		Signature:      packet.Signature,
-		Timestamp:      packet.Timestamp,
-		SenderID:       packet.SenderID,
-		TargetIDs:      make([]string, len(packet.TargetIDs)),
+		ChannelID:        packet.ChannelID,
+		SequenceNumber:  packet.SequenceNumber,
+		Payload:          make([]byte, len(packet.Payload)),
+		Signature:        packet.Signature,
+		Timestamp:        packet.Timestamp,
+		SenderID:         packet.SenderID,
+		TargetIDs:        make([]string, len(packet.TargetIDs)),
+		FlowID:           packet.FlowID,
+		IsFinal:          packet.IsFinal,
+		DataHash:         packet.DataHash,
 	}
 	copy(bufferedPacket.Payload, packet.Payload)
 	copy(bufferedPacket.TargetIDs, packet.TargetIDs)
@@ -2979,4 +3169,3 @@ func (c *Channel) forwardControlMessageToRemoteKernels(packet *DataPacket) {
 // - 更符合分布式系统的设计理念
 // - 内核职责简化，专注核心功能
 // -----------------------------------------------------------
-

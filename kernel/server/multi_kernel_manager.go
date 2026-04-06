@@ -68,6 +68,8 @@ type MultiKernelManager struct {
 	registry       *control.Registry
 	channelManager *circulation.ChannelManager
 	auditLog       *evidence.AuditLog
+	// businessChainManager 业务哈希链管理器（由外部注入，供 KernelServiceServer 使用）
+	businessChainManager *BusinessChainManager
 
 	// multiHopConfigManager 多跳路由配置管理器（由外部注入）
 	multiHopConfigManager *MultiHopConfigManager
@@ -94,6 +96,8 @@ type MultiKernelManager struct {
 	multiHopSessionsMu   sync.RWMutex
 	// 多跳审批回调：收到审批通知后自动触发重连
 	OnMultiHopApproved func(notification *pb.NotifyMultiHopApprovedRequest)
+	// Hop 建立完成回调：收到 HopEstablished RPC 后自动触发重连
+	OnHopEstablished func(req *pb.HopEstablishedRequest)
 }
 
 // NewMultiKernelManager 创建多内核管理器
@@ -123,6 +127,11 @@ func (m *MultiKernelManager) SetNotificationManager(nm *NotificationManager) {
 // SetAuditLog 注入 AuditLog（由 main 初始化后设置）
 func (m *MultiKernelManager) SetAuditLog(al *evidence.AuditLog) {
 	m.auditLog = al
+}
+
+// SetBusinessChainManager 注入 BusinessChainManager（由 main 初始化后设置）
+func (m *MultiKernelManager) SetBusinessChainManager(bcm *BusinessChainManager) {
+	m.businessChainManager = bcm
 }
 
 // SetMultiHopConfigManager 设置多跳路由配置管理器
@@ -201,7 +210,7 @@ func (m *MultiKernelManager) ApprovePendingRequest(requestID string) error {
 			m.config.KernelID,
 			evidence.EventTypeInterconnectApproved,
 			"", // 无频道ID
-			requestID,
+			"", // 无业务数据哈希
 			evidence.DirectionOutgoing,
 			req.RequesterKernelID,
 		)
@@ -499,7 +508,7 @@ func (m *MultiKernelManager) StartKernelServer() error {
 
 	server := grpc.NewServer(grpc.Creds(creds))
 
-	kernelService := NewKernelServiceServer(m, m.channelManager, m.registry, m.notificationManager, m.auditLog)
+	kernelService := NewKernelServiceServer(m, m.channelManager, m.registry, m.notificationManager, m.auditLog, m.businessChainManager)
 	pb.RegisterKernelServiceServer(server, kernelService)
 
 	listener, err := net.Listen("tcp", address)
@@ -607,7 +616,7 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 			m.config.KernelID,
 			evidence.EventTypeInterconnectRequested,
 			"",
-			"",
+			"", // 无业务数据哈希
 			evidence.DirectionOutgoing,
 			kernelID,
 		)
@@ -809,22 +818,11 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int,
 
 	// 如果是发起互联请求，记录存证
 	if m.auditLog != nil {
-		// 尝试从响应中提取 request ID
-		requestID := ""
-		if resp.Message != "" && strings.Contains(resp.Message, "interconnect_request_id:") {
-			parts := strings.Split(resp.Message, ";")
-			for _, p := range parts {
-				if strings.HasPrefix(p, "interconnect_request_id:") {
-					requestID = strings.TrimPrefix(p, "interconnect_request_id:")
-					break
-				}
-			}
-		}
 		m.auditLog.SubmitBasicEvidence(
 			m.config.KernelID,
 			evidence.EventTypeInterconnectRequested,
 			"",
-			requestID,
+			"", // 无业务数据哈希
 			evidence.DirectionOutgoing,
 			kernelID,
 		)
@@ -1057,6 +1055,55 @@ func (m *MultiKernelManager) GetConnectedKernelCount() int {
 // GetKernelID 获取本内核ID
 func (m *MultiKernelManager) GetKernelID() string {
 	return m.config.KernelID
+}
+
+// ForwardAckToKernel 向指定内核发送 ForwardAckNotification RPC
+func (m *MultiKernelManager) ForwardAckToKernel(targetKernelID string, req *pb.ForwardAckNotificationRequest) error {
+	m.kernelsMu.RLock()
+	kernelInfo, exists := m.kernels[targetKernelID]
+	if !exists || kernelInfo == nil || kernelInfo.Client == nil {
+		m.kernelsMu.RUnlock()
+		// 尝试建立连接
+		m.kernelsMu.RUnlock()
+		m.kernelsMu.Lock()
+		kernelInfo, exists = m.kernels[targetKernelID]
+		if !exists {
+			m.kernelsMu.Unlock()
+			return fmt.Errorf("kernel %s not found in known kernels", targetKernelID)
+		}
+		// 尝试建立连接
+		mainPort := kernelInfo.MainPort
+		kernelPort := mainPort + 2
+		m.kernelsMu.Unlock()
+
+		if err := m.createKernelClient(targetKernelID, kernelInfo.Address, kernelPort); err != nil {
+			return fmt.Errorf("failed to create client for kernel %s: %w", targetKernelID, err)
+		}
+
+		m.kernelsMu.RLock()
+		kernelInfo, _ = m.kernels[targetKernelID]
+		m.kernelsMu.RUnlock()
+	}
+
+	client := kernelInfo.Client
+	m.kernelsMu.RUnlock()
+
+	if client == nil {
+		return fmt.Errorf("kernel %s client not available", targetKernelID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := client.ForwardAckNotification(ctx, req)
+	if err != nil {
+		return fmt.Errorf("ForwardAckNotification RPC failed: %w", err)
+	}
+	if !resp.Success {
+		return fmt.Errorf("ForwardAckNotification returned failure: %s", resp.Message)
+	}
+
+	return nil
 }
 
 // AddRemotePermissionRequest 添加同步过来的权限请求
@@ -1405,6 +1452,7 @@ func (m *MultiKernelManager) ForwardData(targetKernelID string, dataPacket *pb.D
 		IsFinal:        isFinal,
 	}
 
+	
 	_, err := kernelInfo.Client.ForwardData(context.Background(), req)
 	if err != nil {
 		log.Printf("[WARN] ForwardData RPC to %s failed: %v", targetKernelID, err)
@@ -1730,8 +1778,31 @@ func (m *MultiKernelManager) InitMultiHopApprovedCallback() {
 			delete(m.pendingHops, requestID)
 			m.pendingHopsMu.Unlock()
 
-			// 检查该路由的所有 hop 是否都已建立完成
-			m.checkMultiHopSessionComplete(hopInfo.RouteName)
+		// 检查该路由的所有 hop 是否都已建立完成
+		m.checkMultiHopSessionComplete(hopInfo.RouteName)
+		}()
+	}
+}
+
+// InitHopEstablishedCallback 初始化 Hop 建立完成回调
+// 当收到 HopEstablished RPC 时，触发自动建立到目标内核的连接
+func (m *MultiKernelManager) InitHopEstablishedCallback() {
+	m.OnHopEstablished = func(req *pb.HopEstablishedRequest) {
+		log.Printf("[INFO] HopEstablished callback triggered: source=%s, target=%s, hop=%s",
+			req.SourceKernelId, req.TargetKernelId, req.HopId)
+
+		// 触发重连到目标内核
+		go func() {
+			// 尝试连接到目标内核
+			if err := m.connectToKernelInternal(req.TargetKernelId, req.TargetAddress, int(req.TargetPort), false); err != nil {
+				if strings.Contains(err.Error(), "already connected") {
+					log.Printf("[INFO] Already connected to %s via hop %s", req.TargetKernelId, req.HopId)
+				} else {
+					log.Printf("[WARN] Failed to connect to %s via hop %s: %v", req.TargetKernelId, req.HopId, err)
+				}
+				return
+			}
+			log.Printf("[OK] Successfully connected to %s via hop %s", req.TargetKernelId, req.HopId)
 		}()
 	}
 }

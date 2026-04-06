@@ -2,15 +2,8 @@ package server
 
 import (
 	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/x509"
-	"encoding/hex"
-	"encoding/pem"
 	"fmt"
-	"os"
+	"log"
 	"time"
 
 	"github.com/trusted-space/kernel/kernel/database"
@@ -63,6 +56,7 @@ func (m *BusinessChainManager) RecordDataHash(connectorID, channelID, dataHash, 
 // ACK 记录的 data_hash 为空，通过 prev_signature 和 signature 形成签名链
 func (m *BusinessChainManager) RecordAck(connectorID, channelID, prevSignature, signature string) error {
 	if m.store == nil {
+		log.Printf("[WARN] RecordAck: store is nil, cannot record ACK")
 		return fmt.Errorf("store not initialized")
 	}
 
@@ -76,7 +70,23 @@ func (m *BusinessChainManager) RecordAck(connectorID, channelID, prevSignature, 
 		Timestamp:    time.Now(),
 	}
 
-	_, err := m.store.InsertRecord(record)
+	// 去重：同一 (channelID, prevSignature) 组合的 ACK 只记录一次
+	// 防止 reverse routing 中 ACK 沿多条路径返回时导致重复插入
+	existingRecords, err := m.store.GetRecords(channelID, 100)
+	if err == nil {
+		for _, rec := range existingRecords {
+			if rec.DataHash == "" && rec.PrevSignature == prevSignature {
+				return nil
+			}
+		}
+	}
+
+	id, err := m.store.InsertRecord(record)
+	if err != nil {
+		log.Printf("[WARN] RecordAck InsertRecord failed: %v", err)
+	} else {
+		log.Printf("[OK] RecordAck succeeded: id=%d, channelID=%s", id, channelID)
+	}
 	return err
 }
 
@@ -96,54 +106,12 @@ func (m *BusinessChainManager) GetLastDataHash(channelID string) (dataHash strin
 	return record.DataHash, record.PrevHash, nil
 }
 
-// GenerateKernelSignature 生成内核签名
-// 签名输入: dataHash + prevSignature（原始字节拼接，不哈希）
-// 使用内核 RSA 私钥签名
-func GenerateKernelSignature(dataHash, prevSignature string) (string, error) {
-	keyPaths := []string{
-		"certs/kernel.key",
-		"kernel/certs/kernel.key",
-		"../kernel/certs/kernel.key",
-		"../../kernel/certs/kernel.key",
+// GetRecords 获取指定频道的记录列表（按 ID 升序）
+func (m *BusinessChainManager) GetRecords(channelID string, limit int) ([]*database.BusinessChainRecord, error) {
+	if m.store == nil {
+		return nil, fmt.Errorf("store not initialized")
 	}
-
-	var privateKey *rsa.PrivateKey
-	for _, keyPath := range keyPaths {
-		keyData, err := os.ReadFile(keyPath)
-		if err != nil {
-			continue
-		}
-		block, _ := pem.Decode(keyData)
-		if block == nil {
-			continue
-		}
-		rsaKey, parseErr := x509.ParsePKCS1PrivateKey(block.Bytes)
-		if parseErr != nil {
-			key, parseErr2 := x509.ParsePKCS8PrivateKey(block.Bytes)
-			if parseErr2 != nil {
-				continue
-			}
-			var ok bool
-			rsaKey, ok = key.(*rsa.PrivateKey)
-			if !ok {
-				continue
-			}
-		}
-		privateKey = rsaKey
-		break
-	}
-
-	if privateKey == nil {
-		return "", fmt.Errorf("cannot load kernel private key")
-	}
-
-	signInput := append([]byte(dataHash), []byte(prevSignature)...)
-	hash := sha256.Sum256(signInput)
-	signature, err := rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, hash[:], nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to sign: %w", err)
-	}
-	return hex.EncodeToString(signature), nil
+	return m.store.GetRecords(channelID, limit)
 }
 
 // BusinessChainServiceServer 业务数据哈希链服务实现
@@ -159,6 +127,11 @@ func NewBusinessChainServiceServer(dbManager *database.DBManager) *BusinessChain
 	return &BusinessChainServiceServer{
 		manager: NewBusinessChainManager(dbManager),
 	}
+}
+
+// Manager 返回底层的 BusinessChainManager，供其他组件（如 KernelServiceServer）直接调用
+func (s *BusinessChainServiceServer) Manager() *BusinessChainManager {
+	return s.manager
 }
 
 // GetLastDataHash 获取最新 data_hash

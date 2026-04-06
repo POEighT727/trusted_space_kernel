@@ -87,7 +87,9 @@ message DataPacket {
   string channel_id = 1;
   int64 sequence_number = 2;
   bytes payload = 3;            // 原始数据载荷
-  string signature = 4;         // 当前节点对 (data_hash + 上一跳签名) 的 RSA 签名
+  string signature = 4;         // 当前节点生成的 kernel 对 data_hash 的 RSA 签名
+  // 上一跳 kernel 签名已合并到此字段中：每跳都会覆盖此字段
+  // prev_kernel_signature (字段15) 已废弃，保留向后兼容
   int64 timestamp = 5;
   string sender_id = 6;         // 发送方ID
   repeated string target_ids = 7; // 目标接收者ID列表（为空则广播给所有订阅者）
@@ -96,7 +98,8 @@ message DataPacket {
   bool is_final = 10;           // 是否是最后一个数据包（流结束标志）
   string data_hash = 11;        // 当前节点计算的 SHA256 业务数据哈希
   bool is_ack = 12;             // 是否是 ACK 数据包（用于反向通道）
-  string ack_prev_signature = 13; // ACK 中 prev_signature（上一跳签名，用于签名链）
+  string original_signature = 13;  // 原始 connector 签名（StreamData 保存，不会被 kernel 签名覆盖）
+  string prev_kernel_signature = 14; // [已废弃] 上一跳 kernel 签名已合并到 signature 字段，请使用 GetSignature() 获取
 }
 
 message TransferStatus {
@@ -114,7 +117,7 @@ message AckPacket {
   string sender_kernel_id = 4; // 发送方所在内核ID（跨内核时使用）
   string signature = 5;       // 当前节点（接收方 connector-B）对 data_hash 的签名
   int64 timestamp = 6;
-  string flow_id = 7;        // 业务流程ID
+  string flow_id = 7; // 业务流程ID
 }
 
 message SendAckResponse {

@@ -48,6 +48,10 @@ service KernelService {
   // 多跳链路审批通知：当目标内核审批了互联请求后，通过此 RPC 主动通知发起方，
   // 发起方收到后自动重试建立到该内核的连接，无需手动重新执行 connect-kernel --route。
   rpc NotifyMultiHopApproved (NotifyMultiHopApprovedRequest) returns (NotifyMultiHopApprovedResponse);
+
+  // ACK 强制转发通知：当 kernel-3 SendAck 时，通过此 RPC 通知 kernel-2 和 kernel-1
+  // 让它们记录 ACK_RECEIVED 和 business_data_chain，同时让 kernel-2 继续转发给 kernel-1
+  rpc ForwardAckNotification (ForwardAckNotificationRequest) returns (ForwardAckNotificationResponse);
 }
 
 // ------------------------------------------------------------
@@ -253,6 +257,27 @@ message NotifyMultiHopApprovedRequest {
 }
 
 message NotifyMultiHopApprovedResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ------------------------------------------------------------
+// ACK 强制转发通知相关消息定义
+// ------------------------------------------------------------
+message ForwardAckNotificationRequest {
+  string source_kernel_id = 1;    // 通知发送方内核ID（kernel-3）
+  string channel_id = 2;          // 频道ID
+  string data_hash = 3;           // 被确认的数据包的 data_hash
+  string connector_signature = 4;  // connector-X 对 data_hash 的签名（原始签名）
+  string kernel_signature = 5;    // kernel-3 对 ACK 的签名
+  string prev_signature = 6;      // kernel-3 对 data_hash 的签名（用于 kernel-2 RecordAck）
+  string flow_id = 7;            // 业务流程ID
+  string origin_connector_id = 8; // 原始发送方 connector-A
+  // 是否是最后一跳（kernel-1 收到时设为 true，不再转发）
+  bool is_final = 9;
+}
+
+message ForwardAckNotificationResponse {
   bool success = 1;
   string message = 2;
 }

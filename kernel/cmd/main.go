@@ -222,6 +222,7 @@ func main() {
 		Store:          evidenceStore,
 		ChannelManager: channelManager,
 		UseMemoryCache: !config.Database.Enabled, // 如果使用数据库，不需要内存缓存
+		SignRecordFunc: security.SignRecordHash, // 每条 evidence_record 的 RSA 签名
 	}
 
 	auditLog, err := evidence.NewAuditLogWithConfig(auditLogConfig)
@@ -280,23 +281,50 @@ func main() {
 	// 初始化多跳审批回调，使发起方能在收到审批通知后自动重连
 	multiKernelManager.InitMultiHopApprovedCallback()
 
+	// 初始化 Hop 建立完成回调，使发起方能在收到 HopEstablished RPC 后自动重连
+	multiKernelManager.InitHopEstablishedCallback()
+
 	// 将跨内核数据转发回调注入到 ChannelManager（当检测到目标为 kernel:connector 时调用）
 	channelManager.SetForwardToKernel(func(kernelID string, packet *circulation.DataPacket, isFinal bool) error {
-		// 将 circulation.DataPacket 转为 pb.DataPacket
-		pbPacket := &pb.DataPacket{
-			ChannelId:       packet.ChannelID,
-			SequenceNumber:   packet.SequenceNumber,
-			Payload:         packet.Payload,
-			Signature:       packet.Signature,
-			Timestamp:       packet.Timestamp,
-			SenderId:        packet.SenderID,
-			TargetIds:       packet.TargetIDs,
-			FlowId:          packet.FlowID,
-			IsFinal:         isFinal, // 传递流结束标志
-			DataHash:        packet.DataHash,
-			IsAck:           packet.IsAck,
-			AckPrevSignature: packet.AckPrevSignature,
+		currentKernelID := config.Kernel.ID
+
+		// 记录 kernel→kernel DATA_SEND 证据（每个业务数据包，非 ACK，非流结束包）
+		// 原因：kernel→kernel 的证据在 ForwardData RPC 返回前记录，避免 ACK 包 FlowId 丢失导致跳过
+		if !packet.IsAck && !isFinal && packet.DataHash != "" {
+			metadata := map[string]string{
+				"data_category":    "business",
+				"original_flow_id": packet.FlowID, // 用于 ACK_RECEIVED 关联原始 FlowID
+			}
+			if _, err := auditLog.SubmitBasicEvidenceWithMetadata(
+				currentKernelID,               // source: 当前内核
+				evidence.EventTypeDataSend,    // event: DATA_SEND
+				packet.ChannelID,               // channel
+				packet.DataHash,                // data_hash
+				evidence.DirectionInternal,     // direction
+				kernelID,                       // target: 目标内核
+				packet.FlowID,                  // flow_id
+				metadata,                       // metadata
+			); err != nil {
+				log.Printf("[WARN] Failed to submit kernel->kernel DATA_SEND evidence: %v", err)
+			}
 		}
+
+		pbPacket := &pb.DataPacket{
+			ChannelId:         packet.ChannelID,
+			SequenceNumber:    packet.SequenceNumber,
+			Payload:           packet.Payload,
+			Signature:         packet.Signature,
+			Timestamp:         packet.Timestamp,
+			SenderId:          packet.SenderID,
+			TargetIds:         packet.TargetIDs,
+			FlowId:            packet.FlowID,
+			IsFinal:           isFinal,
+			DataHash: packet.DataHash,
+			IsAck:    packet.IsAck,
+			// Signature 字段在下面单独赋值，传递上一跳 kernel 的签名
+		}
+		// Signature 已合并：直接传递上一跳 kernel 的签名，下一跳读取 GetSignature() 即可
+		
 		return multiKernelManager.ForwardData(kernelID, pbPacket, isFinal)
 	})
 
@@ -304,6 +332,10 @@ func main() {
 	if multiHopConfigManager != nil {
 		channelManager.SetGetNextHopKernel(func(currentKernelID, targetKernelID string) (string, string, int, int, int, bool) {
 			return multiHopConfigManager.GetNextHop(currentKernelID, targetKernelID)
+		})
+		// 设置反向路由回调，用于获取上一跳内核信息（ACK 反向转发用）
+		channelManager.SetGetPreviousHopKernel(func(sourceKernelID string) (string, string, int, bool) {
+			return multiHopConfigManager.GetPreviousHop(sourceKernelID)
 		})
 	}
 
@@ -316,7 +348,14 @@ func main() {
 		}(seed)
 	}
 
-	// 启动内核间通信服务器
+	// 将 AuditLog 注入到 MultiKernelManager（必须在 StartKernelServer 之前，因为 goroutine 会立即创建 KernelServiceServer）
+	multiKernelManager.SetAuditLog(auditLog)
+
+	// 注册业务数据哈希链服务（只依赖 dbManager，可以提前创建）
+	businessChainService := server.NewBusinessChainServiceServer(dbManager)
+	multiKernelManager.SetBusinessChainManager(businessChainService.Manager())
+
+	// 启动内核间通信服务器（goroutine，监听 kernel-to-kernel 端口）
 	go func() {
 		if err := multiKernelManager.StartKernelServer(); err != nil {
 			log.Printf("[ERROR] Failed to start kernel server: %v", err)
@@ -407,20 +446,13 @@ func main() {
 	evidenceService := server.NewEvidenceServiceServer(auditLog, channelManager)
 	pb.RegisterEvidenceServiceServer(grpcServer, evidenceService)
 
-	// 注册业务数据哈希链服务
-	businessChainService := server.NewBusinessChainServiceServer(dbManager)
-	pb.RegisterBusinessChainServiceServer(grpcServer, businessChainService)
-	log.Println("[OK] Business chain service registered")
-
 	// 将业务哈希链服务注入到 ChannelService
 	channelService.SetBusinessChainService(businessChainService)
 
 	// 将 ChannelService 的 NotificationManager 注入到 MultiKernelManager，供内核间服务使用
 	multiKernelManager.SetNotificationManager(channelService.NotificationManager)
-	// 将 AuditLog 注入到 MultiKernelManager，供内核间服务使用
-	multiKernelManager.SetAuditLog(auditLog)
 	// 注册内核间通信服务（多内核网络核心服务）
-	kernelService := server.NewKernelServiceServer(multiKernelManager, channelManager, registry, channelService.NotificationManager, auditLog)
+	kernelService := server.NewKernelServiceServer(multiKernelManager, channelManager, registry, channelService.NotificationManager, auditLog, businessChainService.Manager())
 	pb.RegisterKernelServiceServer(grpcServer, kernelService)
 	log.Println("[OK] Kernel-to-kernel service registered")
 

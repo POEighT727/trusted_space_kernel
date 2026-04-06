@@ -143,6 +143,9 @@ type AuditLog struct {
 
 	// 分布式存证支持
 	channelManager interface{} // ChannelManager 接口，用于通过频道传输存证数据
+
+	// 每条记录的签名函数（由内核层注入，使用内核 RSA 私钥签名 record.Hash）
+	signRecordFunc func(hash string) (string, error)
 }
 
 // EvidenceStore 证据存储接口
@@ -187,6 +190,8 @@ type AuditLogConfig struct {
 	Store          EvidenceStore // 如果提供，将使用数据库存储
 	ChannelManager interface{}
 	UseMemoryCache bool // 是否使用内存缓存
+	// SignRecordFunc 每条记录的签名函数（由内核层注入，使用内核 RSA 私钥签名）
+	SignRecordFunc func(hash string) (string, error)
 }
 
 // NewAuditLog 创建审计日志（文件存储）
@@ -206,6 +211,7 @@ func NewAuditLogWithConfig(config AuditLogConfig) (*AuditLog, error) {
 		store:          config.Store,
 		persistent:     config.Persistent,
 		channelManager: config.ChannelManager,
+		signRecordFunc: config.SignRecordFunc,
 	}
 
 	// 初始化内存缓存（如果启用）
@@ -270,10 +276,6 @@ func (al *AuditLog) SubmitBasicEvidenceWithMetadata(sourceID string, eventType E
 	eventID := uuid.New().String()
 	tempTimestamp := time.Now()
 
-	// 注意：单条签名（Signature）在流签名模式下不再生成
-	// 签名将在数据流结束时统一通过 SignFlow 方法生成
-	signature := ""
-
 	al.mu.Lock()
 	prevHash := al.lastRecordHash
 	al.mu.Unlock()
@@ -288,7 +290,6 @@ func (al *AuditLog) SubmitBasicEvidenceWithMetadata(sourceID string, eventType E
 		ChannelID: channelID,
 		FlowID:    flowID,
 		DataHash:  dataHash,
-		Signature: signature,
 		PrevHash:  prevHash,
 	}
 
@@ -299,6 +300,15 @@ func (al *AuditLog) SubmitBasicEvidenceWithMetadata(sourceID string, eventType E
 
 	// 计算记录内容的哈希
 	record.Hash = al.calculateRecordHash(record)
+
+	// 使用内核私钥对该条记录做 RSA 签名（形成每条记录的不可否认性）
+	if al.signRecordFunc != nil {
+		if sig, err := al.signRecordFunc(record.Hash); err != nil {
+			log.Printf("[WARN] Failed to sign evidence record %s: %v", record.EventID, err)
+		} else {
+			record.Signature = sig
+		}
+	}
 
 	// 更新最后记录哈希（用于哈希链）
 	al.mu.Lock()

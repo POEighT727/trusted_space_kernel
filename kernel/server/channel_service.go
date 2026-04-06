@@ -2,29 +2,24 @@ package server
 
 import (
 	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/hex"
-	"encoding/pem"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/proto"
+	pb "github.com/trusted-space/kernel/proto/kernel/v1"
 	"github.com/trusted-space/kernel/kernel/circulation"
 	"github.com/trusted-space/kernel/kernel/control"
 	"github.com/trusted-space/kernel/kernel/database"
 	"github.com/trusted-space/kernel/kernel/evidence"
 	"github.com/trusted-space/kernel/kernel/security"
-	pb "github.com/trusted-space/kernel/proto/kernel/v1"
 )
 
 // NotificationManager 通知管理器，管理接收方的通知通道
@@ -191,6 +186,10 @@ func NewChannelServiceServer(
 // SetBusinessChainService 设置业务哈希链服务
 func (s *ChannelServiceServer) SetBusinessChainService(bcs *BusinessChainServiceServer) {
 	s.businessChainService = bcs
+	// 同时设置 businessChainManager，使 SendAck 等方法可以直接使用
+	if bcs != nil {
+		s.businessChainManager = bcs.Manager()
+	}
 }
 
 // notifyChannelCreated 处理异步创建的频道通知（特别是evidence频道）
@@ -661,31 +660,6 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 		}, nil
 	}
 
-	// 如果频道已经是 active 状态，且这是来自远端内核的 accept，
-	// 需要通知远端内核频道已激活（因为频道可能是在创建者自动接受时激活的）
-	if channel.Status == circulation.ChannelStatusActive && isForwarded {
-		notification := &pb.ChannelNotification{
-			ChannelId:         channel.ChannelID,
-			CreatorId:         channel.CreatorID,
-			SenderIds:         channel.SenderIDs,
-			ReceiverIds:       channel.ReceiverIDs,
-			Encrypted:         channel.Encrypted,
-			DataTopic:         channel.DataTopic,
-			CreatedAt:         channel.CreatedAt.Unix(),
-			NegotiationStatus: pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED,
-			ProposalId:        channel.ChannelProposal.ProposalID,
-		}
-		go s.notifyOtherKernelsChannelActivated(channel, notification)
-
-		// 同时通知本地创建者（如果创建者是本地参与者且尚未收到通知）
-		if channel.CreatorID != "" && !strings.Contains(channel.CreatorID, ":") {
-			if err := s.notifyParticipant(channel.CreatorID, notification); err != nil {
-				log.Printf("[WARN] Failed to notify creator %s of channel activation: %v", channel.CreatorID, err)
-			} else {
-			}
-		}
-	}
-
 	// 检查是否所有参与方都已确认
 	// 跨内核频道：需要所有远端参与者都确认后才能激活
 	allApproved := true
@@ -725,18 +699,7 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 		}
 	} else {
 		// 本地频道：只需要本地参与者确认
-	for id, approved := range channel.ChannelProposal.SenderApprovals {
-		// 跳过远端参与者（带 kernel 前缀）
-		if strings.Contains(id, ":") {
-			continue
-		}
-		if !approved {
-			allApproved = false
-			break
-		}
-	}
-	if allApproved {
-		for id, approved := range channel.ChannelProposal.ReceiverApprovals {
+		for id, approved := range channel.ChannelProposal.SenderApprovals {
 			// 跳过远端参与者（带 kernel 前缀）
 			if strings.Contains(id, ":") {
 				continue
@@ -744,27 +707,19 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 			if !approved {
 				allApproved = false
 				break
-				}
 			}
 		}
-	}
-
-	// 设置远端接收者映射（用于跨内核数据转发）
-	// 在频道激活时立即设置，而不是等到所有参与方都确认
-	for _, receiverID := range channel.ReceiverIDs {
-		if strings.Contains(receiverID, ":") {
-			parts := strings.SplitN(receiverID, ":", 2)
-			kernelID := parts[0]
-			connectorID := parts[1]
-			channel.SetRemoteReceiver(connectorID, kernelID)
-		}
-	}
-	for _, senderID := range channel.SenderIDs {
-		if strings.Contains(senderID, ":") {
-			parts := strings.SplitN(senderID, ":", 2)
-			kernelID := parts[0]
-			connectorID := parts[1]
-			channel.SetRemoteReceiver(connectorID, kernelID)
+		if allApproved {
+			for id, approved := range channel.ChannelProposal.ReceiverApprovals {
+				// 跳过远端参与者（带 kernel 前缀）
+				if strings.Contains(id, ":") {
+					continue
+				}
+				if !approved {
+					allApproved = false
+					break
+				}
+			}
 		}
 	}
 
@@ -1037,10 +992,8 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 	var channelID string
 	var flowID string
 	var isCrossKernel bool
-	var receiverIDs []string
 	var targetKernelID string
 	var currentKernelID string
-	var firstPacketDataCategory string
 	var dataHashAccumulator []byte
 
 	// 业务哈希链：记录是否已初始化
@@ -1051,61 +1004,11 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 		if err == io.EOF {
 			// 流结束
 			if channelID != "" && senderID != "" && flowID != "" {
-				finalHash := sha256.Sum256(dataHashAccumulator)
-
 				if s.multiKernelManager != nil && s.multiKernelManager.config != nil {
 					currentKernelID = s.multiKernelManager.config.KernelID
 				}
 
-				actualTargetForEvidence := ""
-				if isCrossKernel && targetKernelID != "" {
-					if s.multiKernelManager != nil && s.multiKernelManager.multiHopConfigManager != nil {
-						nextKernel, _, _, _, _, found := s.multiKernelManager.multiHopConfigManager.GetNextHop(currentKernelID, targetKernelID)
-						if found && nextKernel != "" {
-							actualTargetForEvidence = nextKernel
-						} else {
-							actualTargetForEvidence = targetKernelID
-						}
-					} else {
-						actualTargetForEvidence = targetKernelID
-					}
-				} else if len(receiverIDs) > 0 {
-					actualTargetForEvidence = receiverIDs[0]
-				}
-
-				// 跨内核：记录 connector -> kernel 的 DATA_SEND（A → kernel-1，A 相关）
-				if isCrossKernel {
-					dataCategory := "business"
-					if firstPacketDataCategory != "business" {
-						dataCategory = "control"
-					}
-					metadata := map[string]string{"data_category": dataCategory}
-					if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
-						senderID, evidence.EventTypeDataSend, channelID,
-						hex.EncodeToString(finalHash[:]),
-						evidence.DirectionInternal, currentKernelID, flowID, metadata,
-					); err != nil {
-						log.Printf("[WARN] Failed to submit connector->kernel DATA_SEND evidence: %v", err)
-					}
-				}
-
-				// 记录 kernel -> next 的 DATA_SEND（A → kernel-1 → kernel-2 转发链路，跨内核时记录）
-				{
-					dataCategory := "business"
-					if firstPacketDataCategory != "business" {
-						dataCategory = "control"
-					}
-					metadata := map[string]string{"data_category": dataCategory}
-					if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
-						currentKernelID, evidence.EventTypeDataSend, channelID,
-						hex.EncodeToString(finalHash[:]),
-						evidence.DirectionInternal, actualTargetForEvidence, flowID, metadata,
-					); err != nil {
-						log.Printf("[WARN] Failed to submit DATA_SEND evidence: %v", err)
-					}
-				}
-
-				// 流签名
+					// 流签名
 				if flowID != "" {
 					if _, err := s.auditLog.SignFlow(flowID); err != nil {
 						log.Printf("[WARN] Failed to sign flow %s: %v", flowID, err)
@@ -1149,8 +1052,6 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				return fmt.Errorf("sender_id is required in packet")
 			}
 
-			firstPacketDataCategory = determineDataCategory(packet.Payload)
-
 			if err := security.VerifyConnectorID(ctx, senderID); err != nil {
 				return fmt.Errorf("sender verification failed: %v", err)
 			}
@@ -1171,7 +1072,6 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 
 			isCrossKernel = false
 			targetKernelID = ""
-			receiverIDs = channel.ReceiverIDs
 
 			for _, receiverID := range channel.ReceiverIDs {
 				if strings.Contains(receiverID, ":") {
@@ -1208,31 +1108,35 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 		// ================================================================
 		chainInitMu.Lock()
 
-		// 获取频道上一条记录的 data_hash
-		var prevHash string
-		if s.businessChainManager != nil {
-			lastHash, _, err := s.businessChainManager.GetLastDataHash(channelID)
-			if err == nil && lastHash != "" {
-				prevHash = lastHash
+		// 检查 senderID 是否属于当前 kernel 的本地 connector
+		// 只有本地 connector 发送的数据才需要在 kernel 的 business_data_chain 中记录
+		// 来自其他 kernel 转发的数据由 kernel_service.go 的 ForwardData 处理（ForwardData 中已有条件判断 currentKernelID != req.SourceKernelId）
+		isLocalSender := true
+		if strings.Contains(senderID, ":") {
+			parts := strings.SplitN(senderID, ":", 2)
+			if len(parts) >= 2 && parts[0] != currentKernelID {
+				// senderID 带有其他 kernel 的前缀，说明是转发数据，不需要在 StreamData 中记录
+				isLocalSender = false
 			}
 		}
 
-		// 计算 data_hash = SHA256(payload + prevHash)
-		var computedDataHash string
-		if prevHash != "" {
-			hashInput := append(packet.Payload, []byte(prevHash)...)
-			h := sha256.Sum256(hashInput)
-			computedDataHash = hex.EncodeToString(h[:])
+		// data_hash 直接使用 connector 发送的 packet.DataHash
+		// packet.DataHash 由 connector 计算: SHA256(payload + prevHash)
+		// prevHash 从数据库获取，用于构建 kernel 本地的哈希链
+		var dataHash string
+		if packet.DataHash != "" {
+			dataHash = packet.DataHash
 		} else {
+			// 兼容：无 dataHash 时使用简单 SHA256(payload)
 			h := sha256.Sum256(packet.Payload)
-			computedDataHash = hex.EncodeToString(h[:])
+			dataHash = hex.EncodeToString(h[:])
 		}
 
-		// 获取上一跳的签名（来自 packet.Signature，即 connector 的签名）
+		// 获取上一一跳的签名（来自 packet.Signature，即 connector 的签名）
 		prevSignature := packet.Signature
-
+		
 		// 计算内核签名: RSA_Sign(dataHash + prevSignature)
-		kernelSignature, signErr := s.kernelSignDataHash(computedDataHash, prevSignature)
+		kernelSignature, signErr := security.KernelSign(dataHash, prevSignature)
 
 		// 判断数据类型（用于 evidence metadata）
 		dataCategory := determineDataCategory(packet.Payload)
@@ -1244,7 +1148,7 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				senderID,
 				evidence.EventTypeDataSend,
 				channelID,
-				computedDataHash,
+				dataHash,
 				evidence.DirectionInternal,
 				currentKernelID,
 				flowID,
@@ -1254,12 +1158,14 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 
 		// 写入 evidence_records（kernel → receiver 发送数据）
 		// source=kernel（向 B 发送），event=DATA_RECEIVE（B 相关）
-		if signErr == nil && len(channel.ReceiverIDs) > 0 {
+		// 注意：跨内核场景下不记录 DATA_RECEIVE，
+		// 跨内核的接收证据由 kernel_service.go ForwardData 中统一记录
+		if signErr == nil && len(channel.ReceiverIDs) > 0 && !isCrossKernel {
 			s.auditLog.SubmitBasicEvidenceWithMetadata(
 				currentKernelID,
 				evidence.EventTypeDataReceive,
 				channelID,
-				computedDataHash,
+				dataHash,
 				evidence.DirectionInternal,
 				channel.ReceiverIDs[0],
 				flowID,
@@ -1268,7 +1174,8 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 		}
 
 		// 写入 business_data_chain
-		if signErr == nil && s.businessChainManager != nil {
+		// 只有本地 connector 发送的数据才记录（避免转发数据被错误记录）
+		if signErr == nil && s.businessChainManager != nil && isLocalSender {
 			err := s.businessChainManager.RecordDataHash(
 				senderID,
 				channelID,
@@ -1416,10 +1323,9 @@ func (s *ChannelServiceServer) SubscribeData(req *pb.SubscribeRequest, stream pb
 				Payload:          packet.Payload,
 				Signature:        packet.Signature,
 				Timestamp:        packet.Timestamp,
-				DataHash:         packet.DataHash,
-				IsAck:            packet.IsAck,
-				AckPrevSignature: packet.AckPrevSignature,
-			}
+			DataHash:  packet.DataHash,
+			IsAck:     packet.IsAck,
+		}
 
 			if err := stream.Send(pbPacket); err != nil {
 				return err
@@ -1481,10 +1387,11 @@ func (s *ChannelServiceServer) CloseChannel(ctx context.Context, req *pb.CloseCh
 
 // SendAck 处理接收方（connector-B）发送的 ACK，转发给原始发送方（connector-A）
 // ACK 流程：connector-B → kernel → connector-A
+// 多跳场景：kernel-3 SendAck → multiKernelManager.ForwardData → kernel-2 ForwardData → kernel-1 ForwardData → connector-A
 func (s *ChannelServiceServer) SendAck(ctx context.Context, req *pb.AckPacket) (*pb.SendAckResponse, error) {
 	channelID := req.ChannelId
 	dataHash := req.DataHash
-	connectorSignature := req.Signature // connector-B 的签名
+	connectorSignature := req.Signature // connector-B（connector-X）的签名
 
 	// 1. 验证频道存在
 	channel, err := s.channelManager.GetChannel(channelID)
@@ -1519,7 +1426,6 @@ func (s *ChannelServiceServer) SendAck(ctx context.Context, req *pb.AckPacket) (
 	}
 
 	// 3. 获取原始发送方 ID（connector-A）
-	// 通过查找 senderIDs 中不包含当前 connector 的 ID
 	var senderID string
 	for _, sid := range channel.SenderIDs {
 		if sid != req.SenderId {
@@ -1534,8 +1440,19 @@ func (s *ChannelServiceServer) SendAck(ctx context.Context, req *pb.AckPacket) (
 		}, nil
 	}
 
-	// 4. 生成内核对 ACK 的签名：RSA_Sign(dataHash + connectorSignature)
-	kernelAckSignature, signErr := s.kernelSignDataHash(dataHash, connectorSignature)
+	// 4. 获取 FlowId
+	ackFlowID := channel.GetCurrentFlowID()
+	if ackFlowID == "" {
+		ackFlowID = req.FlowId
+	}
+
+	// 5. 确定原始发送内核（kernel-1）
+	originKernelID := channel.GetOriginKernelID()
+	currentKernelID := s.multiKernelManager.config.KernelID
+
+	// 6. 生成内核对 ACK 的签名：RSA_Sign(prevSignature)
+	// ACK 包的签名输入只有上一跳的签名，不含 dataHash
+	kernelAckSignature, signErr := security.KernelSign("", connectorSignature)
 	if signErr != nil {
 		log.Printf("[WARN] Failed to sign ACK at kernel: %v", signErr)
 		return &pb.SendAckResponse{
@@ -1544,63 +1461,96 @@ func (s *ChannelServiceServer) SendAck(ctx context.Context, req *pb.AckPacket) (
 		}, nil
 	}
 
-	// 5. 记录 ACK 到 business_data_chain
-	if s.businessChainManager != nil {
-		if err := s.businessChainManager.RecordAck(req.SenderId, channelID, connectorSignature, kernelAckSignature); err != nil {
-			log.Printf("[WARN] Failed to record ACK in business chain: %v", err)
-		} else {
-			log.Printf("[OK] ACK recorded: channel=%s, data_hash=%s, from=%s", channelID, dataHash, req.SenderId)
-		}
+	// 8. 构造 AckPacket（放入 DataPacket.Payload 用于 ForwardData）
+	// Signature 已合并为当前 kernel 对 ACK 的签名，下一跳直接读取 GetSignature() 作为 prev_signature
+	ackPB := &pb.AckPacket{
+		ChannelId:  channelID,
+		DataHash:   dataHash,
+		SenderId:   req.SenderId,
+		Signature:  connectorSignature, // connector-X 签名
+		FlowId:    ackFlowID,
 	}
-
-	// 5b. 提交 ACK 证据到审计日志（evidence_records）
-	if s.auditLog != nil {
-		ackMetadata := map[string]string{
-			"connector_signature": connectorSignature,
-			"kernel_signature":    kernelAckSignature,
-			"original_sender":     senderID,
-		}
-		s.auditLog.SubmitBasicEvidenceWithMetadata(
-			req.SenderId,                     // sourceID: connector-B（发送 ACK 的接收方）
-			evidence.EventTypeAckReceived,    // eventType: ACK 到达事件
-			channelID,                        // channelID
-			dataHash,                         // dataHash: 被确认的数据哈希
-			evidence.DirectionInternal,        // direction
-			senderID,                         // targetID: connector-A（原始发送方）
-			req.FlowId,                       // flowID
-			ackMetadata,                      // metadata: 签名信息
-		)
-	}
-
-	// 6. 构造 ACK 数据包，定向转发给原始发送方（connector-A）
-	// ACK 包设置 TargetIDs 为 connector-A，不走广播，避免接收方也收到自己的 ACK
-	ackPacket := &circulation.DataPacket{
-		ChannelID:       channelID,
-		SequenceNumber:  0,
-		Payload:         []byte{},
-		SenderID:        req.SenderId,
-		TargetIDs:      []string{senderID}, // 定向：只发给原始发送方
-		MessageType:     circulation.MessageTypeAck,
-		FlowID:         req.FlowId,
-		IsAck:          true,
-		DataHash:       dataHash,
-		Signature:      kernelAckSignature,
-		AckPrevSignature: connectorSignature,
-	}
-
-	// PushData 会通过 SubscribeData 通道发送给 connector-A（订阅者）
-	if err := channel.PushData(ackPacket); err != nil {
-		log.Printf("[WARN] Failed to forward ACK to %s: %v", senderID, err)
+	ackPayload, err := proto.Marshal(ackPB)
+	if err != nil {
+		log.Printf("[WARN] Failed to marshal ACK packet: %v", err)
 		return &pb.SendAckResponse{
 			Success: false,
-			Message: fmt.Sprintf("failed to forward ACK: %v", err),
+			Message: fmt.Sprintf("failed to marshal ACK: %v", err),
 		}, nil
 	}
 
-	log.Printf("[OK] ACK forwarded: data_hash=%s, from=%s, to=%s", dataHash, req.SenderId, senderID)
+	// 9. 记录 ACK_RECEIVED（当前 kernel - 即 kernel-3）
+	if s.auditLog != nil {
+		ackMetadata := map[string]string{
+			"connector_signature":     connectorSignature,
+			"kernel_signature":       kernelAckSignature,
+			"ack_sender":            req.SenderId,
+			"original_sender_kernel": originKernelID,
+		}
+		if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
+			currentKernelID,
+			evidence.EventTypeAckReceived,
+			channelID,
+			dataHash,
+			evidence.DirectionInternal,
+			"",
+			ackFlowID,
+			ackMetadata,
+		); err != nil {
+			log.Printf("[WARN] SendAck: failed to submit ACK_RECEIVED evidence: %v", err)
+		} else {
+			log.Printf("[OK] SendAck: ACK_RECEIVED recorded at kernel=%s, data_hash=%.20s", currentKernelID, dataHash)
+		}
+	}
+
+	// 10. 记录 ACK 到 business_data_chain（ACK 签名链，当前 kernel 即 kernel-3）
+	// prev_signature = connectorSignature（connector-X 对 ACK 的签名）
+	// signature = kernelAckSignature（kernel-3 对 ACK 的签名）
+	if s.businessChainManager != nil {
+		if err := s.businessChainManager.RecordAck(
+			"", channelID,
+			connectorSignature, kernelAckSignature,
+		); err != nil {
+			log.Printf("[WARN] SendAck: failed to record ACK business chain: %v", err)
+		} else {
+			log.Printf("[OK] SendAck: ACK business chain recorded at kernel=%s, data_hash=%.20s", currentKernelID, dataHash)
+		}
+	}
+
+	// 11. 构造 DataPacket（用于本地分发和多跳转发）
+	// TargetIDs 设为 originKernelID:connector-A，用于 ACK 反向路由
+	// FlowID = ackFlowID（从 channel.GetCurrentFlowID 获取）
+	// Signature = kernelAckSignature（当前 kernel 对 ACK 的签名，下一跳作为 prev_signature 使用）
+	ackPacket := &circulation.DataPacket{
+		ChannelID:            channelID,
+		SequenceNumber:       0,
+		Payload:              ackPayload,
+		SenderID:             req.SenderId,
+		TargetIDs:            []string{originKernelID + ":" + senderID}, // 用于 ACK 反向路由
+		MessageType:          circulation.MessageTypeAck,
+		FlowID:               ackFlowID,
+		IsAck:                true,
+		DataHash:             dataHash,
+		Signature:            kernelAckSignature, // 当前 kernel 对 ACK 的签名，下一跳作为 prev_signature
+		AckEvidenceRecorded:  true,             // ACK_RECEIVED 已记录，不再重复
+	}
+
+	// 12. PushData：ACK 反向路由会统一处理多跳转发
+	// PushData 中的 ACK 反向路由逻辑会根据 TargetIDs 中的 originKernelID
+	// 自动查找上一跳并转发 ACK，不再需要 SendAck 直接调用 ForwardData
+	if err := channel.PushData(ackPacket); err != nil {
+		log.Printf("[WARN] SendAck: failed to push ACK to channel: %v", err)
+		return &pb.SendAckResponse{
+			Success: false,
+			Message: fmt.Sprintf("failed to push ACK: %v", err),
+		}, nil
+	}
+
+	log.Printf("[OK] ACK processed: data_hash=%.20s, from=%s, to=%s, origin_kernel=%s",
+		dataHash, req.SenderId, senderID, originKernelID)
 	return &pb.SendAckResponse{
 		Success: true,
-		Message: "ACK forwarded successfully",
+		Message: "ACK processed successfully",
 	}, nil
 }
 
@@ -1842,6 +1792,18 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 			channel.ChannelProposal.Status = circulation.NegotiationStatusAccepted
 		channel.LastActivity = time.Now()
 
+			// 记录 CHANNEL_CREATED evidence（kernel-2/3 上没有 ProposeChannel，所以在此记录）
+			if s.auditLog != nil {
+				s.auditLog.SubmitBasicEvidence(
+					s.multiKernelManager.config.KernelID,
+					evidence.EventTypeChannelCreated,
+					channel.ChannelID,
+					"",
+					evidence.DirectionInternal,
+					"",
+				)
+			}
+
 			// 启动数据分发协程
 			go channel.StartDataDistribution()
 
@@ -1938,6 +1900,18 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 			}
 			if channel.ChannelProposal != nil {
 				notification.ProposalId = channel.ChannelProposal.ProposalID
+			}
+
+			// 记录 CHANNEL_CREATED evidence（kernel-2/3 上没有 ProposeChannel，所以在此记录）
+			if s.auditLog != nil {
+				s.auditLog.SubmitBasicEvidence(
+					s.multiKernelManager.config.KernelID,
+					evidence.EventTypeChannelCreated,
+					channel.ChannelID,
+					"",
+					evidence.DirectionInternal,
+					"",
+				)
 			}
 
 			localKernelID := s.multiKernelManager.config.KernelID
@@ -2825,58 +2799,6 @@ func (s *ChannelServiceServer) GetPermissionRequests(ctx context.Context, req *p
 		Requests: pbRequests,
 		Message:  "permission requests retrieved successfully",
 	}, nil
-}
-
-// kernelSignDataHash 内核对 dataHash + prevSignature 进行签名
-// 签名输入: dataHash + prevSignature（原始字节拼接）
-// 使用内核 RSA 私钥签名
-func (s *ChannelServiceServer) kernelSignDataHash(dataHash string, prevSignature string) (string, error) {
-	// 查找内核私钥路径
-	keyPaths := []string{
-		"certs/kernel.key",
-		"kernel/certs/kernel.key",
-		"../kernel/certs/kernel.key",
-		"../../kernel/certs/kernel.key",
-	}
-
-	var privateKey *rsa.PrivateKey
-	for _, keyPath := range keyPaths {
-		keyData, err := os.ReadFile(keyPath)
-		if err != nil {
-			continue
-		}
-		block, _ := pem.Decode(keyData)
-		if block == nil {
-			continue
-		}
-		rsaKey, parseErr := x509.ParsePKCS1PrivateKey(block.Bytes)
-		if parseErr != nil {
-			key, parseErr2 := x509.ParsePKCS8PrivateKey(block.Bytes)
-			if parseErr2 != nil {
-				continue
-			}
-			var ok bool
-			rsaKey, ok = key.(*rsa.PrivateKey)
-			if !ok {
-				continue
-			}
-		}
-		privateKey = rsaKey
-		break
-	}
-
-	if privateKey == nil {
-		return "", fmt.Errorf("cannot load kernel private key")
-	}
-
-	// 签名输入: dataHash + prevSignature（原始字节拼接）
-	signInput := append([]byte(dataHash), []byte(prevSignature)...)
-	hash := sha256.Sum256(signInput)
-	signature, err := rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, hash[:], nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to sign: %w", err)
-	}
-	return hex.EncodeToString(signature), nil
 }
 
 // determineDataCategory 根据 payload 判断数据类型

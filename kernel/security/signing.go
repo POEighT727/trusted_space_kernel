@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"log"
@@ -189,6 +190,17 @@ func VerifyEvidenceSignature(isCrossKernel bool, connectorID, eventType, channel
 	return VerifySignature([]byte(data), signature, publicKey)
 }
 
+// SignRecordHash 使用内核私钥对 evidence_record 的内容哈希做 RSA 签名
+// 用于 evidence_records 表的 signature 字段，确保每条记录的不可否认性
+func SignRecordHash(recordHash string) (string, error) {
+	kernelKeyPath := "certs/kernel.key"
+	privateKey, err := LoadRSAPrivateKey(kernelKeyPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to load kernel private key: %w", err)
+	}
+	return SignData([]byte(recordHash), privateKey)
+}
+
 // GenerateFlowSignature 生成数据流的最终签名（使用内核私钥对链尾哈希签名）
 func GenerateFlowSignature(chainTailHash string, timestamp int64) (string, error) {
 	// 构建要签名的数据：链尾哈希 + 时间戳
@@ -205,16 +217,44 @@ func GenerateFlowSignature(chainTailHash string, timestamp int64) (string, error
 	return SignData([]byte(data), privateKey)
 }
 
+// KernelSign 统一的内核签名函数
+// 规则：
+//   - 数据包签名：RSA_Sign(dataHash + prevSignature)，其中 prevSignature 是上一跳的签名
+//   - ACK 签名：RSA_Sign(prevSignature)，不含 dataHash
+// 参数：
+//   - dataHash：业务数据哈希（ACK 包为空字符串）
+//   - prevSignature：上一跳的签名（数据包为 connector/kernel 的签名，ACK 包为上一跳 kernel 的签名）
+func KernelSign(dataHash, prevSignature string) (string, error) {
+	privateKey, err := LoadRSAPrivateKey("certs/kernel.key")
+	if err != nil {
+		return "", fmt.Errorf("failed to load kernel private key: %w", err)
+	}
+
+	var signInput []byte
+	if dataHash != "" {
+		// 数据包签名：dataHash + prevSignature
+		signInput = append([]byte(dataHash), []byte(prevSignature)...)
+	} else {
+		// ACK 签名：只有 prevSignature
+		signInput = []byte(prevSignature)
+	}
+
+	hash := sha256.Sum256(signInput)
+	signature, err := rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, hash[:], nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to sign: %w", err)
+	}
+	return hex.EncodeToString(signature), nil
+}
+
 // VerifyFlowSignature 验证数据流的最终签名
 func VerifyFlowSignature(chainTailHash string, timestamp int64, signature string) error {
 	if signature == "" {
 		return fmt.Errorf("empty flow signature")
 	}
 
-	// 构建待验证数据
 	data := fmt.Sprintf("%s|%d", chainTailHash, timestamp)
 
-	// 优先使用CA证书验证签名
 	caPublicKey, caErr := ExtractPublicKeyFromCert("certs/ca.crt")
 	if caErr == nil {
 		if err := VerifySignature([]byte(data), signature, caPublicKey); err == nil {
@@ -222,13 +262,11 @@ func VerifyFlowSignature(chainTailHash string, timestamp int64, signature string
 		}
 	}
 
-	// 回退：使用内核证书验证（兼容旧版本）
 	kernelPublicKey, kernelErr := ExtractPublicKeyFromCert("certs/kernel.crt")
 	if kernelErr != nil {
 		return fmt.Errorf("failed to load certificate for verification: CA error: %v, kernel error: %v", caErr, kernelErr)
 	}
 
-	// 验证签名
 	if err := VerifySignature([]byte(data), signature, kernelPublicKey); err != nil {
 		return fmt.Errorf("flow signature verification failed: %w", err)
 	}

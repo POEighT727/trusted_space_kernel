@@ -501,23 +501,24 @@ func (c *Connector) ReceiveData(channelID string, handler func(*pb.DataPacket) e
 		log.Printf("[OK] Received packet #%d (%d bytes)", packet.SequenceNumber, len(packet.Payload))
 
 		// connector-B 接收时：如果启用了业务哈希链，提取 data_hash 和上一跳签名，写入本地 business_data_chain
-		if c.HasBusinessChainManager() && packet.DataHash != "" && !packet.IsAck {
-			prevSignatureHex := ""
-			if packet.AckPrevSignature != "" {
-				prevSignatureHex = packet.AckPrevSignature
-			} else {
-				prevSignatureHex = packet.Signature
-			}
-			if err := c.connectorReceiveBusinessData(channelID, packet.DataHash, prevSignatureHex); err != nil {
+		// 注意：必须先写本地 business_data_chain，再发 ACK（确保内核 ACK 记录在数据记录之后）
+		// 跳过流转结束包（seq=-1），该包只在内核间传递协调信号，不需要在业务链中记录
+		if c.HasBusinessChainManager() && packet.DataHash != "" && !packet.IsAck && packet.SequenceNumber > 0 {
+			prevSignatureHex := packet.Signature
+			connectorSig, err := c.connectorReceiveBusinessData(channelID, packet.DataHash, prevSignatureHex)
+			if err != nil {
 				log.Printf("[WARN] Failed to record received business data: %v", err)
 			}
-			// 接收方生成并发送 ACK
-			go c.sendAckForData(channelID, packet.DataHash, packet.Signature, packet.FlowId)
+			// 同步发送 ACK（不等同 goroutine），确保数据记录在 ACK 记录之前
+			// 复用 connectorReceiveBusinessData 中已计算的签名，避免重复计算
+			c.sendAckForData(channelID, packet.DataHash, packet.Signature, packet.FlowId, connectorSig)
 		}
 
 		// ACK 数据包：写入本地 business_data_chain
+		// ACK 数据包：写入本地 business_data_chain
+		// kernelSignature 来自 packet.Signature（kernel 对 connector 签名的签名）
 		if c.HasBusinessChainManager() && packet.IsAck && packet.DataHash != "" {
-			if err := c.recordAckFromKernel(channelID, packet.DataHash, packet.Signature, packet.AckPrevSignature); err != nil {
+			if err := c.recordAckFromKernel(channelID, packet.DataHash, packet.Signature); err != nil {
 				log.Printf("[WARN] Failed to record ACK: %v", err)
 			}
 		}
@@ -559,8 +560,9 @@ func (c *Connector) receiveDataSilent(channelID string) error {
 		}
 
 		// 收到 ACK 数据包：写入本地 business_data_chain
+		// kernelSignature 来自 packet.Signature（kernel 对 connector 签名的签名）
 		if c.HasBusinessChainManager() && packet.IsAck && packet.DataHash != "" {
-			if err := c.recordAckFromKernel(channelID, packet.DataHash, packet.Signature, packet.AckPrevSignature); err != nil {
+			if err := c.recordAckFromKernel(channelID, packet.DataHash, packet.Signature); err != nil {
 				log.Printf("[WARN] Failed to record ACK: %v", err)
 			}
 		}
@@ -2117,7 +2119,7 @@ func (c *Connector) loadPrivateKey(keyPath string) (*rsa.PrivateKey, error) {
 	return rsaKey, nil
 }
 
-// signData 使用 RSA 私钥对数据进行签名
+// signData 使用 RSA 私钥对数据进行签名（需传入哈希值）
 func (c *Connector) signData(data []byte, privateKey *rsa.PrivateKey) ([]byte, error) {
 	hash := sha256.Sum256(data)
 	return rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, hash[:], nil)
@@ -2144,7 +2146,7 @@ func (c *Connector) connectorSignDataHashHex(dataHash string, prevSignatureHex s
 		return "", fmt.Errorf("failed to load connector private key: %w", err)
 	}
 
-	// 签名输入: dataHash + prevSignature（原始字节拼接，不哈希）
+	// 签名输入: dataHash + prevSignature（原始字节拼接）
 	signInput := append([]byte(dataHash), []byte(prevSignatureHex)...)
 	hash := sha256.Sum256(signInput)
 	signature, err := rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, hash[:], nil)
@@ -2161,17 +2163,23 @@ func (c *Connector) connectorRecordBusinessData(channelID string, data []byte) (
 		return "", "", fmt.Errorf("business chain manager not initialized")
 	}
 
-	// 1. 获取频道上一条记录
-	prevRecord, err := c.businessChainManager.GetLastRecord(channelID)
+	// 1. 获取频道上一条记录（prevHash 排除 ACK，prevSignature 取最后一条的签名）
+	prevNonAckRecord, err := c.businessChainManager.GetLastNonAckRecord(channelID)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get last non-ack record: %w", err)
+	}
+	lastRecord, err := c.businessChainManager.GetLastRecord(channelID)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get last record: %w", err)
 	}
 
 	prevHash := ""
 	prevSignature := ""
-	if prevRecord != nil {
-		prevHash = prevRecord.DataHash
-		prevSignature = prevRecord.Signature
+	if prevNonAckRecord != nil {
+		prevHash = prevNonAckRecord.DataHash
+	}
+	if lastRecord != nil {
+		prevSignature = lastRecord.Signature
 	}
 
 	// 2. 计算 data_hash = SHA256(data + prevHash)
@@ -2202,10 +2210,26 @@ func (c *Connector) connectorRecordBusinessData(channelID string, data []byte) (
 	}
 	signature = hex.EncodeToString(sigBytes)
 
-	// 4. 写入本地 business_data_chain
-	err = c.businessChainManager.RecordChainData(channelID, dataHash, prevHash, prevSignature, signature)
+	// 4. 写入本地 business_data_chain（带重试，防止 MySQL 连接临时断开）
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		err = c.businessChainManager.RecordChainData(channelID, dataHash, prevHash, prevSignature, signature)
+		if err == nil {
+			break
+		}
+		// 检查是否是连接错误，连接错误才重试
+		if attempt < maxRetries-1 && (strings.Contains(err.Error(), "connection") ||
+			strings.Contains(err.Error(), "closed") ||
+			strings.Contains(err.Error(), "bad connection") ||
+			strings.Contains(err.Error(), "invalid connection") ||
+			strings.Contains(err.Error(), "EOF")) {
+			log.Printf("[INFO] connectorRecordBusinessData: MySQL connection error (attempt %d/%d), retrying: %v", attempt+1, maxRetries, err)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+	}
 	if err != nil {
-		return "", "", fmt.Errorf("failed to record chain data: %w", err)
+		return "", "", fmt.Errorf("failed to record chain data after %d attempts: %w", maxRetries, err)
 	}
 
 	return dataHash, signature, nil
@@ -2213,54 +2237,93 @@ func (c *Connector) connectorRecordBusinessData(channelID string, data []byte) (
 
 // connectorReceiveBusinessData connector 接收业务数据时写入本地 business_data_chain
 // 从 packet.Signature 提取上一跳（kernel）的签名，记录 data_hash 和 prev_signature
-func (c *Connector) connectorReceiveBusinessData(channelID, dataHash, prevSignatureHex string) error {
+// 同时计算并存储 connector 自己的签名（用于后续 ACK 链）
+// 返回 connectorSig，供 sendAckForData 复用（避免重复计算签名）
+func (c *Connector) connectorReceiveBusinessData(channelID, dataHash, prevSignatureHex string) (connectorSig string, err error) {
 	if c.businessChainManager == nil {
-		return fmt.Errorf("business chain manager not initialized")
+		return "", fmt.Errorf("business chain manager not initialized")
 	}
 
 	// 1. 获取频道上一条记录的 dataHash（用于 prev_hash）
 	prevHash, err := c.businessChainManager.GetLastDataHash(channelID)
 	if err != nil {
-		return fmt.Errorf("failed to get last data hash: %w", err)
+		return "", fmt.Errorf("failed to get last data hash: %w", err)
 	}
 
-	// 2. 写入本地 business_data_chain
-	// prevSignature 是 kernel-2 的签名（来自 packet.Signature 或 packet.AckPrevSignature）
-	err = c.businessChainManager.RecordChainData(channelID, dataHash, prevHash, prevSignatureHex, "")
+	// 2. 计算 connector 自己的签名（用于后续 ACK 链的 prev_signature）
+	// 签名输入: dataHash + prevSignatureHex
+	if prevSignatureHex != "" {
+		// 有上一跳签名时，使用 dataHash + prevSignatureHex 计算签名
+		connectorSig, err = c.connectorSignDataHashHex(dataHash, prevSignatureHex)
+		if err != nil {
+			log.Printf("[WARN] Failed to sign received data: %v", err)
+		}
+	} else {
+		// 没有上一跳签名时，仅使用 dataHash 计算签名
+		connectorSig, err = c.connectorSignDataHashHex(dataHash, "")
+		if err != nil {
+			log.Printf("[WARN] Failed to sign received data: %v", err)
+		}
+	}
+
+	// 3. 写入本地 business_data_chain（带重试，防止 MySQL 连接临时断开）
+	// prevSignature 是上一跳 kernel 的签名（来自 packet.Signature）
+	// signature 是 connector 自己对 dataHash 的签名
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		err = c.businessChainManager.RecordChainData(channelID, dataHash, prevHash, prevSignatureHex, connectorSig)
+		if err == nil {
+			break
+		}
+		if attempt < maxRetries-1 && (strings.Contains(err.Error(), "connection") ||
+			strings.Contains(err.Error(), "closed") ||
+			strings.Contains(err.Error(), "bad connection") ||
+			strings.Contains(err.Error(), "invalid connection") ||
+			strings.Contains(err.Error(), "EOF")) {
+			log.Printf("[INFO] connectorReceiveBusinessData: MySQL connection error (attempt %d/%d), retrying: %v", attempt+1, maxRetries, err)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+	}
 	if err != nil {
-		return fmt.Errorf("failed to record chain data: %w", err)
+		return "", fmt.Errorf("failed to record chain data after %d attempts: %w", maxRetries, err)
 	}
 
-	return nil
+	return connectorSig, nil
 }
 
-// sendAckForData 接收方（connector-B）对收到的数据包生成并发送 ACK 给内核
+// sendAckForData 接收方（connector）对收到的数据包生成并发送 ACK 给内核
 // dataHash: 被确认的数据包的 data_hash
-// kernelSignature: 上一跳（kernel）的签名，作为 ACK 签名输入的一部分
+// kernelSignature: 上一跳（kernel）的签名，作为 ACK 记录的 prev_signature
 // flowID: 业务流程ID
-func (c *Connector) sendAckForData(channelID, dataHash, kernelSignature, flowID string) {
+// connectorSig: connector 在 connectorReceiveBusinessData 中已计算好的签名（直接复用，避免重复计算）
+func (c *Connector) sendAckForData(channelID, dataHash, kernelSignature, flowID, connectorSig string) {
 	if c.channelSvc == nil {
 		log.Printf("[WARN] Channel service not available, cannot send ACK")
 		return
 	}
 
-	prevSignature := kernelSignature
+	// 复用 connectorReceiveBusinessData 中已计算的签名（方案 A）
+	// ACK 记录的 prev_signature = kernelSignature（保持不变）
+	// ACK 记录的 signature = connectorSig（复用，不复算）
+	// ACK 包的 Signature = connectorSig（复用，不复算）
 
-	// 签名输入: dataHash + prevSignature（原始字节拼接）
-	// connector-B 使用自己的私钥签名
-	dataHashBytes, _ := hex.DecodeString(dataHash)
-	kernelSigBytes, _ := hex.DecodeString(kernelSignature)
-	signatureBytes, err := c.connectorSignDataHash(dataHashBytes, kernelSigBytes)
-	if err != nil {
-		log.Printf("[WARN] Failed to sign ACK: %v", err)
-		return
-	}
-	connectorSignature := hex.EncodeToString(signatureBytes)
-
-	// 记录 ACK 到本地 business_data_chain
+	// 记录 ACK 到本地 business_data_chain（带重试，防止 MySQL 连接临时断开）
 	if c.businessChainManager != nil {
-		if err := c.businessChainManager.HandleAck(channelID, prevSignature, connectorSignature); err != nil {
-			log.Printf("[WARN] Failed to record ACK locally: %v", err)
+		ackErr := c.businessChainManager.HandleAck(channelID, kernelSignature, connectorSig)
+		if ackErr != nil {
+			// 重试
+			for attempt := 1; attempt <= 3; attempt++ {
+				log.Printf("[INFO] sendAckForData HandleAck: MySQL connection error (attempt %d/3), retrying: %v", attempt, ackErr)
+				time.Sleep(500 * time.Millisecond)
+				ackErr = c.businessChainManager.HandleAck(channelID, kernelSignature, connectorSig)
+				if ackErr == nil {
+					break
+				}
+			}
+			if ackErr != nil {
+				log.Printf("[WARN] Failed to record ACK locally after retries: %v", ackErr)
+			}
 		}
 	}
 
@@ -2269,11 +2332,11 @@ func (c *Connector) sendAckForData(channelID, dataHash, kernelSignature, flowID 
 	defer cancel()
 
 	resp, err := c.channelSvc.SendAck(ctx, &pb.AckPacket{
-		ChannelId:  channelID,
-		DataHash:   dataHash,
-		SenderId:   c.connectorID,
-		Signature:  connectorSignature,
-		FlowId:     flowID,
+		ChannelId: channelID,
+		DataHash:  dataHash,
+		SenderId:  c.connectorID,
+		Signature: connectorSig,
+		FlowId:    flowID,
 	})
 	if err != nil {
 		log.Printf("[WARN] Failed to send ACK for data_hash=%s: %v", dataHash, err)
@@ -2286,13 +2349,22 @@ func (c *Connector) sendAckForData(channelID, dataHash, kernelSignature, flowID 
 	log.Printf("[OK] ACK sent")
 }
 
-// recordAckFromKernel 接收方（connector-B）从内核收到转发的 ACK，写入本地链
+// recordAckFromKernel 接收方（connector）从内核收到转发的 ACK，写入本地链
 // dataHash: 被确认的 data_hash
-// ackSignature: kernel 对 connectorSignature 的签名
-// prevSignature: connector-B 自己的签名（作为 prev_signature 记录）
-func (c *Connector) recordAckFromKernel(channelID, dataHash, ackSignature, prevSignature string) error {
+// kernelSignature: kernel 对 connectorSignature 的签名（来自 packet.Signature）
+func (c *Connector) recordAckFromKernel(channelID, dataHash, kernelSignature string) error {
 	if c.businessChainManager == nil {
 		return fmt.Errorf("business chain manager not initialized")
 	}
-	return c.businessChainManager.HandleAck(channelID, prevSignature, ackSignature)
+
+	// 计算 connector 自己的签名：RSA_Sign(dataHash + kernelSignature)
+	// prev_signature = kernel 的签名，signature = connector 自己的签名
+	connectorSig, err := c.connectorSignDataHashHex(dataHash, kernelSignature)
+	if err != nil {
+		log.Printf("[WARN] Failed to sign ACK: %v", err)
+		return err
+	}
+
+	// prev_signature = kernel 的签名，signature = connector 的签名
+	return c.businessChainManager.HandleAck(channelID, kernelSignature, connectorSig)
 }

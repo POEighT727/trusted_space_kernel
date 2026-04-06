@@ -403,6 +403,36 @@ func (m *MultiHopConfigManager) GetNextHop(currentKernelID, targetKernelID strin
 	return "", "", 0, 0, 0, false
 }
 
+// GetPreviousHop 获取从指定内核到上一个内核的信息（反向查找）
+// 用于 ACK 转发通知：kernel-3 -> kernel-2 -> kernel-1，当 kernel-3 发送通知时需要知道上一跳是谁
+// sourceKernelID 是发送通知的下一跳内核，函数返回当前内核的上一跳
+func (m *MultiHopConfigManager) GetPreviousHop(sourceKernelID string) (prevKernelID string, prevAddress string, prevPort int, found bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// 遍历所有路由配置
+	for _, config := range m.configs {
+		if !config.Enabled {
+			continue
+		}
+
+		// 查找 sourceKernelID 在路由中的位置
+		for i, hop := range config.Hops {
+			if hop.ToKernel == sourceKernelID {
+				// sourceKernelID 是这一跳的终点，即它的上一跳是上一跳的 ToKernel
+				if i > 0 {
+					prevHop := config.Hops[i-1]
+					return prevHop.ToKernel, prevHop.ToAddress, prevHop.ToPort, true
+				}
+				// sourceKernelID 是第一跳的终点，没有上一跳
+				return "", "", 0, false
+			}
+		}
+	}
+
+	return "", "", 0, false
+}
+
 // GetRouteForKernelPair 获取两个内核之间的路由配置
 // 返回路由名称和跳数信息
 func (m *MultiHopConfigManager) GetRouteForKernelPair(currentKernelID, targetKernelID string) (routeName string, hopIndex, totalHops int, found bool) {

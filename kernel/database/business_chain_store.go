@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -46,6 +47,8 @@ func NewMySQLBusinessChainStore(db *sql.DB) *MySQLBusinessChainStore {
 
 // InsertRecord 插入新记录
 func (s *MySQLBusinessChainStore) InsertRecord(record *BusinessChainRecord) (int64, error) {
+	
+
 	query := `
 		INSERT INTO business_data_chain (connector_id, channel_id, data_hash, prev_data_hash, prev_signature, signature, timestamp)
 		VALUES (?, ?, ?, ?, ?, ?, ?)

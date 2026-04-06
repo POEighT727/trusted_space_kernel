@@ -8,13 +8,13 @@ import (
 
 // BusinessChainRecord 业务数据哈希链记录
 type BusinessChainRecord struct {
-	ID          int64
-	ChannelID   string
-	DataHash    string // 业务数据哈希，ACK记录为空
-	PrevHash    string
+	ID            int64
+	ChannelID     string
+	DataHash      string // 业务数据哈希，ACK记录为空
+	PrevHash      string
 	PrevSignature string // 上一跳的RSA签名
-	Signature   string
-	Timestamp   time.Time
+	Signature     string
+	Timestamp     time.Time
 }
 
 // Store 数据存储接口
@@ -23,6 +23,8 @@ type Store interface {
 	AppendChainRecord(record *BusinessChainRecord) (int64, error)
 	// GetLastRecordByChannel 获取指定频道的最新记录（排除ACK）
 	GetLastRecordByChannel(channelID string) (*BusinessChainRecord, error)
+	// GetLastRecordWithAck 获取指定频道的最新记录（含 ACK，用于取 prevSignature）
+	GetLastRecordWithAck(channelID string) (*BusinessChainRecord, error)
 	// GetRecordsByChannel 获取指定频道的所有记录
 	GetRecordsByChannel(channelID string) ([]*BusinessChainRecord, error)
 	// GetRecordByID 根据ID获取记录
@@ -91,6 +93,37 @@ func (s *MySQLStore) GetLastRecordByChannel(channelID string) (*BusinessChainRec
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to query last record: %w", err)
+	}
+
+	return &record, nil
+}
+
+// GetLastRecordWithAck 获取指定频道的最新记录（含 ACK，用于取 prevSignature）
+func (s *MySQLStore) GetLastRecordWithAck(channelID string) (*BusinessChainRecord, error) {
+	query := `
+		SELECT id, channel_id, data_hash, prev_data_hash, prev_signature, signature, timestamp
+		FROM business_data_chain
+		WHERE channel_id = ?
+		ORDER BY id DESC
+		LIMIT 1
+	`
+	row := s.db.QueryRow(query, channelID)
+
+	var record BusinessChainRecord
+	err := row.Scan(
+		&record.ID,
+		&record.ChannelID,
+		&record.DataHash,
+		&record.PrevHash,
+		&record.PrevSignature,
+		&record.Signature,
+		&record.Timestamp,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query last record with ack: %w", err)
 	}
 
 	return &record, nil
