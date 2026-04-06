@@ -832,8 +832,8 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 	// 存证记录在 AfterSent callback 中执行（PushData → startDataDistribution 完成数据分发后才触发）
 	// 这样保证 DATA_RECEIVE 在 forwardToKernel DATA_SEND 之后记录（因果顺序正确）
 	// 注意：ACK_RECEIVED 不在 AfterSent 中记录，只由 SendAck（单跳）或 ForwardData（多跳第一跳）记录一次
-	recordEvidence := func(isAfterSent bool) {
-		// ACK 包在 AfterSent 中直接返回（不记录 DATA_RECEIVED）
+	recordEvidence := func() {
+		// ACK 包直接返回（不记录 DATA_RECEIVED）
 		// 只由 SendAck 记录一次 ACK_RECEIVED
 		if isAckPacket {
 			return
@@ -845,12 +845,11 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 		}
 
 		// 业务数据包记录 DATA_RECEIVE
-		// AfterSent 时 source=currentKernelID（immediate 上一跳，即当前内核刚刚收到）
+		// AfterSent 时 source=req.SourceKernelId（上一跳内核，当前内核刚刚从它收到数据）
 		// direct call 时 source=req.SourceKernelId（原始发送方，用于存证关联）
+		// 注意：不再使用 currentKernelID 作为 source，因为 DATA_RECEIVE 表示"收到数据"，
+		// source 应为数据来源方，而非接收方自己
 		dataReceiveSource := req.SourceKernelId
-		if isAfterSent {
-			dataReceiveSource = currentKernelID
-		}
 		if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
 			dataReceiveSource,
 			evidence.EventTypeDataReceive,
@@ -912,21 +911,13 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 	// 只有上一跳不记录（避免重复）
 	// ================================================================
 	if isAckPacket && currentKernelID != req.SourceKernelId && s.auditLog != nil && !dataPacket.AckEvidenceRecorded {
-		// 提取 connector 签名
-		var ackPB pb.AckPacket
-		ackConnectorSig := ""
-		if proto.Unmarshal(req.DataPacket.Payload, &ackPB) == nil {
-			ackConnectorSig = ackPB.Signature
-		}
 		// 提取 flow_id（AckPacket 中的 FlowId 优先）
 		ackFlowID := flowID
-		if ackPB.FlowId != "" {
-			ackFlowID = ackPB.FlowId
-		}
-		ackMetadata := map[string]string{
-			"connector_signature": ackConnectorSig,
-			"kernel_signature":   req.DataPacket.GetSignature(),
-			"ack_sender":         req.DataPacket.GetSenderId(),
+		var ackPB pb.AckPacket
+		if proto.Unmarshal(req.DataPacket.Payload, &ackPB) == nil {
+			if ackPB.FlowId != "" {
+				ackFlowID = ackPB.FlowId
+			}
 		}
 		if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
 			currentKernelID,
@@ -936,7 +927,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 			evidence.DirectionInternal,
 			"",
 			ackFlowID,
-			ackMetadata,
+			map[string]string{"data_category": "business"},
 		); err != nil {
 			log.Printf("[WARN] Failed to submit ACK_RECEIVED evidence: %v", err)
 		} else {
@@ -1010,7 +1001,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 
 	dataPacket.AfterSent = func() {
 		if !isEndPacket {
-			recordEvidence(true)
+			recordEvidence()
 		}
 	}
 	err = channel.PushData(dataPacket)
@@ -1404,13 +1395,6 @@ func (s *KernelServiceServer) ForwardAckNotification(ctx context.Context, req *p
 	// ================================================================
 	// 1. 记录 ACK_RECEIVED 存证
 	// ================================================================
-	ackMetadata := map[string]string{
-		"connector_signature":     req.ConnectorSignature,
-		"kernel_signature":       req.KernelSignature,
-		"ack_sender":           req.SourceKernelId,
-		"prev_signature":        req.PrevSignature,
-		"origin_connector_id":   req.OriginConnectorId,
-	}
 	if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
 		currentKernelID,
 		evidence.EventTypeAckReceived,
@@ -1419,7 +1403,7 @@ func (s *KernelServiceServer) ForwardAckNotification(ctx context.Context, req *p
 		evidence.DirectionInternal,
 		"",
 		req.FlowId,
-		ackMetadata,
+		map[string]string{"data_category": "business"},
 	); err != nil {
 		log.Printf("[WARN] Failed to submit ACK_RECEIVED evidence: %v", err)
 	} else {

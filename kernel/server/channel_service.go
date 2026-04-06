@@ -725,6 +725,18 @@ func (s *ChannelServiceServer) AcceptChannelProposal(ctx context.Context, req *p
 
 	if allApproved {
 		// 所有参与方都已确认，频道正式创建，发送创建通知
+		// 记录 CHANNEL_CREATED evidence（kernel-2/3 在 AcceptChannelProposal 时激活频道）
+		if s.auditLog != nil {
+			s.auditLog.SubmitBasicEvidence(
+				s.multiKernelManager.config.KernelID,
+				evidence.EventTypeChannelCreated,
+				channel.ChannelID,
+				"",
+				evidence.DirectionInternal,
+				"",
+			)
+		}
+
 		go func() {
 			notification := &pb.ChannelNotification{
 				ChannelId:         channel.ChannelID,
@@ -1120,23 +1132,39 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 			}
 		}
 
-		// data_hash 直接使用 connector 发送的 packet.DataHash
-		// packet.DataHash 由 connector 计算: SHA256(payload + prevHash)
-		// prevHash 从数据库获取，用于构建 kernel 本地的哈希链
-		var dataHash string
-		if packet.DataHash != "" {
-			dataHash = packet.DataHash
-		} else {
-			// 兼容：无 dataHash 时使用简单 SHA256(payload)
-			h := sha256.Sum256(packet.Payload)
-			dataHash = hex.EncodeToString(h[:])
+		// 获取频道上一条记录的 data_hash（用于计算哈希链）
+		var prevHash string
+		if s.businessChainManager != nil {
+			lastHash, _, err := s.businessChainManager.GetLastDataHash(channelID)
+			if err == nil && lastHash != "" {
+				prevHash = lastHash
+			}
 		}
 
-		// 获取上一一跳的签名（来自 packet.Signature，即 connector 的签名）
+		// 计算 data_hash = SHA256(payload + prevHash)
+		// 与 connector 保持一致：dataHash = SHA256(data + prevHash)
+		var computedDataHash string
+		var hashInput []byte
+		if prevHash != "" {
+			hashInput = append(packet.Payload, []byte(prevHash)...)
+		} else {
+			hashInput = packet.Payload
+		}
+		h := sha256.Sum256(hashInput)
+		computedDataHash = hex.EncodeToString(h[:])
+
+		// 验证：当前计算的 data_hash 应与 packet.DataHash 一致
+		if packet.DataHash != "" && computedDataHash != packet.DataHash {
+			log.Printf("[WARN] data_hash mismatch: computed=%s, packet=%s, channel=%s",
+				computedDataHash, packet.DataHash, channelID)
+		}
+
+		// 获取上一跳的签名（来自 packet.Signature，即 connector 的签名）
 		prevSignature := packet.Signature
 		
+
 		// 计算内核签名: RSA_Sign(dataHash + prevSignature)
-		kernelSignature, signErr := security.KernelSign(dataHash, prevSignature)
+		kernelSignature, signErr := security.KernelSign(computedDataHash, prevSignature)
 
 		// 判断数据类型（用于 evidence metadata）
 		dataCategory := determineDataCategory(packet.Payload)
@@ -1148,7 +1176,7 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				senderID,
 				evidence.EventTypeDataSend,
 				channelID,
-				dataHash,
+				computedDataHash,
 				evidence.DirectionInternal,
 				currentKernelID,
 				flowID,
@@ -1165,7 +1193,7 @@ func (s *ChannelServiceServer) StreamData(stream pb.ChannelService_StreamDataSer
 				currentKernelID,
 				evidence.EventTypeDataReceive,
 				channelID,
-				dataHash,
+				computedDataHash,
 				evidence.DirectionInternal,
 				channel.ReceiverIDs[0],
 				flowID,
@@ -1481,12 +1509,6 @@ func (s *ChannelServiceServer) SendAck(ctx context.Context, req *pb.AckPacket) (
 
 	// 9. 记录 ACK_RECEIVED（当前 kernel - 即 kernel-3）
 	if s.auditLog != nil {
-		ackMetadata := map[string]string{
-			"connector_signature":     connectorSignature,
-			"kernel_signature":       kernelAckSignature,
-			"ack_sender":            req.SenderId,
-			"original_sender_kernel": originKernelID,
-		}
 		if _, err := s.auditLog.SubmitBasicEvidenceWithMetadata(
 			currentKernelID,
 			evidence.EventTypeAckReceived,
@@ -1495,7 +1517,7 @@ func (s *ChannelServiceServer) SendAck(ctx context.Context, req *pb.AckPacket) (
 			evidence.DirectionInternal,
 			"",
 			ackFlowID,
-			ackMetadata,
+			map[string]string{"data_category": "business"},
 		); err != nil {
 			log.Printf("[WARN] SendAck: failed to submit ACK_RECEIVED evidence: %v", err)
 		} else {
@@ -2156,6 +2178,18 @@ func (s *ChannelServiceServer) NotifyChannelCreated(ctx context.Context, req *pb
 
 			// 启动数据分发协程
 			go channel.StartDataDistribution()
+
+			// 记录 CHANNEL_CREATED evidence（kernel 作为接收方激活频道时记录）
+			if s.auditLog != nil {
+				s.auditLog.SubmitBasicEvidence(
+					s.multiKernelManager.config.KernelID,
+					evidence.EventTypeChannelCreated,
+					channel.ChannelID,
+					"",
+					evidence.DirectionInternal,
+					"",
+				)
+			}
 
 			// 通知所有参与者频道已激活
 			activatedNotification := &pb.ChannelNotification{

@@ -292,8 +292,7 @@ func main() {
 		// 原因：kernel→kernel 的证据在 ForwardData RPC 返回前记录，避免 ACK 包 FlowId 丢失导致跳过
 		if !packet.IsAck && !isFinal && packet.DataHash != "" {
 			metadata := map[string]string{
-				"data_category":    "business",
-				"original_flow_id": packet.FlowID, // 用于 ACK_RECEIVED 关联原始 FlowID
+				"data_category": "business",
 			}
 			if _, err := auditLog.SubmitBasicEvidenceWithMetadata(
 				currentKernelID,               // source: 当前内核
