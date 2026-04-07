@@ -18,13 +18,10 @@ server:
 # 多内核配置（内核默认启用多内核模式）
 multi_kernel:
   # 种子内核列表（用于初始发现其他内核）
-  seed_kernels: []
-    # - kernel_id: "kernel-2"
-    #   address: "192.168.1.100"
-    #   port: 50051
-    # - kernel_id: "kernel-3"
-    #   address: "192.168.1.101"
-    #   port: 50051
+  seed_kernels: 
+    - kernel_id: "kernel-2"
+      address: "192.168.202.128"
+      port: 50053
   # 内核间通信端口（默认为主端口+2，避免与bootstrap端口冲突）
   kernel_port: 50053
   # 心跳间隔（秒）

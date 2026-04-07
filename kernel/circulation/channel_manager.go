@@ -2684,13 +2684,13 @@ func (c *Channel) StorePermissionRequestFromRemote(permReq *PermissionRequestMes
 	case "add_sender":
 		// 检查是否已经是接收者（禁止双向身份）
 		if c.CanReceive(targetID) {
-			log.Printf("✗ Rejecting permission request: target %s is already a receiver, cannot add as sender", targetID)
+			log.Printf("[FAILED] Rejecting permission request: target %s is already a receiver, cannot add as sender", targetID)
 			return
 		}
 	case "add_receiver":
 		// 检查是否已经是发送者（禁止双向身份）
 		if c.CanSend(targetID) {
-			log.Printf("✗ Rejecting permission request: target %s is already a sender, cannot add as receiver", targetID)
+			log.Printf("[FAILED] Rejecting permission request: target %s is already a sender, cannot add as receiver", targetID)
 			return
 		}
 	}

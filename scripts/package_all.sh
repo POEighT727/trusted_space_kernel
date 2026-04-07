@@ -142,9 +142,9 @@ echo "=== 可信数据空间内核状态 ==="
 # 检查进程
 KERNEL_PID=$(pgrep -f "kernel.*-config.*kernel.yaml" | head -1)
 if [ -n "$KERNEL_PID" ]; then
-    echo "✅ 内核运行中 (PID: $KERNEL_PID)"
+    echo "[OK] 内核运行中 (PID: $KERNEL_PID)"
 else
-    echo "❌ 内核未运行"
+    echo "[FAILED] 内核未运行"
 fi
 
 # 检查端口
@@ -152,9 +152,9 @@ check_port() {
     local port=$1
     local name=$2
     if netstat -tln 2>/dev/null | grep -q ":$port "; then
-        echo "✅ $name 端口 $port 正在监听"
+        echo "[OK] $name 端口 $port 正在监听"
     else
-        echo "❌ $name 端口 $port 未监听"
+        echo "[FAILED] $name 端口 $port 未监听"
     fi
 }
 
@@ -164,22 +164,22 @@ check_port 50053 "内核间通信"
 
 # 检查证书
 if [ -f "certs/ca.crt" ]; then
-    echo "✅ CA证书存在"
+    echo "[OK] CA证书存在"
 else
     echo "⚠️  CA证书不存在（首次运行时自动生成）"
 fi
 
 if [ -f "certs/kernel.crt" ]; then
-    echo "✅ 服务器证书存在"
+    echo "[OK] 服务器证书存在"
 else
     echo "⚠️  服务器证书不存在（首次运行时自动生成）"
 fi
 
 # 检查配置文件
 if [ -f "config/kernel.yaml" ]; then
-    echo "✅ 配置文件存在"
+    echo "[OK] 配置文件存在"
 else
-    echo "❌ 配置文件不存在"
+    echo "[FAILED] 配置文件不存在"
 fi
 
 echo "=== 状态检查完成 ==="
@@ -198,7 +198,7 @@ echo "🔐 开始生成内核证书..."
 
 # 检查openssl是否可用
 if ! command -v openssl &> /dev/null; then
-    echo "❌ 错误：需要安装openssl"
+    echo "[FAILED] 错误：需要安装openssl"
     echo "   Ubuntu/Debian: sudo apt-get install openssl"
     echo "   CentOS/RHEL: sudo yum install openssl"
     echo "   macOS: brew install openssl"
@@ -241,18 +241,18 @@ if [ ! -f "certs/ca.crt" ]; then
     openssl genrsa -out certs/ca.key 4096 2>/dev/null
     openssl req -new -x509 -days 3650 -key certs/ca.key -sha256 -out certs/ca.crt \
         -subj "/C=CN/ST=State/L=City/O=Trusted Data Space/CN=Trusted Data Space CA" 2>/dev/null
-    echo "   ✅ CA证书生成完成"
+    echo "   [OK] CA证书生成完成"
 else
-    echo "   ✅ CA证书已存在"
+    echo "   [OK] CA证书已存在"
 fi
 
 # 生成服务器私钥（如果不存在）
 if [ ! -f "certs/kernel.key" ]; then
     echo "   生成服务器私钥..."
     openssl genrsa -out certs/kernel.key 2048 2>/dev/null
-    echo "   ✅ 服务器私钥生成完成"
+    echo "   [OK] 服务器私钥生成完成"
 else
-    echo "   ✅ 服务器私钥已存在"
+    echo "   [OK] 服务器私钥已存在"
 fi
 
 # 生成服务器证书请求
@@ -296,9 +296,9 @@ KERNEL_EOF
     # 清理临时文件
     rm -f certs/kernel.cnf certs/kernel.csr certs/ca.srl
 
-    echo "   ✅ 服务器证书生成完成"
+    echo "   [OK] 服务器证书生成完成"
 else
-    echo "   ✅ 服务器证书已存在"
+    echo "   [OK] 服务器证书已存在"
 fi
 
 # 设置证书权限
@@ -322,7 +322,7 @@ CERT_EOF
     chmod +x "${KERNEL_DIR}/kernel" 2>/dev/null || true
     chmod +x "${KERNEL_DIR}/kernel.exe" 2>/dev/null || true
 
-    echo "✅ 内核打包完成 -> ${KERNEL_DIR}"
+    echo "[OK] 内核打包完成 -> ${KERNEL_DIR}"
 }
 
 # 打包连接器函数
@@ -359,7 +359,7 @@ package_connector() {
     # 创建空的evidence.log文件
     touch "${CONNECTOR_DIR}/evidence/evidence.log"
 
-    echo "✅ 连接器打包完成 -> ${CONNECTOR_DIR}"
+    echo "[OK] 连接器打包完成 -> ${CONNECTOR_DIR}"
 }
 
 # 生成统一的README
@@ -504,7 +504,7 @@ case "$TARGET" in
         generate_readme "${CONNECTOR_DIR}" "连接器"
         ;;
     *)
-        echo "❌ 无效的目标: $TARGET"
+        echo "[FAILED] 无效的目标: $TARGET"
         echo "   使用方法: $0 <version> <platform> <kernel|connector|all>"
         echo "   示例: $0 1.0.0 linux-amd64 all"
         exit 1
@@ -518,14 +518,14 @@ if [ "$TARGET" = "kernel" ] || [ "$TARGET" = "all" ]; then
     cd "${OUTPUT_DIR}"
     tar -czf "kernel-${VERSION}-${PLATFORM}.tar.gz" "kernel-${VERSION}-${PLATFORM}"
     cd ..
-    echo "   ✅ 内核压缩包: ${OUTPUT_DIR}/kernel-${VERSION}-${PLATFORM}.tar.gz"
+    echo "   [OK] 内核压缩包: ${OUTPUT_DIR}/kernel-${VERSION}-${PLATFORM}.tar.gz"
 fi
 
 if [ "$TARGET" = "connector" ] || [ "$TARGET" = "all" ]; then
     cd "${OUTPUT_DIR}"
     tar -czf "connector-${VERSION}-${PLATFORM}.tar.gz" "connector-${VERSION}-${PLATFORM}"
     cd ..
-    echo "   ✅ 连接器压缩包: ${OUTPUT_DIR}/connector-${VERSION}-${PLATFORM}.tar.gz"
+    echo "   [OK] 连接器压缩包: ${OUTPUT_DIR}/connector-${VERSION}-${PLATFORM}.tar.gz"
 fi
 
 echo ""

@@ -84,7 +84,7 @@ echo "✓ Kernel server certificate created"
 rm -f "$CERTS_DIR/ca.srl"
 
 echo ""
-echo "✅ All certificates generated successfully!"
+echo "[OK] All certificates generated successfully!"
 echo ""
 echo "📁 Certificate files:"
 echo "   CA:          $CERTS_DIR/ca.crt"

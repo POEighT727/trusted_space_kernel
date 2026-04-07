@@ -17,7 +17,7 @@ if (-not (Test-Path $CERTS_DIR)) {
 try {
     $null = Get-Command openssl -ErrorAction Stop
 } catch {
-    Write-Host "❌ OpenSSL not found. Please install OpenSSL first." -ForegroundColor Red
+    Write-Host "[FAILED] OpenSSL not found. Please install OpenSSL first." -ForegroundColor Red
     Write-Host "   Download from: https://slproweb.com/products/Win32OpenSSL.html" -ForegroundColor Yellow
     exit 1
 }
@@ -90,7 +90,7 @@ if (Test-Path "$CERTS_DIR/ca.srl") {
 }
 
 Write-Host ""
-Write-Host "✅ All certificates generated successfully!" -ForegroundColor Green
+Write-Host "[OK] All certificates generated successfully!" -ForegroundColor Green
 Write-Host ""
 Write-Host "📁 Certificate files:" -ForegroundColor Cyan
 Write-Host "   CA:          $CERTS_DIR/ca.crt"

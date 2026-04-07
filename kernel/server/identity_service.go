@@ -86,8 +86,8 @@ func (s *IdentityServiceServer) Handshake(ctx context.Context, req *pb.Handshake
 		exposed = *req.Exposed
 	}
 
-	// 注册连接器（传递公开状态）
-	if err := s.registry.Register(req.ConnectorId, req.EntityType, req.PublicKey, sessionToken, exposed); err != nil {
+	// 注册连接器（传递公开状态和数据目录）
+	if err := s.registry.Register(req.ConnectorId, req.EntityType, req.PublicKey, sessionToken, exposed, req.DataCatalog); err != nil {
 		return &pb.HandshakeResponse{
 			Success: false,
 			Message: fmt.Sprintf("registration failed: %v", err),
@@ -230,17 +230,19 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 				if conn.ConnectorID == req.RequesterId {
 					continue
 				}
-				// 类型过滤
-				if req.FilterType == "" || conn.EntityType == req.FilterType {
-					allConnectors = append(allConnectors, &pb.ConnectorInfo{
-						ConnectorId:   conn.ConnectorID,
-						EntityType:    conn.EntityType,
-						PublicKey:     conn.PublicKey,
-						Status:        string(conn.Status),
-						LastHeartbeat: conn.LastHeartbeat.Unix(),
-						RegisteredAt:  conn.RegisteredAt.Unix(),
-						KernelId:      s.multiKernelManager.config.KernelID,
-					})
+			// 类型过滤
+			if req.FilterType == "" || conn.EntityType == req.FilterType {
+				allConnectors = append(allConnectors, &pb.ConnectorInfo{
+					ConnectorId:   conn.ConnectorID,
+					EntityType:    conn.EntityType,
+					PublicKey:     conn.PublicKey,
+					Status:        string(conn.Status),
+					LastHeartbeat: conn.LastHeartbeat.Unix(),
+					RegisteredAt:  conn.RegisteredAt.Unix(),
+					KernelId:      s.multiKernelManager.config.KernelID,
+					DataCatalog:   conn.DataCatalog,
+					Exposed:      conn.Exposed,
+				})
 				}
 			}
 			
@@ -286,6 +288,8 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 				LastHeartbeat: info.LastHeartbeat.Unix(),
 				RegisteredAt:  info.RegisteredAt.Unix(),
 				KernelId:      s.multiKernelManager.config.KernelID,
+				DataCatalog:   info.DataCatalog,
+				Exposed:      info.Exposed,
 			})
 		}
 		// 可选类型过滤
@@ -327,6 +331,8 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 			Status:        string(info.Status), // 将ConnectorStatus转换为string
 			LastHeartbeat: info.LastHeartbeat.Unix(),
 			RegisteredAt:  info.RegisteredAt.Unix(),
+			DataCatalog:   info.DataCatalog,
+			Exposed:      info.Exposed,
 		})
 	}
 
@@ -336,23 +342,69 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 	}, nil
 }
 
-// GetConnectorInfo 获取连接器详细信息
+// GetConnectorInfo 获取连接器详细信息（支持跨内核查询）
 func (s *IdentityServiceServer) GetConnectorInfo(ctx context.Context, req *pb.GetConnectorInfoRequest) (*pb.GetConnectorInfoResponse, error) {
 	// 验证请求者身份
-	if err := security.VerifyConnectorID(ctx, req.RequesterId); err != nil {
-		return &pb.GetConnectorInfoResponse{
-			Found:   false,
-			Message: fmt.Sprintf("requester authentication failed: %v", err),
-		}, nil
+	// 注意：内核间请求（RequesterId 以 "kernel-" 开头）的身份由 mTLS 在传输层保证，此处跳过连接器身份验证
+	isKernelRequest := strings.HasPrefix(req.RequesterId, "kernel-")
+	if !isKernelRequest {
+		if err := security.VerifyConnectorID(ctx, req.RequesterId); err != nil {
+			return &pb.GetConnectorInfoResponse{
+				Found:   false,
+				Message: fmt.Sprintf("requester authentication failed: %v", err),
+			}, nil
+		}
 	}
 
-	// 获取连接器信息
-	info, err := s.registry.GetConnector(req.ConnectorId)
+	connectorID := req.ConnectorId
+	targetKernelID := req.TargetKernelId
+
+	// 解析 connector_id 是否包含 kernel: 前缀（格式: kernel-1:connector-A）
+	if strings.Contains(connectorID, ":") {
+		parts := strings.SplitN(connectorID, ":", 2)
+		if len(parts) == 2 {
+			targetKernelID = parts[0]
+			connectorID = parts[1]
+		}
+	}
+
+	// 如果指定了目标内核ID，向远端内核查询
+	if targetKernelID != "" && targetKernelID != s.multiKernelManager.config.KernelID {
+		// 向远端内核查询
+		resp, err := s.multiKernelManager.GetRemoteConnectorInfo(targetKernelID, connectorID)
+		if err != nil {
+			return &pb.GetConnectorInfoResponse{
+				Found:   false,
+				Message: fmt.Sprintf("failed to query remote kernel %s: %v", targetKernelID, err),
+			}, nil
+		}
+		return resp, nil
+	}
+
+	// 获取本地连接器信息
+	info, err := s.registry.GetConnector(connectorID)
 	if err != nil {
 		return &pb.GetConnectorInfoResponse{
 			Found:   false,
 			Message: fmt.Sprintf("connector not found: %v", err),
 		}, nil
+	}
+
+	// 检查连接器是否公开（expose_to_others）
+	// 不公开的连接器只能被自己查询，或者在同一内核内被其他连接器查询
+	if !info.Exposed {
+		// 连接器查询自己的信息：允许
+		if !isKernelRequest && req.RequesterId == connectorID {
+			// 连接器查询自己的信息
+		} else if isKernelRequest && targetKernelID == s.multiKernelManager.config.KernelID {
+			// 内核查询自己内核下的连接器信息：允许
+		} else {
+			// 跨内核查询不公开的连接器：拒绝
+			return &pb.GetConnectorInfoResponse{
+				Found:   false,
+				Message: fmt.Sprintf("connector %s is not exposed to other kernels", connectorID),
+			}, nil
+		}
 	}
 
 	return &pb.GetConnectorInfoResponse{
@@ -361,9 +413,12 @@ func (s *IdentityServiceServer) GetConnectorInfo(ctx context.Context, req *pb.Ge
 			ConnectorId:   info.ConnectorID,
 			EntityType:    info.EntityType,
 			PublicKey:     info.PublicKey,
-			Status:        string(info.Status), // 将ConnectorStatus转换为string
+			Status:        string(info.Status),
 			LastHeartbeat: info.LastHeartbeat.Unix(),
 			RegisteredAt:  info.RegisteredAt.Unix(),
+			KernelId:      s.multiKernelManager.config.KernelID,
+			DataCatalog:   info.DataCatalog,
+			Exposed:       info.Exposed,
 		},
 		Message: "connector found",
 	}, nil

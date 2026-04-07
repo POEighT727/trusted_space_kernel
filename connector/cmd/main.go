@@ -23,10 +23,12 @@ import (
 // Config 连接器配置
 type Config struct {
 	Connector struct {
-		ID          string `yaml:"id"`
-		EntityType  string `yaml:"entity_type"`
-		PublicKey   string `yaml:"public_key"`
-		Exposed     bool   `yaml:"expose_to_others"` // 是否向其他内核公开自己的信息，默认为true
+		ID               string `yaml:"id"`
+		EntityType       string `yaml:"entity_type"`
+		PublicKey        string `yaml:"public_key"`
+		Exposed          bool   `yaml:"expose_to_others"` // 是否向其他内核公开自己的信息，默认为true
+		DataCatalog      []string `yaml:"data_catalog"`   // 数据类型/分类目录（支持直接内联列表）
+		DataCatalogFile  string   `yaml:"data_catalog_file"` // 数据目录文件路径（支持从文件加载，JSON 或纯文本，每行一个）
 	} `yaml:"connector"`
 
 	Kernel struct {
@@ -139,6 +141,7 @@ func main() {
 			return os.Getenv("KERNEL_ID")
 		}(),
 		Exposed: exposed,
+		DataCatalog: config.Connector.DataCatalog,
 		// 数据库配置
 		DatabaseEnabled:  config.Database.Enabled,
 		DatabaseHost:     config.Database.Host,
@@ -284,13 +287,13 @@ func runInteractiveShell(connector *client.Connector, config *Config) {
 		case "reject":
 			handleRejectProposal(connector, args)
 		case "propose":
-			fmt.Println("❌ 'propose' command is deprecated - use 'create' command instead")
+			fmt.Println("[FAILED] 'propose' command is deprecated - use 'create' command instead")
 		case "sendto":
 			handleSendTo(connector, args)
 		case "subscribe", "sub":
 			handleSubscribe(connector, args)
 		case "receive", "recv":
-			fmt.Println("❌ 'receive' command is deprecated - use 'subscribe' command instead")
+			fmt.Println("[FAILED] 'receive' command is deprecated - use 'subscribe' command instead")
 		case "channels", "ch":
 			handleChannels(connector)
 		case "request-permission":
@@ -371,7 +374,7 @@ func handleList(connector *client.Connector) {
 
 	connectors, err := connector.DiscoverConnectors("")
 	if err != nil {
-		fmt.Printf("❌ 查询失败: %v\n", err)
+		fmt.Printf("[FAILED] 查询失败: %v\n", err)
 		return
 	}
 
@@ -437,7 +440,7 @@ func handleInfo(connector *client.Connector, args []string) {
 
 	info, err := connector.GetConnectorInfo(connectorID)
 	if err != nil {
-		fmt.Printf("❌ 查询失败: %v\n", err)
+		fmt.Printf("[FAILED] 查询失败: %v\n", err)
 		return
 	}
 
@@ -447,15 +450,33 @@ func handleInfo(connector *client.Connector, args []string) {
 	fmt.Printf("实体类型:     %s\n", info.EntityType)
 	fmt.Printf("状态:         %s\n", info.Status)
 	fmt.Printf("公钥:         %s\n", truncateString(info.PublicKey, 50))
+	fmt.Printf("数据目录:     %s\n", formatDataCatalog(info.DataCatalog))
+	fmt.Printf("信息暴露:     %s\n", mapExposedToText(info.Exposed))
 	fmt.Printf("最后心跳:     %s\n", time.Unix(info.LastHeartbeat, 0).Format("2006-01-02 15:04:05"))
 	fmt.Printf("注册时间:     %s\n", time.Unix(info.RegisteredAt, 0).Format("2006-01-02 15:04:05"))
 	fmt.Println(strings.Repeat("-", 50))
+}
+
+// formatDataCatalog 格式化数据目录显示
+func formatDataCatalog(catalog []string) string {
+	if len(catalog) == 0 {
+		return "(未设置)"
 	}
+	return strings.Join(catalog, ", ")
+}
+
+// mapExposedToText 将 exposed 状态转换为可读文本
+func mapExposedToText(exposed bool) string {
+	if exposed {
+		return "是 (向其他内核公开)"
+	}
+	return "否 (不向其他内核公开)"
+}
 
 // handleCreateChannel 处理创建频道命令
 func handleCreateChannel(connector *client.Connector, args []string, defaultConfigDir string) {
 	if len(args) < 2 {
-		fmt.Println("❌ 参数错误: create --config <config_file> | --sender <sender_ids> --receiver <receiver_ids> [--approver <approver_id>] [--reason <reason>]")
+		fmt.Println("[FAILED] 参数错误: create --config <config_file> | --sender <sender_ids> --receiver <receiver_ids> [--approver <approver_id>] [--reason <reason>]")
 		fmt.Println("   支持两种方式：")
 		fmt.Printf("   1. 从配置文件: create --config channel-config.json (在 %s 中查找)\n", defaultConfigDir)
 		fmt.Println("   2. 手动指定: create --sender connector-A --receiver connector-B --reason \"data exchange\"")
@@ -472,7 +493,7 @@ func handleCreateChannel(connector *client.Connector, args []string, defaultConf
 		if len(args) >= 2 {
 			configFile = args[1]
 		} else {
-			fmt.Println("❌ --config 参数需要提供配置文件路径")
+			fmt.Println("[FAILED] --config 参数需要提供配置文件路径")
 			return
 		}
 	}
@@ -495,7 +516,7 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 
 	// 检查文件是否存在
 	if _, err := os.Stat(configFile); os.IsNotExist(err) {
-		fmt.Printf("❌ 配置文件不存在: %s\n", configFile)
+		fmt.Printf("[FAILED] 配置文件不存在: %s\n", configFile)
 		return
 	}
 
@@ -504,7 +525,7 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 	// 读取配置文件内容以判断是否包含跨内核参与者
 	data, err := os.ReadFile(configFile)
 	if err != nil {
-		fmt.Printf("❌ 读取配置文件失败: %v\n", err)
+		fmt.Printf("[FAILED] 读取配置文件失败: %v\n", err)
 		return
 	}
 
@@ -531,7 +552,7 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 			// 无法解析，回退到原有方法
 			config, err := connector.CreateChannelFromConfig(configFile)
 			if err != nil {
-				fmt.Printf("❌ 创建频道失败: %v\n", err)
+				fmt.Printf("[FAILED] 创建频道失败: %v\n", err)
 				return
 			}
 			fmt.Printf("[OK] 频道创建提议已提交\n")
@@ -574,7 +595,7 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 
 		chID, err := connector.CreateCrossKernelChannel(cfg.SenderIDs, cfg.ReceiverIDs, cfg.DataTopic, cfg.Encrypted, fmt.Sprintf("Create from config: %s", configFile), evidenceConfig)
 		if err != nil {
-			fmt.Printf("❌ 跨内核频道创建失败: %v\n", err)
+			fmt.Printf("[FAILED] 跨内核频道创建失败: %v\n", err)
 			return
 		}
 		fmt.Printf("[OK] 跨内核频道已创建: %s\n", chID)
@@ -584,7 +605,7 @@ func handleCreateChannelFromConfigFile(connector *client.Connector, configFile s
 	// 否则使用原有本地提议流程
 	config, err := connector.CreateChannelFromConfig(configFile)
 	if err != nil {
-		fmt.Printf("❌ 创建频道失败: %v\n", err)
+		fmt.Printf("[FAILED] 创建频道失败: %v\n", err)
 		return
 	}
 
@@ -621,7 +642,7 @@ func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 				}
 				i += 2
 			} else {
-				fmt.Println("❌ --sender 参数需要提供发送方ID")
+				fmt.Println("[FAILED] --sender 参数需要提供发送方ID")
 				return
 			}
 		case "--receiver":
@@ -636,7 +657,7 @@ func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 				}
 				i += 2
 			} else {
-				fmt.Println("❌ --receiver 参数需要提供接收方ID")
+				fmt.Println("[FAILED] --receiver 参数需要提供接收方ID")
 				return
 			}
 		case "--approver":
@@ -644,7 +665,7 @@ func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 				approverID = args[i+1]
 				i += 2
 			} else {
-				fmt.Println("❌ --approver 参数需要提供批准者ID")
+				fmt.Println("[FAILED] --approver 参数需要提供批准者ID")
 				return
 			}
 		case "--reason":
@@ -652,18 +673,18 @@ func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 				reason = strings.Join(args[i+1:], " ")
 				i = len(args) // 结束解析
 			} else {
-				fmt.Println("❌ --reason 参数需要提供理由")
+				fmt.Println("[FAILED] --reason 参数需要提供理由")
 				return
 			}
 		default:
-			fmt.Printf("❌ 未知参数: %s\n", args[i])
+			fmt.Printf("[FAILED] 未知参数: %s\n", args[i])
 			fmt.Println("   支持的参数: --sender, --receiver, --approver, --reason")
 			return
 		}
 	}
 
 	if len(senderIDs) == 0 || len(receiverIDs) == 0 {
-		fmt.Println("❌ 必须至少指定一个 --sender 和一个 --receiver 参数")
+		fmt.Println("[FAILED] 必须至少指定一个 --sender 和一个 --receiver 参数")
 		return
 	}
 
@@ -693,7 +714,7 @@ func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 		fmt.Println("检测到跨内核参与者，使用跨内核协商路径创建频道...")
 		chID, err := connector.CreateCrossKernelChannel(senderIDs, receiverIDs, "", true, reason, nil)
 		if err != nil {
-			fmt.Printf("❌ 跨内核频道创建失败: %v\n", err)
+			fmt.Printf("[FAILED] 跨内核频道创建失败: %v\n", err)
 			return
 		}
 		fmt.Printf("[OK] 跨内核频道已创建: %s\n", chID)
@@ -701,7 +722,7 @@ func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 	} else {
 		channelID, proposalID, err := connector.ProposeChannel(senderIDs, receiverIDs, "", approverID, reason)
 		if err != nil {
-			fmt.Printf("❌ 提议创建频道失败: %v\n", err)
+			fmt.Printf("[FAILED] 提议创建频道失败: %v\n", err)
 			return
 		}
 
@@ -733,7 +754,7 @@ func handleCreateChannelFromArgs(connector *client.Connector, args []string) {
 // handleAcceptProposal 处理接受提议命令
 func handleAcceptProposal(connector *client.Connector, args []string) {
 	if len(args) != 2 {
-		fmt.Println("❌ 参数错误: accept <channel_id> <proposal_id>")
+		fmt.Println("[FAILED] 参数错误: accept <channel_id> <proposal_id>")
 		return
 	}
 
@@ -744,7 +765,7 @@ func handleAcceptProposal(connector *client.Connector, args []string) {
 
 	err := connector.AcceptChannelProposal(channelID, proposalID)
 		if err != nil {
-		fmt.Printf("❌ 接受频道提议失败: %v\n", err)
+		fmt.Printf("[FAILED] 接受频道提议失败: %v\n", err)
 		return
 	}
 
@@ -755,7 +776,7 @@ func handleAcceptProposal(connector *client.Connector, args []string) {
 // handleRejectProposal 处理拒绝提议命令
 func handleRejectProposal(connector *client.Connector, args []string) {
 	if len(args) < 2 {
-		fmt.Println("❌ 参数错误: reject <channel_id> <proposal_id> [--reason <reason>]")
+		fmt.Println("[FAILED] 参数错误: reject <channel_id> <proposal_id> [--reason <reason>]")
 		return
 	}
 
@@ -772,7 +793,7 @@ func handleRejectProposal(connector *client.Connector, args []string) {
 
 	err := connector.RejectChannelProposal(channelID, proposalID, reason)
 	if err != nil {
-		fmt.Printf("❌ 拒绝频道提议失败: %v\n", err)
+		fmt.Printf("[FAILED] 拒绝频道提议失败: %v\n", err)
 		return
 	}
 
@@ -802,18 +823,18 @@ func handleSendTo(connector *client.Connector, args []string) {
 	fmt.Printf("正在验证频道 %s 的状态...\n", channelID)
 	channelInfo, err := connector.GetChannelInfo(channelID)
 	if err != nil {
-		fmt.Printf("❌ 获取频道信息失败: %v\n", err)
+		fmt.Printf("[FAILED] 获取频道信息失败: %v\n", err)
 		return
 	}
 
 	if !channelInfo.Found {
-		fmt.Printf("❌ 频道 %s 不存在\n", channelID)
+		fmt.Printf("[FAILED] 频道 %s 不存在\n", channelID)
 		return
 	}
 
 	// 检查协商状态
 	if channelInfo.NegotiationStatus != pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED {
-		fmt.Printf("❌ 无法发送数据到频道 %s\n", channelID)
+		fmt.Printf("[FAILED] 无法发送数据到频道 %s\n", channelID)
 		fmt.Printf("   频道协商状态: %s\n", channelInfo.NegotiationStatus.String())
 		switch channelInfo.NegotiationStatus {
 		case pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_PROPOSED:
@@ -832,7 +853,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 
 	// 检查频道状态
 	if channelInfo.Status != "active" {
-		fmt.Printf("❌ 频道 %s 当前状态为 %s，无法发送数据\n", channelID, channelInfo.Status)
+		fmt.Printf("[FAILED] 频道 %s 当前状态为 %s，无法发送数据\n", channelID, channelInfo.Status)
 		return
 	}
 
@@ -852,7 +873,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 	}
 
 	if !isSender {
-		fmt.Printf("❌ 权限不足: 连接器 %s 不是频道 %s 的发送方\n", connectorID, channelID)
+		fmt.Printf("[FAILED] 权限不足: 连接器 %s 不是频道 %s 的发送方\n", connectorID, channelID)
 		fmt.Printf("   频道发送方: %v\n", channelInfo.SenderIds)
 		fmt.Printf("   频道接收方: %v\n", channelInfo.ReceiverIds)
 		fmt.Println("   解决方法: 只有发送方可以向频道发送数据")
@@ -886,7 +907,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 				}
 
 				if err := connector.SendFile(channelID, filePath, targetIDs); err != nil {
-					fmt.Printf("❌ 发送文件失败: %v\n", err)
+					fmt.Printf("[FAILED] 发送文件失败: %v\n", err)
 					return
 				}
 
@@ -902,7 +923,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 	// 启动实时发送器
 	sender, err := connector.StartRealtimeSend(channelID)
 	if err != nil {
-		fmt.Printf("❌ 连接频道失败: %v\n", err)
+		fmt.Printf("[FAILED] 连接频道失败: %v\n", err)
 		return
 	}
 	defer sender.Close()
@@ -934,7 +955,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 			// 解析目标接收者
 			parts := strings.Fields(line)
 			if len(parts) < 2 {
-				fmt.Println("❌ 格式错误，正确格式: @<接收者ID> <数据>")
+				fmt.Println("[FAILED] 格式错误，正确格式: @<接收者ID> <数据>")
 				continue
 			}
 			
@@ -951,7 +972,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 			}
 			
 			if len(data) == 0 {
-				fmt.Println("❌ 格式错误，需要提供数据内容")
+				fmt.Println("[FAILED] 格式错误，需要提供数据内容")
 				continue
 			}
 		} else {
@@ -962,7 +983,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 
 		// 立即发送这一行
 		if err := sender.SendLineTo([]byte(data), targetIDs); err != nil {
-			fmt.Printf("❌ 发送失败: %v\n", err)
+			fmt.Printf("[FAILED] 发送失败: %v\n", err)
 			continue
 		}
 
@@ -985,7 +1006,7 @@ func handleSendTo(connector *client.Connector, args []string) {
 // handleSubscribe 处理订阅频道命令
 func handleSubscribe(connector *client.Connector, args []string) {
 	if len(args) == 0 {
-		fmt.Println("❌ 请指定要订阅的频道ID")
+		fmt.Println("[FAILED] 请指定要订阅的频道ID")
 		fmt.Println("用法: subscribe <channel_id> [--role <sender|receiver>] [--reason <reason>] [--output <dir>]")
 		return
 	}
@@ -1005,12 +1026,12 @@ func handleSubscribe(connector *client.Connector, args []string) {
 			if i+1 < len(args) {
 				role = args[i+1]
 				if role != "sender" && role != "receiver" {
-					fmt.Printf("❌ 无效的角色: %s (必须是 'sender' 或 'receiver')\n", role)
+					fmt.Printf("[FAILED] 无效的角色: %s (必须是 'sender' 或 'receiver')\n", role)
 					return
 				}
 				i += 2
 			} else {
-				fmt.Println("❌ --role 参数需要提供角色值")
+				fmt.Println("[FAILED] --role 参数需要提供角色值")
 				return
 			}
 		case "--reason":
@@ -1018,7 +1039,7 @@ func handleSubscribe(connector *client.Connector, args []string) {
 				reason = strings.Join(args[i+1:], " ")
 				i = len(args) // 结束解析
 			} else {
-				fmt.Println("❌ --reason 参数需要提供理由")
+				fmt.Println("[FAILED] --reason 参数需要提供理由")
 				return
 			}
 		case "--output":
@@ -1026,7 +1047,7 @@ func handleSubscribe(connector *client.Connector, args []string) {
 				outputDir = args[i+1]
 				i += 2
 			} else {
-				fmt.Println("❌ --output 参数需要提供目录路径")
+				fmt.Println("[FAILED] --output 参数需要提供目录路径")
 				return
 			}
 		default:
@@ -1035,7 +1056,7 @@ func handleSubscribe(connector *client.Connector, args []string) {
 				outputDir = args[i]
 				i++
 			} else {
-				fmt.Printf("❌ 未知参数: %s\n", args[i])
+				fmt.Printf("[FAILED] 未知参数: %s\n", args[i])
 				return
 			}
 		}
@@ -1049,7 +1070,7 @@ func handleSubscribe(connector *client.Connector, args []string) {
 	// 检查是否已经是频道参与者
 	isParticipant, err := connector.IsChannelParticipant(channelID)
 	if err != nil {
-		fmt.Printf("❌ 检查频道参与状态失败: %v\n", err)
+		fmt.Printf("[FAILED] 检查频道参与状态失败: %v\n", err)
 		return
 	}
 
@@ -1059,7 +1080,7 @@ func handleSubscribe(connector *client.Connector, args []string) {
 	} else {
 		// 不是频道参与者，需要申请加入
 		if role == "" {
-			fmt.Printf("❌ 您不是频道 %s 的参与者，请指定要申请的角色\n", channelID)
+			fmt.Printf("[FAILED] 您不是频道 %s 的参与者，请指定要申请的角色\n", channelID)
 			fmt.Println("   使用: subscribe <channel_id> --role <sender|receiver> [--reason <reason>] [--output <dir>]")
 			return
 		}
@@ -1070,7 +1091,7 @@ func handleSubscribe(connector *client.Connector, args []string) {
 		// 发送加入申请
 		err := connector.RequestChannelAccess(channelID, role, reason)
 		if err != nil {
-			fmt.Printf("❌ 申请加入频道失败: %v\n", err)
+			fmt.Printf("[FAILED] 申请加入频道失败: %v\n", err)
 			return
 		}
 
@@ -1132,7 +1153,7 @@ func handleSubscribe(connector *client.Connector, args []string) {
 		})
 
 		if err != nil {
-			fmt.Printf("❌ 接收失败: %v\n", err)
+			fmt.Printf("[FAILED] 接收失败: %v\n", err)
 		} else {
 			fmt.Printf("[OK] 频道 %s 已关闭\n", channelID)
 		}
@@ -1157,7 +1178,7 @@ func handleStatus(connector *client.Connector, args []string) {
 	// 设置状态
 	newStatus := args[0]
 	if err := connector.SetStatus(client.ConnectorStatus(newStatus)); err != nil {
-		fmt.Printf("❌ 设置状态失败: %v\n", err)
+		fmt.Printf("[FAILED] 设置状态失败: %v\n", err)
 		fmt.Println("可用状态: active, inactive, closed")
 		return
 	}
@@ -1181,7 +1202,7 @@ func truncateString(s string, maxLen int) string {
 // handleRequestPermission 处理申请权限变更命令
 func handleRequestPermission(connector *client.Connector, args []string) {
 	if len(args) != 4 {
-		fmt.Println("❌ 参数错误: request-permission <channel_id> <change_type> <target_id> <reason>")
+		fmt.Println("[FAILED] 参数错误: request-permission <channel_id> <change_type> <target_id> <reason>")
 		fmt.Println("   change_type: add_sender, remove_sender, add_receiver, remove_receiver")
 		return
 	}
@@ -1199,7 +1220,7 @@ func handleRequestPermission(connector *client.Connector, args []string) {
 		"remove_receiver": true,
 	}
 	if !validTypes[changeType] {
-		fmt.Printf("❌ 无效的变更类型: %s\n", changeType)
+		fmt.Printf("[FAILED] 无效的变更类型: %s\n", changeType)
 		fmt.Println("   支持的类型: add_sender, remove_sender, add_receiver, remove_receiver")
 		return
 	}
@@ -1208,12 +1229,12 @@ func handleRequestPermission(connector *client.Connector, args []string) {
 
 	resp, err := connector.RequestPermissionChange(channelID, changeType, targetID, reason)
 	if err != nil {
-		fmt.Printf("❌ 申请失败: %v\n", err)
+		fmt.Printf("[FAILED] 申请失败: %v\n", err)
 		return
 	}
 
 	if !resp.Success {
-		fmt.Printf("❌ 申请失败: %s\n", resp.Message)
+		fmt.Printf("[FAILED] 申请失败: %s\n", resp.Message)
 		return
 	}
 
@@ -1225,7 +1246,7 @@ func handleRequestPermission(connector *client.Connector, args []string) {
 // handleApprovePermission 处理批准权限变更/订阅申请命令
 func handleApprovePermission(connector *client.Connector, args []string) {
 	if len(args) != 2 {
-		fmt.Println("❌ 参数错误: approve-permission <channel_id> <request_id>")
+		fmt.Println("[FAILED] 参数错误: approve-permission <channel_id> <request_id>")
 		return
 	}
 
@@ -1245,7 +1266,7 @@ func handleApprovePermission(connector *client.Connector, args []string) {
 			return
 		}
 		// 两个都失败了，显示权限变更的错误
-		fmt.Printf("❌ 批准失败: %v\n", err2)
+		fmt.Printf("[FAILED] 批准失败: %v\n", err2)
 		return
 	}
 
@@ -1258,7 +1279,7 @@ func handleApprovePermission(connector *client.Connector, args []string) {
 			return
 		}
 		// 两个都失败了，显示权限变更的错误消息
-		fmt.Printf("❌ 批准失败: %s\n", resp2.Message)
+		fmt.Printf("[FAILED] 批准失败: %s\n", resp2.Message)
 		return
 	}
 
@@ -1268,7 +1289,7 @@ func handleApprovePermission(connector *client.Connector, args []string) {
 // handleRejectPermission 处理拒绝权限变更/订阅申请命令
 func handleRejectPermission(connector *client.Connector, args []string) {
 	if len(args) < 3 {
-		fmt.Println("❌ 参数错误: reject-permission <channel_id> <request_id> <reason>")
+		fmt.Println("[FAILED] 参数错误: reject-permission <channel_id> <request_id> <reason>")
 		return
 	}
 
@@ -1289,12 +1310,12 @@ func handleRejectPermission(connector *client.Connector, args []string) {
 	// 如果订阅申请拒绝失败，尝试拒绝权限变更
 	resp2, err2 := connector.RejectPermissionChange(channelID, requestID, reason)
 	if err2 != nil {
-		fmt.Printf("❌ 拒绝失败: %v\n", err2)
+		fmt.Printf("[FAILED] 拒绝失败: %v\n", err2)
 		return
 	}
 
 	if !resp2.Success {
-		fmt.Printf("❌ 拒绝失败: %s\n", resp2.Message)
+		fmt.Printf("[FAILED] 拒绝失败: %s\n", resp2.Message)
 		return
 	}
 
@@ -1305,7 +1326,7 @@ func handleRejectPermission(connector *client.Connector, args []string) {
 // handleListPermissions 处理查看权限变更请求命令
 func handleListPermissions(connector *client.Connector, args []string) {
 	if len(args) != 1 {
-		fmt.Println("❌ 参数错误: list-permissions <channel_id>")
+		fmt.Println("[FAILED] 参数错误: list-permissions <channel_id>")
 		return
 	}
 
@@ -1315,12 +1336,12 @@ func handleListPermissions(connector *client.Connector, args []string) {
 
 	resp, err := connector.GetPermissionRequests(channelID)
 	if err != nil {
-		fmt.Printf("❌ 获取失败: %v\n", err)
+		fmt.Printf("[FAILED] 获取失败: %v\n", err)
 		return
 	}
 
 	if !resp.Success {
-		fmt.Printf("❌ 获取失败: %s\n", resp.Message)
+		fmt.Printf("[FAILED] 获取失败: %s\n", resp.Message)
 		return
 	}
 
@@ -1369,7 +1390,7 @@ func handleQueryEvidence(connector *client.Connector, args []string) {
 				channelID = strings.TrimSpace(args[i+1])
 				i += 2
 			} else {
-				fmt.Println("❌ --channel 参数需要提供频道ID")
+				fmt.Println("[FAILED] --channel 参数需要提供频道ID")
 				return
 			}
 		case "--connector":
@@ -1377,7 +1398,7 @@ func handleQueryEvidence(connector *client.Connector, args []string) {
 				connectorID = strings.TrimSpace(args[i+1])
 				i += 2
 			} else {
-				fmt.Println("❌ --connector 参数需要提供连接器ID")
+				fmt.Println("[FAILED] --connector 参数需要提供连接器ID")
 				return
 			}
 		case "--flow":
@@ -1385,7 +1406,7 @@ func handleQueryEvidence(connector *client.Connector, args []string) {
 				flowID = strings.TrimSpace(args[i+1])
 				i += 2
 			} else {
-				fmt.Println("❌ --flow 参数需要提供业务流程ID")
+				fmt.Println("[FAILED] --flow 参数需要提供业务流程ID")
 				return
 			}
 		case "--limit":
@@ -1394,16 +1415,16 @@ func handleQueryEvidence(connector *client.Connector, args []string) {
 				if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
 					limit = int32(l)
 				} else {
-					fmt.Printf("❌ 无效的limit值: %s\n", limitStr)
+					fmt.Printf("[FAILED] 无效的limit值: %s\n", limitStr)
 					return
 				}
 				i += 2
 			} else {
-				fmt.Println("❌ --limit 参数需要提供数字")
+				fmt.Println("[FAILED] --limit 参数需要提供数字")
 				return
 			}
 		default:
-			fmt.Printf("❌ 未知参数: %s\n", args[i])
+			fmt.Printf("[FAILED] 未知参数: %s\n", args[i])
 			fmt.Println("用法: query-evidence [--channel <channel_id>] [--connector <connector_id>] [--flow <flow_id>] [--limit <num>]")
 			return
 		}
@@ -1411,7 +1432,7 @@ func handleQueryEvidence(connector *client.Connector, args []string) {
 
 	// 至少需要指定一个查询条件
 	if channelID == "" && connectorID == "" && flowID == "" {
-		fmt.Println("❌ 至少需要指定--channel、--connector或--flow参数")
+		fmt.Println("[FAILED] 至少需要指定--channel、--connector或--flow参数")
 		fmt.Println("用法: query-evidence [--channel <channel_id>] [--connector <connector_id>] [--flow <flow_id>] [--limit <num>]")
 		fmt.Println("示例: query-evidence --channel channel-123 --limit 10")
 		fmt.Println("示例: query-evidence --connector connector-A")
@@ -1440,7 +1461,7 @@ func handleQueryEvidence(connector *client.Connector, args []string) {
 		records, err = connector.QueryEvidence(channelID, connectorID, limit)
 	}
 	if err != nil {
-		fmt.Printf("❌ 查询失败: %v\n", err)
+		fmt.Printf("[FAILED] 查询失败: %v\n", err)
 		return
 	}
 
@@ -1558,7 +1579,58 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
+	// 加载数据目录（支持文件引用）
+	dataCatalog := loadDataCatalog(&config)
+	if len(dataCatalog) > 0 {
+		config.Connector.DataCatalog = dataCatalog
+	}
+
 	return &config, nil
+}
+
+// loadDataCatalog 加载数据目录
+// 优先使用内联列表，否则尝试从文件加载
+// 支持 JSON 数组格式和纯文本格式（每行一个数据项）
+func loadDataCatalog(config *Config) []string {
+	// 优先使用内联列表
+	if len(config.Connector.DataCatalog) > 0 {
+		return config.Connector.DataCatalog
+	}
+
+	// 尝试从文件加载
+	if config.Connector.DataCatalogFile == "" {
+		return nil
+	}
+
+	filePath := config.Connector.DataCatalogFile
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Printf("[WARN] Failed to read data catalog file %s: %v", filePath, err)
+		return nil
+	}
+
+	trimmed := strings.TrimSpace(string(data))
+
+	// 尝试 JSON 数组格式
+	if strings.HasPrefix(trimmed, "[") {
+		var items []string
+		if err := json.Unmarshal(data, &items); err != nil {
+			log.Printf("[WARN] Failed to parse data catalog JSON from %s: %v", filePath, err)
+			return nil
+		}
+		return items
+	}
+
+	// 纯文本格式：每行一个数据项
+	var items []string
+	scanner := bufio.NewScanner(strings.NewReader(trimmed))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			items = append(items, line)
+		}
+	}
+	return items
 }
 
 // removeDuplicates 移除字符串切片中的重复元素，保持原有顺序

@@ -29,7 +29,8 @@ type ConnectorInfo struct {
 	LastHeartbeat time.Time
 	RegisteredAt  time.Time
 	SessionToken  string
-	Exposed       bool // 是否向其他内核公开自己的信息，true=公开，false=不公开
+	Exposed       bool     // 是否向其他内核公开自己的信息，true=公开，false=不公开
+	DataCatalog   []string // 数据类型/分类目录（如: ["传感器数据", "日志数据"]）
 }
 
 // Registry 身份注册表，维护连接器信息
@@ -47,7 +48,8 @@ func NewRegistry() *Registry {
 
 // Register 注册连接器
 // exposed: 是否向其他内核公开该连接器信息，默认为 true
-func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken string, exposed ...bool) error {
+// dataCatalog: 数据类型/分类目录列表
+func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken string, exposed bool, dataCatalog []string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -56,12 +58,6 @@ func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken str
 	}
 
 	now := time.Now()
-
-	// 确定是否公开，默认为 true
-	isExposed := true
-	if len(exposed) > 0 {
-		isExposed = exposed[0]
-	}
 
 	// 检查是否已注册
 	if info, exists := r.connectors[connectorID]; exists {
@@ -76,8 +72,9 @@ func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken str
 		}
 		info.LastHeartbeat = now
 		info.SessionToken = sessionToken
-		// 更新公开状态
-		info.Exposed = isExposed
+		// 更新公开状态和数据目录
+		info.Exposed = exposed
+		info.DataCatalog = dataCatalog
 		return nil
 	}
 
@@ -90,7 +87,8 @@ func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken str
 		LastHeartbeat: now,
 		RegisteredAt:  now,
 		SessionToken:  sessionToken,
-		Exposed:       isExposed,
+		Exposed:       exposed,
+		DataCatalog:   dataCatalog,
 	}
 
 	return nil

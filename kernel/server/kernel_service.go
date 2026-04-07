@@ -1214,7 +1214,8 @@ func (s *KernelServiceServer) SyncConnectorInfo(ctx context.Context, req *pb.Syn
 		}
 
 		// 尝试注册（如果已存在则会更新信息）
-		if err := s.registry.Register(connectorInfo.ConnectorId, connectorInfo.EntityType, connectorInfo.PublicKey, ""); err != nil {
+		// exposed: 远端连接器是否向其他内核公开；dataCatalog: 远端连接器的数据目录
+		if err := s.registry.Register(connectorInfo.ConnectorId, connectorInfo.EntityType, connectorInfo.PublicKey, "", connectorInfo.Exposed, connectorInfo.DataCatalog); err != nil {
 			log.Printf("[WARN] Failed to register connector %s from kernel %s: %v", connectorInfo.ConnectorId, req.SourceKernelId, err)
 			continue
 		}

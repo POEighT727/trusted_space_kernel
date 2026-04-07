@@ -36,6 +36,7 @@ message HandshakeRequest {
   string public_key = 3;        // 用于应用层加密的公钥
   int64 timestamp = 4;
   optional bool exposed = 5;    // 是否向其他内核公开自己的信息，默认为true（不设置时为true）
+  repeated string data_catalog = 6; // 数据类型/分类目录（如: ["传感器数据", "日志数据"]）
 }
 
 message HandshakeResponse {
@@ -76,11 +77,14 @@ message ConnectorInfo {
   int64 last_heartbeat = 5; // Unix时间戳
   int64 registered_at = 6;  // Unix时间戳
   string kernel_id = 7;     // 所属内核ID（为空表示本内核）
+  repeated string data_catalog = 8; // 数据类型/分类目录（如: ["传感器数据", "日志数据"]）
+  bool exposed = 9;          // 是否向其他内核公开自己的信息
 }
 
 message GetConnectorInfoRequest {
   string requester_id = 1;
-  string connector_id = 2;  // 要查询的连接器ID
+  string connector_id = 2;      // 要查询的连接器ID
+  string target_kernel_id = 3;  // 目标内核ID（为空则查询本内核）
 }
 
 message GetConnectorInfoResponse {

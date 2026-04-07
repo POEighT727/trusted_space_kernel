@@ -119,9 +119,9 @@ Write-Host "=== 可信数据空间内核状态 ===" -ForegroundColor Cyan
 # 检查进程
 \$kernelProcesses = Get-Process | Where-Object { \$_.ProcessName -eq "kernel" -and \$_.CommandLine -like "*kernel.yaml*" }
 if (\$kernelProcesses) {
-    Write-Host "✅ 内核运行中 (PID: \$(\$kernelProcesses[0].Id))" -ForegroundColor Green
+    Write-Host "[OK] 内核运行中 (PID: \$(\$kernelProcesses[0].Id))" -ForegroundColor Green
 } else {
-    Write-Host "❌ 内核未运行" -ForegroundColor Red
+    Write-Host "[FAILED] 内核未运行" -ForegroundColor Red
 }
 
 # 检查端口
@@ -130,9 +130,9 @@ function Test-Port {
     try {
         `$connection = New-Object System.Net.Sockets.TcpClient("localhost", `$port)
         `$connection.Close()
-        Write-Host "✅ `$name 端口 `$port 正在监听" -ForegroundColor Green
+        Write-Host "[OK] `$name 端口 `$port 正在监听" -ForegroundColor Green
     } catch {
-        Write-Host "❌ `$name 端口 `$port 未监听" -ForegroundColor Red
+        Write-Host "[FAILED] `$name 端口 `$port 未监听" -ForegroundColor Red
     }
 }
 
@@ -142,22 +142,22 @@ Test-Port 50053 "内核间通信"
 
 # 检查证书
 if (Test-Path "certs\ca.crt") {
-    Write-Host "✅ CA证书存在" -ForegroundColor Green
+    Write-Host "[OK] CA证书存在" -ForegroundColor Green
 } else {
     Write-Host "⚠️  CA证书不存在（首次运行时自动生成）" -ForegroundColor Yellow
 }
 
 if (Test-Path "certs\kernel.crt") {
-    Write-Host "✅ 服务器证书存在" -ForegroundColor Green
+    Write-Host "[OK] 服务器证书存在" -ForegroundColor Green
 } else {
     Write-Host "⚠️  服务器证书不存在（首次运行时自动生成）" -ForegroundColor Yellow
 }
 
 # 检查配置文件
 if (Test-Path "config\kernel.yaml") {
-    Write-Host "✅ 配置文件存在" -ForegroundColor Green
+    Write-Host "[OK] 配置文件存在" -ForegroundColor Green
 } else {
-    Write-Host "❌ 配置文件不存在" -ForegroundColor Red
+    Write-Host "[FAILED] 配置文件不存在" -ForegroundColor Red
 }
 
 Write-Host "=== 状态检查完成 ===" -ForegroundColor Cyan
@@ -173,7 +173,7 @@ Write-Host "🔐 开始生成内核证书..." -ForegroundColor Cyan
 
 # 检查openssl是否可用
 if (!(Get-Command openssl -ErrorAction SilentlyContinue)) {
-    Write-Host "❌ 错误：需要安装openssl" -ForegroundColor Red
+    Write-Host "[FAILED] 错误：需要安装openssl" -ForegroundColor Red
     Write-Host "   请从 https://slproweb.com/products/Win32OpenSSL.html 下载并安装" -ForegroundColor Yellow
     exit 1
 }
@@ -223,18 +223,18 @@ if (!(Test-Path "certs\ca.crt")) {
     & openssl req -new -x509 -days 3650 -key certs\ca.key -sha256 -out certs\ca.crt `
         -subj "/C=CN/ST=State/L=City/O=Trusted Data Space/CN=Trusted Data Space CA" 2>`$null
 
-    Write-Host "   ✅ CA证书生成完成" -ForegroundColor Green
+    Write-Host "   [OK] CA证书生成完成" -ForegroundColor Green
 } else {
-    Write-Host "   ✅ CA证书已存在" -ForegroundColor Green
+    Write-Host "   [OK] CA证书已存在" -ForegroundColor Green
 }
 
 # 生成服务器私钥（如果不存在）
 if (!(Test-Path "certs\kernel.key")) {
     Write-Host "   生成服务器私钥..." -ForegroundColor Yellow
     & openssl genrsa -out certs\kernel.key 2048 2>`$null
-    Write-Host "   ✅ 服务器私钥生成完成" -ForegroundColor Green
+    Write-Host "   [OK] 服务器私钥生成完成" -ForegroundColor Green
 } else {
-    Write-Host "   ✅ 服务器私钥已存在" -ForegroundColor Green
+    Write-Host "   [OK] 服务器私钥已存在" -ForegroundColor Green
 }
 
 # 生成服务器证书（如果不存在）
@@ -281,9 +281,9 @@ IP.2 = `$address
     Remove-Item "certs\kernel.cnf", "certs\kernel.csr" -ErrorAction SilentlyContinue
     if (Test-Path "certs\ca.srl") { Remove-Item "certs\ca.srl" }
 
-    Write-Host "   ✅ 服务器证书生成完成" -ForegroundColor Green
+    Write-Host "   [OK] 服务器证书生成完成" -ForegroundColor Green
 } else {
-    Write-Host "   ✅ 服务器证书已存在" -ForegroundColor Green
+    Write-Host "   [OK] 服务器证书已存在" -ForegroundColor Green
 }
 
 Write-Host ""
@@ -299,7 +299,7 @@ Write-Host "   .\start.ps1" -ForegroundColor White
 
     $CertScript | Out-File -FilePath "$KernelDir\generate_certs.ps1" -Encoding UTF8
 
-    Write-Host "✅ 内核打包完成 -> $KernelDir" -ForegroundColor Green
+    Write-Host "[OK] 内核打包完成 -> $KernelDir" -ForegroundColor Green
 }
 
 # 打包连接器函数
@@ -332,7 +332,7 @@ function Package-Connector {
     # 创建空的evidence.log文件
     New-Item -ItemType File -Path "$ConnectorDir\evidence\evidence.log" -Force | Out-Null
 
-    Write-Host "✅ 连接器打包完成 -> $ConnectorDir" -ForegroundColor Green
+    Write-Host "[OK] 连接器打包完成 -> $ConnectorDir" -ForegroundColor Green
 }
 
 # 生成统一的README
@@ -475,7 +475,7 @@ switch ($Target) {
         Generate-Readme $ConnectorDir "连接器"
     }
     default {
-        Write-Host "❌ 无效的目标: $Target" -ForegroundColor Red
+        Write-Host "[FAILED] 无效的目标: $Target" -ForegroundColor Red
         Write-Host "   使用方法: .\package_all.ps1 -Version <version> -Platform <platform> -Target <kernel|connector|all>" -ForegroundColor Yellow
         Write-Host "   示例: .\package_all.ps1 -Version 1.0.0 -Platform windows-amd64 -Target all" -ForegroundColor Yellow
         exit 1
@@ -487,12 +487,12 @@ Write-Host "📦 创建压缩包..." -ForegroundColor Yellow
 
 if ($Target -eq "kernel" -or $Target -eq "all") {
     Compress-Archive -Path "$KernelDir\*" -DestinationPath "$OutputDir\kernel-$Version-$Platform.zip" -Force
-    Write-Host "   ✅ 内核压缩包: $OutputDir\kernel-$Version-$Platform.zip" -ForegroundColor Green
+    Write-Host "   [OK] 内核压缩包: $OutputDir\kernel-$Version-$Platform.zip" -ForegroundColor Green
 }
 
 if ($Target -eq "connector" -or $Target -eq "all") {
     Compress-Archive -Path "$ConnectorDir\*" -DestinationPath "$OutputDir\connector-$Version-$Platform.zip" -Force
-    Write-Host "   ✅ 连接器压缩包: $OutputDir\connector-$Version-$Platform.zip" -ForegroundColor Green
+    Write-Host "   [OK] 连接器压缩包: $OutputDir\connector-$Version-$Platform.zip" -ForegroundColor Green
 }
 
 Write-Host ""

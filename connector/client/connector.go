@@ -57,6 +57,7 @@ type Connector struct {
 	status             ConnectorStatus // 连接器状态，默认为active
 	kernelID           string          // 可选：连接器所在内核ID（用于跨内核发现请求）
 	exposed            *bool           // 是否向其他内核公开自己的信息，默认为true（使用指针以支持可选字段）
+	dataCatalog        []string        // 数据类型/分类目录
 	clientKeyPath      string          // connector 私钥路径（用于签名）
 
 	conn         *grpc.ClientConn
@@ -101,6 +102,8 @@ type Config struct {
 	KernelID string
 	// 是否向其他内核公开自己的信息，默认为true（使用指针以支持可选字段）
 	Exposed *bool
+	// 数据类型/分类目录
+	DataCatalog []string
 	// 数据库配置
 	DatabaseEnabled  bool
 	DatabaseHost     string
@@ -141,6 +144,7 @@ func NewConnector(config *Config) (*Connector, error) {
 		serverAddr:  config.ServerAddr,
 		kernelID:    config.KernelID,
 		exposed:     config.Exposed, // 是否向其他内核公开自己的信息（传递指针）
+		dataCatalog: config.DataCatalog,
 		clientKeyPath: config.ClientKeyPath, // 用于签名
 		status:      ConnectorStatusActive, // 默认状态为active
 		conn:        conn,
@@ -189,6 +193,7 @@ func (c *Connector) Connect() error {
 		PublicKey:   c.publicKey,
 		Timestamp:   time.Now().Unix(),
 		Exposed:     c.exposed, // 是否向其他内核公开自己的信息（已经是*bool类型）
+		DataCatalog: c.dataCatalog,
 	})
 	if err != nil {
 		return fmt.Errorf("handshake failed: %w", err)
@@ -1008,11 +1013,25 @@ func (c *Connector) CreateCrossKernelChannel(senderIDs []string, receiverIDs []s
 	return resp.ChannelId, nil
 }
 
-// GetConnectorInfo 获取指定连接器的详细信息
+// GetConnectorInfo 获取指定连接器的详细信息（支持跨内核查询）
+// connectorID 支持格式: "connector-A" (本内核) 或 "kernel-1:connector-A" (跨内核)
 func (c *Connector) GetConnectorInfo(connectorID string) (*pb.ConnectorInfo, error) {
+	// 解析 connectorID 是否包含 kernel: 前缀
+	targetKernelID := ""
+	actualConnectorID := connectorID
+
+	if strings.Contains(connectorID, ":") {
+		parts := strings.SplitN(connectorID, ":", 2)
+		if len(parts) == 2 {
+			targetKernelID = parts[0]
+			actualConnectorID = parts[1]
+		}
+	}
+
 	resp, err := c.identitySvc.GetConnectorInfo(c.ctx, &pb.GetConnectorInfoRequest{
-		RequesterId: c.connectorID,
-		ConnectorId: connectorID,
+		RequesterId:     c.connectorID,
+		ConnectorId:   actualConnectorID,
+		TargetKernelId: targetKernelID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connector info: %w", err)
@@ -1146,7 +1165,7 @@ func (c *Connector) ApprovePermissionChange(channelID, requestID string) (*pb.Ap
 	if resp.Success {
 		log.Printf("[OK] Permission change approved: %s", requestID)
 	} else {
-		log.Printf("✗ Permission change approval failed: %s", resp.Message)
+		log.Printf("[FAILED] Permission change approval failed: %s", resp.Message)
 	}
 	return resp, nil
 }

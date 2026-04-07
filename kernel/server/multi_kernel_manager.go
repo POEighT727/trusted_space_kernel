@@ -1131,6 +1131,48 @@ func (m *MultiKernelManager) GetRemotePermissionRequests(channelID string) []*Re
 	return m.remotePermissionRequests[channelID]
 }
 
+// GetRemoteConnectorInfo 向远端内核查询连接器信息
+func (m *MultiKernelManager) GetRemoteConnectorInfo(targetKernelID, connectorID string) (*pb.GetConnectorInfoResponse, error) {
+	m.kernelsMu.RLock()
+	kinfo, exists := m.kernels[targetKernelID]
+	m.kernelsMu.RUnlock()
+
+	if !exists {
+		return &pb.GetConnectorInfoResponse{
+			Found:   false,
+			Message: fmt.Sprintf("target kernel %s not connected", targetKernelID),
+		}, nil
+	}
+
+	// 连接到目标内核的 IdentityService
+	conn, err := m.connectToKernelIdentityService(kinfo)
+	if err != nil {
+		return &pb.GetConnectorInfoResponse{
+			Found:   false,
+			Message: fmt.Sprintf("failed to connect to kernel %s: %v", targetKernelID, err),
+		}, nil
+	}
+	defer conn.Close()
+
+	identityClient := pb.NewIdentityServiceClient(conn)
+
+	// 查询远端内核的连接器信息
+	// 注意：使用本内核ID作为请求者，因为这是内核间请求
+	resp, err := identityClient.GetConnectorInfo(context.Background(), &pb.GetConnectorInfoRequest{
+		RequesterId:    m.config.KernelID, // 使用内核ID作为请求者
+		ConnectorId:   connectorID,
+		TargetKernelId: "", // 查询本内核，不需要指定目标
+	})
+	if err != nil {
+		return &pb.GetConnectorInfoResponse{
+			Found:   false,
+			Message: fmt.Sprintf("failed to get connector info from kernel %s: %v", targetKernelID, err),
+		}, nil
+	}
+
+	return resp, nil
+}
+
 // connectToKernelIdentityService 连接到内核的IdentityService（主服务器端口）
 func (m *MultiKernelManager) connectToKernelIdentityService(kernel *KernelInfo) (*grpc.ClientConn, error) {
 	// 创建TLS配置，同时包含自己的CA和对等内核的CA
