@@ -36,6 +36,14 @@ const (
 	ConnectorStatusClosed   ConnectorStatus = "closed"
 )
 
+// DataCatalogItem 数据目录项
+type DataCatalogItem struct {
+	Id      string // 数据项唯一标识
+	Name    string // 数据项名称
+	Type    string // 数据类型
+	Exposed bool   // 是否向外部内核展示，默认为 true
+}
+
 // LocalChannelInfo 本地记录的频道信息（从创建或通知中感知到）
 type LocalChannelInfo struct {
 	ChannelID    string
@@ -57,7 +65,9 @@ type Connector struct {
 	status             ConnectorStatus // 连接器状态，默认为active
 	kernelID           string          // 可选：连接器所在内核ID（用于跨内核发现请求）
 	exposed            *bool           // 是否向其他内核公开自己的信息，默认为true（使用指针以支持可选字段）
-	dataCatalog        []string        // 数据类型/分类目录
+	dataCatalog        []string        // 数据类型/分类目录（旧版，字符串列表）
+	dataCatalogItems   []*DataCatalogItem // 结构化数据目录（新版，支持 exposed 字段）
+	dataCatalogFile    string          // 数据目录文件路径（用于保存变更）
 	clientKeyPath      string          // connector 私钥路径（用于签名）
 
 	conn         *grpc.ClientConn
@@ -102,8 +112,12 @@ type Config struct {
 	KernelID string
 	// 是否向其他内核公开自己的信息，默认为true（使用指针以支持可选字段）
 	Exposed *bool
-	// 数据类型/分类目录
+	// 数据类型/分类目录（旧版，字符串列表）
 	DataCatalog []string
+	// 结构化数据目录（新版，支持 exposed 字段）
+	DataCatalogItems []*DataCatalogItem
+	// 数据目录文件路径（用于保存变更）
+	DataCatalogFile string
 	// 数据库配置
 	DatabaseEnabled  bool
 	DatabaseHost     string
@@ -145,6 +159,8 @@ func NewConnector(config *Config) (*Connector, error) {
 		kernelID:    config.KernelID,
 		exposed:     config.Exposed, // 是否向其他内核公开自己的信息（传递指针）
 		dataCatalog: config.DataCatalog,
+		dataCatalogItems: config.DataCatalogItems, // 结构化数据目录
+		dataCatalogFile: config.DataCatalogFile, // 数据目录文件路径
 		clientKeyPath: config.ClientKeyPath, // 用于签名
 		status:      ConnectorStatusActive, // 默认状态为active
 		conn:        conn,
@@ -159,6 +175,11 @@ func NewConnector(config *Config) (*Connector, error) {
 		subscriptions: make(map[string]bool),
 		processedNotifications: make(map[string]bool),
 		skippedNotifications: make(map[string]int),
+	}
+
+	// 同步旧版 DataCatalog 从结构化数据目录（如果在配置中指定了数据目录文件）
+	if connector.dataCatalogItems != nil && len(connector.dataCatalogItems) > 0 {
+		connector.syncDataCatalog()
 	}
 
 	// 初始化业务数据哈希链管理器
@@ -193,7 +214,8 @@ func (c *Connector) Connect() error {
 		PublicKey:   c.publicKey,
 		Timestamp:   time.Now().Unix(),
 		Exposed:     c.exposed, // 是否向其他内核公开自己的信息（已经是*bool类型）
-		DataCatalog: c.dataCatalog,
+		DataCatalog: c.dataCatalog, // 旧版数据目录（字符串列表）
+		DataCatalogItems: c.convertDataCatalogItems(), // 新版结构化数据目录
 	})
 	if err != nil {
 		return fmt.Errorf("handshake failed: %w", err)
@@ -2386,4 +2408,176 @@ func (c *Connector) recordAckFromKernel(channelID, dataHash, kernelSignature str
 
 	// prev_signature = kernel 的签名，signature = connector 的签名
 	return c.businessChainManager.HandleAck(channelID, kernelSignature, connectorSig)
+}
+
+// ReconnectWithCatalog 重新连接到内核并上报数据目录
+// 用于在更新数据目录后重新上报
+func (c *Connector) ReconnectWithCatalog() error {
+	// 首先保存数据目录到本地文件（如果有配置数据目录文件）
+	if c.dataCatalogFile != "" {
+		if err := c.saveDataCatalogToFile(); err != nil {
+			log.Printf("[WARN] Failed to save data catalog to file: %v", err)
+		}
+	}
+
+	// 发送握手请求，重新注册数据目录
+	resp, err := c.identitySvc.Handshake(c.ctx, &pb.HandshakeRequest{
+		ConnectorId: c.connectorID,
+		EntityType:  c.entityType,
+		PublicKey:   c.publicKey,
+		Timestamp:   time.Now().Unix(),
+		Exposed:     c.exposed,
+		DataCatalog: c.dataCatalog, // 旧版字符串列表（已在 SetDataCatalogItems 时同步更新）
+		DataCatalogItems: c.convertDataCatalogItems(), // 新版结构化数据目录（包含所有项，含 exposed 状态）
+	})
+	if err != nil {
+		return fmt.Errorf("handshake failed: %w", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("handshake rejected: %s", resp.Message)
+	}
+
+	c.sessionToken = resp.SessionToken
+	log.Printf("[OK] Data catalog updated and synced to kernel (version: %s)", resp.KernelVersion)
+	return nil
+}
+
+// syncDataCatalog 同步旧版 DataCatalog（字符串列表）从新版 DataCatalogItems
+func (c *Connector) syncDataCatalog() {
+	if c.dataCatalogItems == nil {
+		return
+	}
+	c.dataCatalog = make([]string, 0, len(c.dataCatalogItems))
+	for _, item := range c.dataCatalogItems {
+		c.dataCatalog = append(c.dataCatalog, item.Name)
+	}
+}
+
+// saveDataCatalogToFile 保存数据目录到本地 JSON 文件
+func (c *Connector) saveDataCatalogToFile() error {
+	if c.dataCatalogFile == "" {
+		return nil
+	}
+
+	if c.dataCatalogItems == nil {
+		return nil
+	}
+
+	// 构造保存的数据结构
+	catalogFile := struct {
+		DataItems []DataCatalogItem `json:"data_items"`
+	}{
+		DataItems: make([]DataCatalogItem, 0, len(c.dataCatalogItems)),
+	}
+
+	for _, item := range c.dataCatalogItems {
+		catalogFile.DataItems = append(catalogFile.DataItems, DataCatalogItem{
+			Id:      item.Id,
+			Name:    item.Name,
+			Type:    item.Type,
+			Exposed: item.Exposed,
+		})
+	}
+
+	// 序列化并保存到文件
+	data, err := json.MarshalIndent(catalogFile, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal data catalog: %w", err)
+	}
+
+	if err := os.WriteFile(c.dataCatalogFile, data, 0644); err != nil {
+		return fmt.Errorf("failed to write data catalog file: %w", err)
+	}
+
+	log.Printf("[OK] Data catalog saved to %s", c.dataCatalogFile)
+	return nil
+}
+
+// UpdateDataCatalogItem 更新指定数据项的暴露状态
+func (c *Connector) UpdateDataCatalogItem(dataID string, exposed bool) error {
+	if c.dataCatalogItems == nil {
+		return fmt.Errorf("data catalog items not initialized")
+	}
+
+	found := false
+	for _, item := range c.dataCatalogItems {
+		if item.Id == dataID {
+			item.Exposed = exposed
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("data item not found: %s", dataID)
+	}
+
+	return nil
+}
+
+// convertDataCatalogItems 将连接器内部的 DataCatalogItem 格式转换为 protobuf 格式
+func (c *Connector) convertDataCatalogItems() []*pb.DataCatalogItem {
+	if len(c.dataCatalogItems) == 0 {
+		return nil
+	}
+
+	result := make([]*pb.DataCatalogItem, 0, len(c.dataCatalogItems))
+	for _, item := range c.dataCatalogItems {
+		result = append(result, &pb.DataCatalogItem{
+			Id:      item.Id,
+			Name:    item.Name,
+			Type:    item.Type,
+			Exposed: item.Exposed,
+		})
+	}
+	return result
+}
+
+// GetDataCatalogItems 获取连接器的结构化数据目录
+func (c *Connector) GetDataCatalogItems() []*DataCatalogItem {
+	return c.dataCatalogItems
+}
+
+// SetDataCatalogItems 设置连接器的结构化数据目录
+func (c *Connector) SetDataCatalogItems(items []*DataCatalogItem) {
+	c.dataCatalogItems = items
+	// 同步更新旧版 DataCatalog（字符串列表）- 用于兼容旧版显示
+	c.syncDataCatalog()
+}
+
+// LoadDataCatalogFromFile 从 JSON 文件加载结构化数据目录
+func (c *Connector) LoadDataCatalogFromFile(filePath string) error {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read data catalog file: %w", err)
+	}
+
+	var catalogFile struct {
+		DataItems []struct {
+			Id      string `json:"id"`
+			Name    string `json:"name"`
+			Type    string `json:"type"`
+			Exposed bool   `json:"exposed"`
+		} `json:"data_items"`
+	}
+
+	if err := json.Unmarshal(data, &catalogFile); err != nil {
+		return fmt.Errorf("failed to parse data catalog file: %w", err)
+	}
+
+	c.dataCatalogItems = make([]*DataCatalogItem, 0, len(catalogFile.DataItems))
+	for _, item := range catalogFile.DataItems {
+		c.dataCatalogItems = append(c.dataCatalogItems, &DataCatalogItem{
+			Id:      item.Id,
+			Name:    item.Name,
+			Type:    item.Type,
+			Exposed: item.Exposed,
+		})
+	}
+
+	// 同步更新旧版 DataCatalog（字符串列表）
+	c.syncDataCatalog()
+
+	return nil
 }

@@ -36,7 +36,8 @@ message HandshakeRequest {
   string public_key = 3;        // 用于应用层加密的公钥
   int64 timestamp = 4;
   optional bool exposed = 5;    // 是否向其他内核公开自己的信息，默认为true（不设置时为true）
-  repeated string data_catalog = 6; // 数据类型/分类目录（如: ["传感器数据", "日志数据"]）
+  repeated string data_catalog = 6; // 数据类型/分类目录（如: ["传感器数据", "日志数据"]）（旧版，兼容）
+  repeated DataCatalogItem data_catalog_items = 7; // 结构化数据目录（新版，支持 exposed 字段）
 }
 
 message HandshakeResponse {
@@ -69,6 +70,14 @@ message DiscoverResponse {
   int32 total_count = 2;
 }
 
+// 数据目录项结构
+message DataCatalogItem {
+  string id = 1;    // 数据项唯一标识
+  string name = 2;  // 数据项名称
+  string type = 3;  // 数据类型
+  bool exposed = 4; // 是否向外部内核展示，默认为 true
+}
+
 message ConnectorInfo {
   string connector_id = 1;
   string entity_type = 2;
@@ -77,8 +86,9 @@ message ConnectorInfo {
   int64 last_heartbeat = 5; // Unix时间戳
   int64 registered_at = 6;  // Unix时间戳
   string kernel_id = 7;     // 所属内核ID（为空表示本内核）
-  repeated string data_catalog = 8; // 数据类型/分类目录（如: ["传感器数据", "日志数据"]）
+  repeated string data_catalog = 8; // 数据类型/分类目录（旧版，兼容）
   bool exposed = 9;          // 是否向其他内核公开自己的信息
+  repeated DataCatalogItem data_catalog_items = 10; // 结构化数据目录（新版）
 }
 
 message GetConnectorInfoRequest {

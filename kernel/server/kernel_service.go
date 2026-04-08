@@ -1029,6 +1029,9 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 	//     signature     = 当前 kernel 对传入签名的 RSA 签名
 	//   数据包链（仅 kernel-2/3）：RecordDataHash
 	// ================================================================
+	log.Printf("[DEBUG ForwardData] business_chain check: flowID='%s', isEndPacket=%v, businessChainManager=%v, currentKernelID=%s, req.SourceKernelId=%s",
+		flowID, isEndPacket, s.businessChainManager != nil, currentKernelID, req.SourceKernelId)
+
 	if flowID != "" && !isEndPacket && s.businessChainManager != nil {
 		if isAckPacket {
 			// ---- 所有 kernel（kernel-3/2/1）：记录 ACK 签名链 ----
@@ -1046,6 +1049,8 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 				}
 			// dataPacket.Signature 已在 PushData 之前更新为 currentKernelAckSig
 		} else if currentKernelID != req.SourceKernelId {
+			log.Printf("[DEBUG ForwardData] Will record data hash: currentKernelID=%s != req.SourceKernelId=%s",
+				currentKernelID, req.SourceKernelId)
 			// ---- kernel-2/3：业务数据包写入业务哈希链 ----
 			// data_hash 直接使用 packetDataHashFromProto（来自 connector，不重新计算）
 			// 数据库链的 prev_hash（上一跳 kernel 在 DB 中记录的 data_hash）
@@ -1057,6 +1062,8 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 			// prevSignature = 上一跳 kernel 的签名（原始请求中的 Signature）
 			prevSignature := req.DataPacket.GetSignature()
 			// 使用预先计算好的签名 currentKernelDataSig
+			log.Printf("[DEBUG ForwardData] RecordDataHash: channel=%s, computedDataHash=%s, prevHash='%s', prevSignature='%s', currentKernelDataSig='%s'",
+				req.ChannelId, computedDataHash, prevHash, prevSignature, currentKernelDataSig)
 			if err := s.businessChainManager.RecordDataHash(
 				"", req.ChannelId, computedDataHash, prevHash,
 				prevSignature, currentKernelDataSig,
@@ -1067,8 +1074,14 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 					req.ChannelId, computedDataHash, prevSignature)
 			}
 			// dataPacket.Signature 和 dataPacket.DataHash 已在 PushData 之前更新
+		} else {
+			log.Printf("[DEBUG ForwardData] Skipping data hash record: currentKernelID=%s == req.SourceKernelId=%s",
+				currentKernelID, req.SourceKernelId)
 		}
 		// kernel-1 侧的业务数据包不写入 business_data_chain（由 connector-A 写入）
+	} else {
+		log.Printf("[DEBUG ForwardData] Skipping business chain record: flowID='%s', isEndPacket=%v, businessChainManager=%v",
+			flowID, isEndPacket, s.businessChainManager != nil)
 	}
 
 	// ----------------------------------------
@@ -1215,7 +1228,17 @@ func (s *KernelServiceServer) SyncConnectorInfo(ctx context.Context, req *pb.Syn
 
 		// 尝试注册（如果已存在则会更新信息）
 		// exposed: 远端连接器是否向其他内核公开；dataCatalog: 远端连接器的数据目录
-		if err := s.registry.Register(connectorInfo.ConnectorId, connectorInfo.EntityType, connectorInfo.PublicKey, "", connectorInfo.Exposed, connectorInfo.DataCatalog); err != nil {
+		// 转换远端数据目录项
+		var dataCatalogItems []*control.DataCatalogItem
+		for _, item := range connectorInfo.DataCatalogItems {
+			dataCatalogItems = append(dataCatalogItems, &control.DataCatalogItem{
+				Id:      item.Id,
+				Name:    item.Name,
+				Type:    item.Type,
+				Exposed: item.Exposed,
+			})
+		}
+		if err := s.registry.Register(connectorInfo.ConnectorId, connectorInfo.EntityType, connectorInfo.PublicKey, "", connectorInfo.Exposed, connectorInfo.DataCatalog, dataCatalogItems); err != nil {
 			log.Printf("[WARN] Failed to register connector %s from kernel %s: %v", connectorInfo.ConnectorId, req.SourceKernelId, err)
 			continue
 		}

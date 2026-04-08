@@ -1675,22 +1675,28 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		currentKernelID := c.manager.kernelID
 
 		for rk, connectorIDs := range remoteTargetsByKernel {
+			log.Printf("[DEBUG PushData] remoteTargetsByKernel: rk=%s, connectorIDs=%v, currentKernelID=%s", rk, connectorIDs, currentKernelID)
+
 			// 确定实际转发的目标内核（多跳路由或直接转发）
 			actualTargetKernel := rk
 
 			// 如果目标是当前内核，只做本地处理，不转发
 			if actualTargetKernel == currentKernelID {
+				log.Printf("[DEBUG PushData] Skipping forward to self: %s == %s", actualTargetKernel, currentKernelID)
 				continue
 			}
 
 			// 检查是否配置了多跳路由
-		if c.manager.GetNextHopKernel != nil {
-			nextKernel, _, _, hopIndex, totalHops, found := c.manager.GetNextHopKernel(currentKernelID, rk)
-			if found && nextKernel != "" {
-				// 使用多跳路由，只转发到下一跳
-				actualTargetKernel = nextKernel
-				log.Printf("[INFO] Multi-hop: forwarding to next hop %s (hop %d/%d) instead of final target %s",
-					nextKernel, hopIndex, totalHops, rk)
+			if c.manager.GetNextHopKernel != nil {
+				nextKernel, nextAddr, nextPort, hopIndex, totalHops, found := c.manager.GetNextHopKernel(currentKernelID, rk)
+				log.Printf("[DEBUG PushData] GetNextHop(current=%s, target=%s) -> found=%v, next=%s, addr=%s, port=%d, hop=%d/%d",
+					currentKernelID, rk, found, nextKernel, nextAddr, nextPort, hopIndex, totalHops)
+
+				if found && nextKernel != "" {
+					// 使用多跳路由，只转发到下一跳
+					actualTargetKernel = nextKernel
+					log.Printf("[INFO] Multi-hop: forwarding to next hop %s (hop %d/%d) instead of final target %s",
+						nextKernel, hopIndex, totalHops, rk)
 
 					// 如果是最后一跳，设置 IsFinal=true（通知下一跳这是最后一跳数据）
 					// 注意：只有当 actualTargetKernel 就是最终目标 rk 时才设置 IsFinal

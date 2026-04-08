@@ -54,7 +54,7 @@ func (s *IdentityServiceServer) Handshake(ctx context.Context, req *pb.Handshake
 			"",
 			"",
 		)
-		
+
 		return &pb.HandshakeResponse{
 			Success: false,
 			Message: fmt.Sprintf("authentication failed: %v", err),
@@ -69,7 +69,7 @@ func (s *IdentityServiceServer) Handshake(ctx context.Context, req *pb.Handshake
 			"",
 			"",
 		)
-		
+
 		return &pb.HandshakeResponse{
 			Success: false,
 			Message: fmt.Sprintf("connector ID mismatch: %v", err),
@@ -86,8 +86,22 @@ func (s *IdentityServiceServer) Handshake(ctx context.Context, req *pb.Handshake
 		exposed = *req.Exposed
 	}
 
+	// 转换结构化数据目录（proto -> internal）
+	var dataCatalogItems []*control.DataCatalogItem
+	if len(req.DataCatalogItems) > 0 {
+		dataCatalogItems = make([]*control.DataCatalogItem, 0, len(req.DataCatalogItems))
+		for _, item := range req.DataCatalogItems {
+			dataCatalogItems = append(dataCatalogItems, &control.DataCatalogItem{
+				Id:      item.Id,
+				Name:    item.Name,
+				Type:    item.Type,
+				Exposed: item.Exposed,
+			})
+		}
+	}
+
 	// 注册连接器（传递公开状态和数据目录）
-	if err := s.registry.Register(req.ConnectorId, req.EntityType, req.PublicKey, sessionToken, exposed, req.DataCatalog); err != nil {
+	if err := s.registry.Register(req.ConnectorId, req.EntityType, req.PublicKey, sessionToken, exposed, req.DataCatalog, dataCatalogItems); err != nil {
 		return &pb.HandshakeResponse{
 			Success: false,
 			Message: fmt.Sprintf("registration failed: %v", err),
@@ -223,29 +237,30 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 			// 先添加本地所有连接器（无论是否公开）
 			localConnectors := s.registry.ListConnectors()
 			allConnectors := make([]*pb.ConnectorInfo, 0)
-			
+
 			// 添加本地连接器（全部添加，无论是否公开）
 			for _, conn := range localConnectors {
 				// 过滤掉请求者自身
 				if conn.ConnectorID == req.RequesterId {
 					continue
 				}
-			// 类型过滤
-			if req.FilterType == "" || conn.EntityType == req.FilterType {
-				allConnectors = append(allConnectors, &pb.ConnectorInfo{
-					ConnectorId:   conn.ConnectorID,
-					EntityType:    conn.EntityType,
-					PublicKey:     conn.PublicKey,
-					Status:        string(conn.Status),
-					LastHeartbeat: conn.LastHeartbeat.Unix(),
-					RegisteredAt:  conn.RegisteredAt.Unix(),
-					KernelId:      s.multiKernelManager.config.KernelID,
-					DataCatalog:   conn.DataCatalog,
-					Exposed:      conn.Exposed,
-				})
+				// 类型过滤
+				if req.FilterType == "" || conn.EntityType == req.FilterType {
+					allConnectors = append(allConnectors, &pb.ConnectorInfo{
+						ConnectorId:   conn.ConnectorID,
+						EntityType:    conn.EntityType,
+						PublicKey:     conn.PublicKey,
+						Status:        string(conn.Status),
+						LastHeartbeat: conn.LastHeartbeat.Unix(),
+						RegisteredAt:  conn.RegisteredAt.Unix(),
+						KernelId:      s.multiKernelManager.config.KernelID,
+						DataCatalog:   conn.DataCatalog,
+						Exposed:      conn.Exposed,
+						DataCatalogItems: convertToPBDataCatalogItems(conn.DataCatalogItems),
+					})
 				}
 			}
-			
+
 			// 再添加远端连接器（只添加公开的）
 			remoteConnectors, err := s.multiKernelManager.CollectAllConnectors()
 			if err != nil {
@@ -280,6 +295,18 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 		allConnectors := s.registry.ListExposedConnectors() // 只返回公开的连接器
 		pbConnectors := make([]*pb.ConnectorInfo, 0, len(allConnectors))
 		for _, info := range allConnectors {
+			// 过滤数据目录，只返回 exposed=true 的数据项
+			exposedItems := make([]*pb.DataCatalogItem, 0)
+			for _, item := range info.DataCatalogItems {
+				if item.Exposed {
+					exposedItems = append(exposedItems, &pb.DataCatalogItem{
+						Id:      item.Id,
+						Name:    item.Name,
+						Type:    item.Type,
+						Exposed: item.Exposed,
+					})
+				}
+			}
 			pbConnectors = append(pbConnectors, &pb.ConnectorInfo{
 				ConnectorId:   info.ConnectorID,
 				EntityType:    info.EntityType,
@@ -290,6 +317,7 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 				KernelId:      s.multiKernelManager.config.KernelID,
 				DataCatalog:   info.DataCatalog,
 				Exposed:      info.Exposed,
+				DataCatalogItems: exposedItems,
 			})
 		}
 		// 可选类型过滤
@@ -333,6 +361,7 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 			RegisteredAt:  info.RegisteredAt.Unix(),
 			DataCatalog:   info.DataCatalog,
 			Exposed:      info.Exposed,
+			DataCatalogItems: convertToPBDataCatalogItems(info.DataCatalogItems),
 		})
 	}
 
@@ -340,6 +369,23 @@ func (s *IdentityServiceServer) DiscoverConnectors(ctx context.Context, req *pb.
 		Connectors: pbConnectors,
 		TotalCount: int32(len(pbConnectors)),
 	}, nil
+}
+
+// convertToPBDataCatalogItems 将内部 DataCatalogItem 列表转换为 protobuf 格式
+func convertToPBDataCatalogItems(items []*control.DataCatalogItem) []*pb.DataCatalogItem {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]*pb.DataCatalogItem, 0, len(items))
+	for _, item := range items {
+		result = append(result, &pb.DataCatalogItem{
+			Id:      item.Id,
+			Name:    item.Name,
+			Type:    item.Type,
+			Exposed: item.Exposed,
+		})
+	}
+	return result
 }
 
 // GetConnectorInfo 获取连接器详细信息（支持跨内核查询）
@@ -407,6 +453,32 @@ func (s *IdentityServiceServer) GetConnectorInfo(ctx context.Context, req *pb.Ge
 		}
 	}
 
+	// 构建响应数据
+	// 如果是跨内核请求，过滤数据目录只返回 exposed=true 的项
+	// 如果是本地请求，返回所有数据项
+	var dataCatalogItems []*pb.DataCatalogItem
+	var dataCatalog []string
+	if isKernelRequest {
+		// 跨内核请求：只返回暴露的数据项
+		dataCatalogItems = make([]*pb.DataCatalogItem, 0)
+		dataCatalog = make([]string, 0)
+		for _, item := range info.DataCatalogItems {
+			if item.Exposed {
+				dataCatalogItems = append(dataCatalogItems, &pb.DataCatalogItem{
+					Id:      item.Id,
+					Name:    item.Name,
+					Type:    item.Type,
+					Exposed: item.Exposed,
+				})
+				dataCatalog = append(dataCatalog, item.Name)
+			}
+		}
+	} else {
+		// 本地请求：返回所有数据项
+		dataCatalogItems = convertToPBDataCatalogItems(info.DataCatalogItems)
+		dataCatalog = info.DataCatalog
+	}
+
 	return &pb.GetConnectorInfoResponse{
 		Found: true,
 		Connector: &pb.ConnectorInfo{
@@ -417,8 +489,9 @@ func (s *IdentityServiceServer) GetConnectorInfo(ctx context.Context, req *pb.Ge
 			LastHeartbeat: info.LastHeartbeat.Unix(),
 			RegisteredAt:  info.RegisteredAt.Unix(),
 			KernelId:      s.multiKernelManager.config.KernelID,
-			DataCatalog:   info.DataCatalog,
+			DataCatalog:   dataCatalog, // 跨内核请求时只包含 exposed=true 的项
 			Exposed:       info.Exposed,
+			DataCatalogItems: dataCatalogItems,
 		},
 		Message: "connector found",
 	}, nil

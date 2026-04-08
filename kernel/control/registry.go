@@ -30,7 +30,16 @@ type ConnectorInfo struct {
 	RegisteredAt  time.Time
 	SessionToken  string
 	Exposed       bool     // 是否向其他内核公开自己的信息，true=公开，false=不公开
-	DataCatalog   []string // 数据类型/分类目录（如: ["传感器数据", "日志数据"]）
+	DataCatalog   []string // 数据类型/分类目录（旧版，字符串列表）
+	DataCatalogItems []*DataCatalogItem // 结构化数据目录（新版，支持 exposed 字段）
+}
+
+// DataCatalogItem 数据目录项
+type DataCatalogItem struct {
+	Id      string // 数据项唯一标识
+	Name    string // 数据项名称
+	Type    string // 数据类型
+	Exposed bool   // 是否向外部内核展示，默认为 true
 }
 
 // Registry 身份注册表，维护连接器信息
@@ -48,8 +57,9 @@ func NewRegistry() *Registry {
 
 // Register 注册连接器
 // exposed: 是否向其他内核公开该连接器信息，默认为 true
-// dataCatalog: 数据类型/分类目录列表
-func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken string, exposed bool, dataCatalog []string) error {
+// dataCatalog: 数据类型/分类目录列表（旧版）
+// dataCatalogItems: 结构化数据目录列表（新版）
+func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken string, exposed bool, dataCatalog []string, dataCatalogItems []*DataCatalogItem) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -75,6 +85,7 @@ func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken str
 		// 更新公开状态和数据目录
 		info.Exposed = exposed
 		info.DataCatalog = dataCatalog
+		info.DataCatalogItems = dataCatalogItems
 		return nil
 	}
 
@@ -89,6 +100,7 @@ func (r *Registry) Register(connectorID, entityType, publicKey, sessionToken str
 		SessionToken:  sessionToken,
 		Exposed:       exposed,
 		DataCatalog:   dataCatalog,
+		DataCatalogItems: dataCatalogItems,
 	}
 
 	return nil
@@ -247,6 +259,44 @@ func (r *Registry) ListExposedConnectors() []*ConnectorInfo {
 	}
 
 	return list
+}
+
+// GetExposedDataCatalogItems 获取连接器的已暴露数据目录项
+// 仅返回 exposed=true 的数据项，用于对外公开
+func (r *Registry) GetExposedDataCatalogItems(connectorID string) []*DataCatalogItem {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	info, exists := r.connectors[connectorID]
+	if !exists {
+		return nil
+	}
+
+	if info.DataCatalogItems == nil {
+		return nil
+	}
+
+	result := make([]*DataCatalogItem, 0)
+	for _, item := range info.DataCatalogItems {
+		if item.Exposed {
+			result = append(result, item)
+		}
+	}
+
+	return result
+}
+
+// GetAllDataCatalogItems 获取连接器的所有数据目录项（包括未暴露的）
+func (r *Registry) GetAllDataCatalogItems(connectorID string) []*DataCatalogItem {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	info, exists := r.connectors[connectorID]
+	if !exists {
+		return nil
+	}
+
+	return info.DataCatalogItems
 }
 
 // StartHealthCheck 启动健康检查协程

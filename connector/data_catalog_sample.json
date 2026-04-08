@@ -1,0 +1,22 @@
+{
+  "data_items": [
+    {
+      "Id": "sensor-temp-001",
+      "Name": "温度传感器数据",
+      "Type": "sensor",
+      "Exposed": true
+    },
+    {
+      "Id": "sensor-humidity-001",
+      "Name": "湿度传感器数据",
+      "Type": "sensor",
+      "Exposed": true
+    },
+    {
+      "Id": "log-app-001",
+      "Name": "应用日志（敏感）",
+      "Type": "log",
+      "Exposed": true
+    }
+  ]
+}

@@ -1335,6 +1335,18 @@ func (m *MultiKernelManager) CollectAllConnectors() ([]*pb.ConnectorInfo, error)
 	// 添加本地连接器（只添加公开的）
 	localConnectors := m.registry.ListExposedConnectors()
 	for _, conn := range localConnectors {
+		// 过滤数据目录，只返回 exposed=true 的数据项
+		exposedItems := make([]*pb.DataCatalogItem, 0)
+		for _, item := range conn.DataCatalogItems {
+			if item.Exposed {
+				exposedItems = append(exposedItems, &pb.DataCatalogItem{
+					Id:      item.Id,
+					Name:    item.Name,
+					Type:    item.Type,
+					Exposed: item.Exposed,
+				})
+			}
+		}
 		allConnectors = append(allConnectors, &pb.ConnectorInfo{
 			ConnectorId:   conn.ConnectorID,
 			EntityType:    conn.EntityType,
@@ -1343,6 +1355,9 @@ func (m *MultiKernelManager) CollectAllConnectors() ([]*pb.ConnectorInfo, error)
 			LastHeartbeat: conn.LastHeartbeat.Unix(),
 			RegisteredAt:  conn.RegisteredAt.Unix(),
 			KernelId:      m.config.KernelID, // 本地连接器标记为本内核
+			DataCatalog:   conn.DataCatalog,
+			Exposed:       conn.Exposed,
+			DataCatalogItems: exposedItems,
 		})
 	}
 
@@ -1398,12 +1413,28 @@ func (m *MultiKernelManager) SyncConnectorInfo(targetKernelID string) error {
 
 	req := &pb.SyncConnectorInfoRequest{
 		SourceKernelId: m.config.KernelID,
-		Connectors:     make([]*pb.ConnectorInfo, len(connectors)),
+		Connectors:     make([]*pb.ConnectorInfo, 0, len(connectors)),
 		SyncType:       "incremental",
 	}
 
-	for i, conn := range connectors {
-		req.Connectors[i] = &pb.ConnectorInfo{
+	for _, conn := range connectors {
+		// 只同步公开的连接器
+		if !conn.Exposed {
+			continue
+		}
+		// 过滤数据目录，只同步 exposed=true 的数据项
+		exposedItems := make([]*pb.DataCatalogItem, 0)
+		for _, item := range conn.DataCatalogItems {
+			if item.Exposed {
+				exposedItems = append(exposedItems, &pb.DataCatalogItem{
+					Id:      item.Id,
+					Name:    item.Name,
+					Type:    item.Type,
+					Exposed: item.Exposed,
+				})
+			}
+		}
+		req.Connectors = append(req.Connectors, &pb.ConnectorInfo{
 			ConnectorId:   conn.ConnectorID,
 			EntityType:    conn.EntityType,
 			PublicKey:     conn.PublicKey,
@@ -1411,7 +1442,10 @@ func (m *MultiKernelManager) SyncConnectorInfo(targetKernelID string) error {
 			LastHeartbeat: conn.LastHeartbeat.Unix(),
 			RegisteredAt:  conn.RegisteredAt.Unix(),
 			KernelId:      m.config.KernelID,
-		}
+			DataCatalog:   conn.DataCatalog,
+			Exposed:       conn.Exposed,
+			DataCatalogItems: exposedItems,
+		})
 	}
 
 	if targetKernelID != "" {
@@ -1912,6 +1946,7 @@ func (m *MultiKernelManager) Shutdown() {
 // ConnectMultiHopRoute 根据多跳链路配置建立连接
 // 该方法会按照配置中的每一跳依次建立连接
 // 如果遇到待审批的 hop，会自动注册并等待审批通知，无需手动重试
+// 注意：creator 连接到 hop.FromKernel（远端发起方），使用 hop.FromAddress 作为目标地址
 func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) error {
 	if config == nil {
 		return fmt.Errorf("config cannot be nil")
@@ -1942,23 +1977,34 @@ func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) er
 	pendingHopCount := 0
 
 	// 依次建立每一跳的连接
+	// creator 连接到 hop.FromKernel（远端发起方），使用 hop.FromAddress 作为目标地址
 	for i, hop := range config.Hops {
 		hopNum := i + 1
-		log.Printf("--- Hop %d: %s -> %s (%s:%d) ---",
-			hopNum, hop.FromKernel, hop.ToKernel, hop.ToAddress, hop.ToPort)
+		log.Printf("--- Hop %d: %s -> %s (creator will connect to %s at %s:%d) ---",
+			hopNum, hop.FromKernel, hop.ToKernel, hop.FromKernel, hop.FromAddress, hop.ToPort)
 
-		// 检查是否需要连接（仅当未连接时）
-		m.kernelsMu.RLock()
-		existingKernel, alreadyConnected := m.kernels[hop.ToKernel]
-		m.kernelsMu.RUnlock()
-
-		if alreadyConnected && existingKernel.conn != nil && existingKernel.Client != nil {
+		// 跳过自身：hop.FromKernel 是当前内核本身，不需要建立连接
+		if hop.FromKernel == m.config.KernelID {
+			log.Printf("  [SKIP] Skipping hop %d: from_kernel %s is the current kernel",
+				hopNum, hop.FromKernel)
 			continue
 		}
 
-		// 尝试连接到目标内核
+		// 检查是否需要连接（仅当未连接时）
+		// 注意：检查的是 from_kernel（远端发起方）是否已连接
+		m.kernelsMu.RLock()
+		existingKernel, alreadyConnected := m.kernels[hop.FromKernel]
+		m.kernelsMu.RUnlock()
+
+		if alreadyConnected && existingKernel.conn != nil && existingKernel.Client != nil {
+			log.Printf("  [SKIP] %s already connected", hop.FromKernel)
+			continue
+		}
+
+		// 尝试连接到 hop.FromKernel（远端发起方）
+		// 使用 hop.FromAddress 和 hop.ToPort 作为目标地址
 		// 注意：这里使用 interconnectRequest=true，因为需要对方审批才能建立连接
-		if err := m.connectToKernelInternal(hop.ToKernel, hop.ToAddress, hop.ToPort, true); err != nil {
+		if err := m.connectToKernelInternal(hop.FromKernel, hop.FromAddress, hop.ToPort, true); err != nil {
 			// 检查是否是"已连接"错误
 			if strings.Contains(err.Error(), "already connected") {
 				continue
@@ -1969,12 +2015,13 @@ func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) er
 				requestID := strings.TrimPrefix(err.Error(), "interconnect_pending:")
 
 				// 注册待审批的 hop 到会话中，以便收到批准通知后自动重连
+				// 注意：连接目标是 from_kernel（远端发起方）
 				hopInfo := &PendingHopInfo{
 					RouteName:  config.RouteName,
 					HopIndex:   hopNum,
 					HopTotal:   len(config.Hops),
-					ToKernelID: hop.ToKernel,
-					ToAddress:  hop.ToAddress,
+					ToKernelID: hop.FromKernel, // 连接目标是 from_kernel
+					ToAddress:  hop.FromAddress,
 					ToPort:     hop.ToPort,
 					RequestID:  requestID,
 					Approved:   false,
@@ -1984,8 +2031,8 @@ func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) er
 				continue
 			}
 
-			log.Printf("  [ERROR] Failed to connect to %s: %v", hop.ToKernel, err)
-			return fmt.Errorf("hop %d: failed to connect to %s: %w", hopNum, hop.ToKernel, err)
+			log.Printf("  [ERROR] Failed to connect to %s: %v", hop.FromKernel, err)
+			return fmt.Errorf("hop %d: failed to connect to %s: %w", hopNum, hop.FromKernel, err)
 		}
 
 	}
@@ -2068,9 +2115,9 @@ func (m *MultiKernelManager) GetMultiHopRouteInfo(config *MultiHopConfigFile) st
 	info += "Path:\n"
 
 	for i, hop := range config.Hops {
-		// 检查连接状态
+		// 检查连接状态（creator 连接到 from_kernel）
 		m.kernelsMu.RLock()
-		kernelInfo, connected := m.kernels[hop.ToKernel]
+		kernelInfo, connected := m.kernels[hop.FromKernel]
 		m.kernelsMu.RUnlock()
 
 		status := "[ERROR] Not connected"
@@ -2078,14 +2125,18 @@ func (m *MultiKernelManager) GetMultiHopRouteInfo(config *MultiHopConfigFile) st
 			status = "[OK] Connected"
 		}
 
-		info += fmt.Sprintf("  %d. %s -> %s [%s:%d] [%s]\n",
-			i+1, hop.FromKernel, hop.ToKernel, hop.ToAddress, hop.ToPort, status)
+		info += fmt.Sprintf("  %d. %s(%s:%d) -> %s [%s]\n",
+			i+1, hop.FromKernel, hop.FromAddress, hop.ToPort, hop.ToKernel, status)
 	}
 
 	return info
 }
 
-// ValidateMultiHopConfig 验证多跳配置是否适用于当前内核
+// ValidateMultiHopConfig 验证多跳配置是否有效
+// 检查项：
+// 1. 至少有一跳
+// 2. 跳之间是连续的（每一跳的 to_kernel 必须是下一跳的 from_kernel）
+// 3. 端口有效
 func (m *MultiKernelManager) ValidateMultiHopConfig(config *MultiHopConfigFile) error {
 	if config == nil {
 		return fmt.Errorf("config cannot be nil")
@@ -2095,21 +2146,27 @@ func (m *MultiKernelManager) ValidateMultiHopConfig(config *MultiHopConfigFile) 
 		return fmt.Errorf("no hops in configuration")
 	}
 
-	// 验证第一跳的源是否是当前内核
-	firstHop := config.Hops[0]
-	if firstHop.FromKernel != m.config.KernelID {
-		return fmt.Errorf("first hop from_kernel (%s) does not match current kernel (%s)",
-			firstHop.FromKernel, m.config.KernelID)
+	// 验证每一跳的连续性
+	for i := 0; i < len(config.Hops)-1; i++ {
+		currHop := config.Hops[i]
+		nextHop := config.Hops[i+1]
+
+		if currHop.ToKernel != nextHop.FromKernel {
+			return fmt.Errorf("hop %d: to_kernel (%s) does not match hop %d's from_kernel (%s)",
+				i+1, currHop.ToKernel, i+2, nextHop.FromKernel)
+		}
 	}
 
-	// 验证每一跳的连续性
-	for i := 1; i < len(config.Hops); i++ {
-		prevHop := config.Hops[i-1]
-		currHop := config.Hops[i]
-
-		if prevHop.ToKernel != currHop.FromKernel {
-			return fmt.Errorf("hop %d: from_kernel (%s) does not match previous hop's to_kernel (%s)",
-				i+1, currHop.FromKernel, prevHop.ToKernel)
+	// 验证端口和地址（包括 from_address）
+	for i, hop := range config.Hops {
+		if hop.ToPort <= 0 || hop.ToPort > 65535 {
+			return fmt.Errorf("hop %d: invalid port %d", i+1, hop.ToPort)
+		}
+		if hop.ToAddress == "" {
+			return fmt.Errorf("hop %d: to_address cannot be empty", i+1)
+		}
+		if hop.FromAddress == "" {
+			return fmt.Errorf("hop %d: from_address cannot be empty", i+1)
 		}
 	}
 

@@ -142,6 +142,8 @@ func main() {
 		}(),
 		Exposed: exposed,
 		DataCatalog: config.Connector.DataCatalog,
+		DataCatalogItems: convertToClientDataCatalogItems(loadDataCatalogItems(config)),
+		DataCatalogFile: config.Connector.DataCatalogFile, // 数据目录文件路径
 		// 数据库配置
 		DatabaseEnabled:  config.Database.Enabled,
 		DatabaseHost:     config.Database.Host,
@@ -154,6 +156,16 @@ func main() {
 		log.Fatalf("Failed to create connector: %v", err)
 	}
 	defer connector.Close()
+
+	// 如果配置了数据目录文件，加载并同步
+	if config.Connector.DataCatalogFile != "" && len(config.Connector.DataCatalog) == 0 {
+		// 只有在未配置内联 DataCatalog 时，才从文件加载
+		// 注意：loadDataCatalogItems 已经在 loadConfig 中处理过了
+		// 这里只是确保 DataCatalog 被同步
+		if err := connector.LoadDataCatalogFromFile(config.Connector.DataCatalogFile); err != nil {
+			log.Printf("[WARN] Failed to load data catalog from file: %v", err)
+		}
+	}
 
 	// 创建频道配置文件目录
 	channelConfigDir := config.Channel.ConfigDir
@@ -306,6 +318,10 @@ func runInteractiveShell(connector *client.Connector, config *Config) {
 			handleListPermissions(connector, args)
 		case "query-evidence", "query":
 			handleQueryEvidence(connector, args)
+		case "update-catalog":
+			handleUpdateCatalog(connector, args)
+		case "show-catalog":
+			handleShowCatalog(connector)
 		case "status":
 			handleStatus(connector, args)
 		case "exit", "quit", "q":
@@ -356,6 +372,11 @@ func printHelp(defaultConfigDir string) {
     fmt.Println("    示例: query-evidence --channel channel-123 --limit 10")
     fmt.Println("    示例: query-evidence --connector connector-A")
     fmt.Println("    示例: query-evidence --flow flow-uuid-123")
+	fmt.Println("  update-catalog <data_id> <true|false> - 更新数据项的暴露状态")
+    fmt.Println("    修改指定数据项的 exposed 字段，并重新上报到内核")
+    fmt.Println("    示例: update-catalog sensor-temp-001 false")
+    fmt.Println("  show-catalog - 显示当前连接器的数据目录")
+    fmt.Println("    显示所有数据项，包括未暴露的项")
 	fmt.Println("  status [active|inactive|closed] - 查看或设置连接器状态")
 	fmt.Println("  help, h               - 显示此帮助信息")
 	fmt.Println("  exit, quit, q         - 退出连接器")
@@ -1191,6 +1212,98 @@ func handleStatus(connector *client.Connector, args []string) {
 	}
 }
 
+// handleUpdateCatalog 处理更新数据目录命令
+func handleUpdateCatalog(connector *client.Connector, args []string) {
+	if len(args) != 2 {
+		fmt.Println("[FAILED] 参数错误: update-catalog <data_id> <true|false>")
+		fmt.Println("  修改指定数据项的 exposed 字段，并重新上报到内核")
+		fmt.Println("  示例: update-catalog sensor-temp-001 false")
+		return
+	}
+
+	dataID := args[0]
+	exposedStr := strings.ToLower(args[1])
+
+	var exposed bool
+	if exposedStr == "true" {
+		exposed = true
+	} else if exposedStr == "false" {
+		exposed = false
+	} else {
+		fmt.Printf("[FAILED] 无效的暴露状态: %s (必须是 true 或 false)\n", args[1])
+		return
+	}
+
+	// 获取当前数据目录
+	items := connector.GetDataCatalogItems()
+	if len(items) == 0 {
+		fmt.Println("[FAILED] 当前连接器没有配置结构化数据目录")
+		fmt.Println("  请先在配置文件中通过 data_catalog_file 指定 JSON 文件路径")
+		return
+	}
+
+	// 查找并更新指定的数据项
+	found := false
+	for _, item := range items {
+		if item.Id == dataID {
+			item.Exposed = exposed
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		fmt.Printf("[FAILED] 未找到数据项: %s\n", dataID)
+		fmt.Println("  当前数据目录中的数据项ID:")
+		for _, item := range items {
+			fmt.Printf("    - %s (%s)\n", item.Id, item.Name)
+		}
+		return
+	}
+
+	// 更新本地数据目录
+	connector.SetDataCatalogItems(items)
+
+	// 重新连接到内核以更新数据目录
+	// 注意：这里需要重新调用 Connect 来更新数据目录
+	fmt.Println("[INFO] 正在重新上报数据目录到内核...")
+	if err := connector.ReconnectWithCatalog(); err != nil {
+		fmt.Printf("[FAILED] 重新上报数据目录失败: %v\n", err)
+		return
+	}
+
+	exposedText := "暴露"
+	if !exposed {
+		exposedText = "隐藏"
+	}
+	fmt.Printf("[OK] 数据项 %s 已设置为 %s\n", dataID, exposedText)
+}
+
+// handleShowCatalog 处理显示数据目录命令
+func handleShowCatalog(connector *client.Connector) {
+	items := connector.GetDataCatalogItems()
+
+	if len(items) == 0 {
+		fmt.Println("当前连接器没有配置结构化数据目录")
+		fmt.Println("  请先在配置文件中通过 data_catalog_file 指定 JSON 文件路径")
+		return
+	}
+
+	fmt.Printf("当前数据目录 (共 %d 项):\n", len(items))
+	fmt.Println(strings.Repeat("-", 70))
+	fmt.Printf("%-25s %-20s %-10s %-10s\n", "数据ID", "名称", "类型", "已暴露")
+	fmt.Println(strings.Repeat("-", 70))
+
+	for _, item := range items {
+		exposedText := "是"
+		if !item.Exposed {
+			exposedText = "否"
+		}
+		fmt.Printf("%-25s %-20s %-10s %-10s\n", item.Id, item.Name, item.Type, exposedText)
+	}
+	fmt.Println(strings.Repeat("-", 70))
+}
+
 // truncateString 截断字符串
 func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
@@ -1588,9 +1701,22 @@ func loadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
+// DataCatalogItem 结构化数据目录项
+type DataCatalogItem struct {
+	Id      string `json:"id"`
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Exposed bool   `json:"exposed"`
+}
+
+// DataCatalogFile JSON格式的数据目录文件结构
+type DataCatalogFile struct {
+	DataItems []DataCatalogItem `json:"data_items"`
+}
+
 // loadDataCatalog 加载数据目录
 // 优先使用内联列表，否则尝试从文件加载
-// 支持 JSON 数组格式和纯文本格式（每行一个数据项）
+// 支持 JSON 数组格式、新的结构化 JSON 格式和纯文本格式（每行一个数据项）
 func loadDataCatalog(config *Config) []string {
 	// 优先使用内联列表
 	if len(config.Connector.DataCatalog) > 0 {
@@ -1611,7 +1737,21 @@ func loadDataCatalog(config *Config) []string {
 
 	trimmed := strings.TrimSpace(string(data))
 
-	// 尝试 JSON 数组格式
+	// 尝试新的结构化 JSON 格式（包含 data_items 数组）
+	if strings.HasPrefix(trimmed, "{") {
+		var catalogFile DataCatalogFile
+		if err := json.Unmarshal(data, &catalogFile); err == nil && len(catalogFile.DataItems) > 0 {
+			// 这是新的结构化格式，转换为字符串列表返回（兼容旧版）
+			// 注意：新版连接器应使用 loadDataCatalogItems 函数获取完整信息
+			result := make([]string, 0, len(catalogFile.DataItems))
+			for _, item := range catalogFile.DataItems {
+				result = append(result, item.Name)
+			}
+			return result
+		}
+	}
+
+	// 尝试旧版 JSON 数组格式
 	if strings.HasPrefix(trimmed, "[") {
 		var items []string
 		if err := json.Unmarshal(data, &items); err != nil {
@@ -1631,6 +1771,67 @@ func loadDataCatalog(config *Config) []string {
 		}
 	}
 	return items
+}
+
+// loadDataCatalogItems 从配置文件加载结构化数据目录
+// 返回 DataCatalogItem 列表，如果文件不存在或解析失败返回 nil
+func loadDataCatalogItems(config *Config) []*DataCatalogItem {
+	if config.Connector.DataCatalogFile == "" {
+		return nil
+	}
+
+	filePath := config.Connector.DataCatalogFile
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Printf("[WARN] Failed to read data catalog file %s: %v", filePath, err)
+		return nil
+	}
+
+	trimmed := strings.TrimSpace(string(data))
+
+	// 只解析新的结构化 JSON 格式
+	if !strings.HasPrefix(trimmed, "{") {
+		return nil
+	}
+
+	var catalogFile DataCatalogFile
+	if err := json.Unmarshal(data, &catalogFile); err != nil {
+		log.Printf("[WARN] Failed to parse structured data catalog from %s: %v", filePath, err)
+		return nil
+	}
+
+	if len(catalogFile.DataItems) == 0 {
+		return nil
+	}
+
+	result := make([]*DataCatalogItem, 0, len(catalogFile.DataItems))
+	for _, item := range catalogFile.DataItems {
+		result = append(result, &DataCatalogItem{
+			Id:      item.Id,
+			Name:    item.Name,
+			Type:    item.Type,
+			Exposed: item.Exposed,
+		})
+	}
+
+	return result
+}
+
+// convertToClientDataCatalogItems 将 main.go 中的 DataCatalogItem 转换为 client.DataCatalogItem
+func convertToClientDataCatalogItems(items []*DataCatalogItem) []*client.DataCatalogItem {
+	if items == nil {
+		return nil
+	}
+	result := make([]*client.DataCatalogItem, 0, len(items))
+	for _, item := range items {
+		result = append(result, &client.DataCatalogItem{
+			Id:      item.Id,
+			Name:    item.Name,
+			Type:    item.Type,
+			Exposed: item.Exposed,
+		})
+	}
+	return result
 }
 
 // removeDuplicates 移除字符串切片中的重复元素，保持原有顺序

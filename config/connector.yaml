@@ -7,10 +7,8 @@ connector:
   # 是否向其他内核公开自己的信息
   # false - 不公开（默认）：其他内核不知道该连接器的存在，创建跨内核频道时需要线下协商
   # true - 公开：互联后其他内核可以通过发现机制获取该连接器信息
-  expose_to_others: false
-  data_catalog:
-    - "传感器数据"
-    - "日志数据"
+  expose_to_others: true
+  data_catalog_file: "connector/data_catalog_sample.json"
 
 kernel:
   # 内核服务器地址
@@ -40,6 +38,3 @@ database:
   password: "123456"
   database: "connector_a"  # 连接器自己的数据库名
 
-data_catalog:
-    - "传感器数据"
-    - "日志数据"

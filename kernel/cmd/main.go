@@ -1098,8 +1098,8 @@ func handleLoadRoute(configManager *server.MultiHopConfigManager, args []string)
 	fmt.Printf("  Hops: %d\n", len(config.Hops))
 
 	for i, hop := range config.Hops {
-		fmt.Printf("    Hop %d: %s -> %s (%s:%d)\n",
-			i+1, hop.FromKernel, hop.ToKernel, hop.ToAddress, hop.ToPort)
+		fmt.Printf("    Hop %d: %s(%s:%d) -> %s\n",
+			i+1, hop.FromKernel, hop.FromAddress, hop.ToPort, hop.ToKernel)
 	}
 }
 

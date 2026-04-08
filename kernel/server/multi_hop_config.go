@@ -30,6 +30,7 @@ type MultiHopConfigFile struct {
 type MultiHop struct {
 	HopID       int    `json:"hop_id"`
 	FromKernel  string `json:"from_kernel"`
+	FromAddress string `json:"from_address"` // 发起方的地址（用于 creator 发起互联请求）
 	ToKernel    string `json:"to_kernel"`
 	ToAddress   string `json:"to_address"`
 	ToPort      int    `json:"to_port"`
@@ -96,6 +97,9 @@ func (m *MultiHopConfigManager) SaveConfig(config *MultiHopConfigFile) error {
 	for i, hop := range config.Hops {
 		if hop.FromKernel == "" {
 			return fmt.Errorf("hop %d: from_kernel cannot be empty", i+1)
+		}
+		if hop.FromAddress == "" {
+			return fmt.Errorf("hop %d: from_address cannot be empty", i+1)
 		}
 		if hop.ToKernel == "" {
 			return fmt.Errorf("hop %d: to_kernel cannot be empty", i+1)
@@ -357,10 +361,10 @@ func (m *MultiHopConfigManager) GetRoutePath(routeName string) string {
 	path := ""
 	for i, hop := range config.Hops {
 		if i > 0 {
-			path += " → "
+			path += " -> "
 		}
-		path += hop.FromKernel + "(" + hop.ToAddress + ":" + fmt.Sprintf("%d", hop.ToPort) + ")"
-		path += "→" + hop.ToKernel
+		path += fmt.Sprintf("%s(%s:%d)", hop.FromKernel, hop.FromAddress, hop.ToPort)
+		path += " -> " + hop.ToKernel
 	}
 
 	return path
@@ -368,9 +372,26 @@ func (m *MultiHopConfigManager) GetRoutePath(routeName string) string {
 
 // GetNextHop 获取从指定内核到目标内核的下一跳信息
 // 返回下一跳内核ID、地址、端口，以及当前是第几跳、总共多少跳
+//
+// 路由方向：
+//   Hop 1: kernel-3 -> kernel-2 (kernel-3 是起点)
+//   Hop 2: kernel-2 -> kernel-1 (kernel-2 是起点)
+//
+// 数据流向：
+//   数据从 kernel-3（起点）流向 kernel-1（终点）
+//   kernel-3 调用 GetNextHop(kernel-3, kernel-1) -> 返回 kernel-2
+//   kernel-2 调用 GetNextHop(kernel-2, kernel-1) -> 返回 kernel-1
+//   kernel-1 调用 GetNextHop(kernel-1, kernel-1) -> 返回 not found（终点）
+//
+// 注意：GetNextHop 只用于数据转发（正向），ACK 反向路由使用 GetPreviousHop
 func (m *MultiHopConfigManager) GetNextHop(currentKernelID, targetKernelID string) (nextKernelID, nextAddress string, nextPort int, hopIndex, totalHops int, found bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
+	// 如果当前内核就是目标，直接返回（不需要转发）
+	if currentKernelID == targetKernelID {
+		return "", "", 0, 0, 0, false
+	}
 
 	// 遍历所有路由配置
 	for _, config := range m.configs {
@@ -380,19 +401,20 @@ func (m *MultiHopConfigManager) GetNextHop(currentKernelID, targetKernelID strin
 
 		totalHops = len(config.Hops)
 
-		// 查找当前内核所在的位置
+		// 查找当前内核作为起点的 hop
+		// 只有当 currentKernelID 是某个 hop 的起点时，才进行正向查找
 		for i, hop := range config.Hops {
 			if hop.FromKernel == currentKernelID {
 				// 如果当前内核就是要到达的目标内核
 				if hop.ToKernel == targetKernelID {
-					// 当前跳直接到目标，返回当前跳的 ToKernel
+					// 当前跳直接到目标
 					return hop.ToKernel, hop.ToAddress, hop.ToPort, i + 1, totalHops, true
 				}
 
 				// 检查目标是否在后续路径中
 				for j := i + 1; j < len(config.Hops); j++ {
 					if config.Hops[j].ToKernel == targetKernelID {
-						// 找到路径！返回当前跳的下一跳（即当前跳的 ToKernel）
+						// 找到路径！返回当前跳的 ToKernel（下一跳）
 						return hop.ToKernel, hop.ToAddress, hop.ToPort, i + 1, totalHops, true
 					}
 				}
@@ -400,6 +422,7 @@ func (m *MultiHopConfigManager) GetNextHop(currentKernelID, targetKernelID strin
 		}
 	}
 
+	// 未找到路径
 	return "", "", 0, 0, 0, false
 }
 
