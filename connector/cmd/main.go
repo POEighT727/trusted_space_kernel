@@ -17,6 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/trusted-space/kernel/connector/client"
+	tempchat "github.com/trusted-space/kernel/connector/tempchat"
 	pb "github.com/trusted-space/kernel/proto/kernel/v1"
 )
 
@@ -56,6 +57,14 @@ type Config struct {
 		Password string `yaml:"password"`
 		Database string `yaml:"database"`
 	} `yaml:"database"`
+
+	TempChat struct {
+		Enabled        bool   `yaml:"enabled"`      // 是否启用临时通信功能
+		ServerAddr     string `yaml:"server_addr"`  // 运维方地址
+		ListenAddr     string `yaml:"listen_addr"`  // 连接器监听地址
+		ListenPort     int    `yaml:"listen_port"`  // 连接器监听端口
+		ExposeToOthers bool   `yaml:"expose_to_others"` // 是否向其他内核暴露（默认 true）
+	} `yaml:"tempchat"`
 }
 
 func main() {
@@ -155,7 +164,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create connector: %v", err)
 	}
-	defer connector.Close()
+	// 提前声明 tempChatClient，确保 defer 语句可以引用
+	var tempChatClient *tempchat.TempChatClient
+	defer func() {
+		connector.Close()
+		if tempChatClient != nil {
+			tempChatClient.Close()
+		}
+	}()
 
 	// 如果配置了数据目录文件，加载并同步
 	if config.Connector.DataCatalogFile != "" && len(config.Connector.DataCatalog) == 0 {
@@ -189,6 +205,37 @@ func main() {
 	}
 
 	fmt.Printf("[OK] 连接成功！连接器ID: %s\n", config.Connector.ID)
+
+	// 初始化临时通信客户端（运维方模式）
+	if config.TempChat.Enabled {
+		fmt.Println("[INFO] 正在初始化临时通信客户端（运维方模式）...")
+
+		tempChatConfig := &tempchat.Config{
+			ConnectorID:     config.Connector.ID,
+			KernelID:       config.Kernel.ID,
+			Address:         config.TempChat.ListenAddr,
+			Port:            config.TempChat.ListenPort,
+			EntityType:     config.Connector.EntityType,
+			ServerAddr:      config.TempChat.ServerAddr,
+			CACertPath:      config.Security.CACertPath,
+			ClientCertPath:  config.Security.ClientCertPath,
+			ClientKeyPath:   config.Security.ClientKeyPath,
+			ServerName:      config.Security.ServerName,
+			ExposeToOthers:  config.TempChat.ExposeToOthers,
+		}
+
+		tempChatClient, err = tempchat.NewTempChatClient(tempChatConfig)
+		if err != nil {
+			log.Printf("[WARN] 创建临时通信客户端失败: %v", err)
+		} else {
+			if err := tempChatClient.Connect(); err != nil {
+				log.Printf("[WARN] 连接临时通信服务失败: %v", err)
+				tempChatClient = nil
+			} else {
+				fmt.Println("[OK] 临时通信客户端已连接")
+			}
+		}
+	}
 	
 	// 启动自动通知监听（所有连接器都会自动等待频道创建通知）
 	fmt.Println("正在启动自动通知监听...")
@@ -242,7 +289,7 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// 启动交互式命令行
-	go runInteractiveShell(connector, config)
+	go runInteractiveShell(connector, tempChatClient, config)
 
 	// 等待信号
 	<-sigChan
@@ -250,7 +297,7 @@ func main() {
 }
 
 // runInteractiveShell 运行交互式命令行
-func runInteractiveShell(connector *client.Connector, config *Config) {
+func runInteractiveShell(connector *client.Connector, tempChatClient *tempchat.TempChatClient, config *Config) {
 	connectorID := config.Connector.ID
 
 	// 获取默认配置目录
@@ -324,6 +371,10 @@ func runInteractiveShell(connector *client.Connector, config *Config) {
 			handleShowCatalog(connector)
 		case "status":
 			handleStatus(connector, args)
+		case "tempchat-list":
+			handleTempChatList(tempChatClient, args)
+		case "tempchat-send", "ts":
+			handleTempChatSend(tempChatClient, args)
 		case "exit", "quit", "q":
 			fmt.Println("退出连接器...")
 			os.Exit(0)
@@ -373,11 +424,16 @@ func printHelp(defaultConfigDir string) {
     fmt.Println("    示例: query-evidence --connector connector-A")
     fmt.Println("    示例: query-evidence --flow flow-uuid-123")
 	fmt.Println("  update-catalog <data_id> <true|false> - 更新数据项的暴露状态")
-    fmt.Println("    修改指定数据项的 exposed 字段，并重新上报到内核")
-    fmt.Println("    示例: update-catalog sensor-temp-001 false")
-    fmt.Println("  show-catalog - 显示当前连接器的数据目录")
-    fmt.Println("    显示所有数据项，包括未暴露的项")
+	fmt.Println("    修改指定数据项的 exposed 字段，并重新上报到内核")
+	fmt.Println("    示例: update-catalog sensor-temp-001 false")
+	fmt.Println("  show-catalog - 显示当前连接器的数据目录")
+	fmt.Println("    显示所有数据项，包括未暴露的项")
 	fmt.Println("  status [active|inactive|closed] - 查看或设置连接器状态")
+	fmt.Println("")
+	fmt.Println("临时通信命令（运维方模式）:")
+	fmt.Println("  tempchat-list              - 列出所有在线连接器（本地 + 远程）[-kernel <kernel_id>]")
+	fmt.Println("  tempchat-send, ts        - 发送临时消息 <receiver_id> <message>")
+	fmt.Println("    示例: tempchat-send connector-B Hello")
 	fmt.Println("  help, h               - 显示此帮助信息")
 	fmt.Println("  exit, quit, q         - 退出连接器")
 	fmt.Println("")
@@ -1692,6 +1748,14 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
+	// 设置临时通信默认值：启用时默认暴露连接器
+	// 如果用户不希望暴露，应在配置文件中显式设置 expose_to_others: false
+	if config.TempChat.Enabled {
+		// TempChat.ExposeToOthers 在 YAML 中默认为 false，
+		// 这里改为默认暴露连接器，除非用户显式设置为 false
+		config.TempChat.ExposeToOthers = true
+	}
+
 	// 加载数据目录（支持文件引用）
 	dataCatalog := loadDataCatalog(&config)
 	if len(dataCatalog) > 0 {
@@ -1946,3 +2010,108 @@ func handleControlMessage(packet *pb.DataPacket) error {
 	return nil
 }
 
+// =============================================================================
+// 临时通信命令处理（运维方模式）
+// =============================================================================
+
+// handleTempChatList 列出在线连接器
+func handleTempChatList(tempChatClient *tempchat.TempChatClient, args []string) {
+	if tempChatClient == nil {
+		fmt.Println("[ERROR] 临时通信未启用，请检查配置文件中 tempchat.enabled 是否为 true")
+		return
+	}
+
+	if !tempChatClient.IsConnected() {
+		fmt.Println("[ERROR] 临时通信未启用，请检查配置文件中 tempchat.enabled 是否为 true")
+		return
+	}
+
+	var kernelID string
+
+	// 解析可选的 kernel 过滤参数
+	for i, arg := range args {
+		if arg == "-kernel" && i+1 < len(args) {
+			kernelID = args[i+1]
+		}
+	}
+
+	// 查询本地连接器
+	localConnectors, err := tempChatClient.ListOnlineConnectors(kernelID, false)
+	if err != nil {
+		fmt.Printf("[ERROR] 查询本地连接器失败: %v\n", err)
+	}
+
+	// 查询远程连接器
+	remoteConnectors, err := tempChatClient.ListOnlineConnectors(kernelID, true)
+	if err != nil {
+		fmt.Printf("[ERROR] 查询远程连接器失败: %v\n", err)
+	}
+
+	// 合并（去重：远程已包含本地，防止重复）
+	seen := make(map[string]bool)
+	var all []*pb.ConnectorOnlineInfo
+	for _, c := range remoteConnectors {
+		key := c.KernelId + ":" + c.ConnectorId
+		if !seen[key] {
+			seen[key] = true
+			all = append(all, c)
+		}
+	}
+	for _, c := range localConnectors {
+		key := c.KernelId + ":" + c.ConnectorId
+		if !seen[key] {
+			seen[key] = true
+			all = append(all, c)
+		}
+	}
+
+	if len(all) == 0 {
+		fmt.Println("[INFO] 没有在线的连接器")
+		return
+	}
+
+	fmt.Printf("=== 在线连接器列表 (%d 个) ===\n", len(all))
+	fmt.Println(strings.Repeat("-", 60))
+	fmt.Printf("%-20s %-15s %-20s\n", "Connector ID", "Kernel", "Last Heartbeat")
+	fmt.Println(strings.Repeat("-", 60))
+
+	for _, c := range all {
+		lastHeartbeat := time.Unix(c.LastHeartbeat, 0)
+		timeStr := time.Since(lastHeartbeat).Round(time.Second).String()
+		fmt.Printf("%-20s %-15s %-20s\n",
+			c.ConnectorId, c.KernelId, timeStr+" ago")
+	}
+	fmt.Println()
+}
+
+// handleTempChatSend 发送临时消息
+func handleTempChatSend(tempChatClient *tempchat.TempChatClient, args []string) {
+	if tempChatClient == nil {
+		fmt.Println("[ERROR] 临时通信未启用，请检查配置文件中 tempchat.enabled 是否为 true")
+		return
+	}
+
+	if !tempChatClient.IsConnected() {
+		fmt.Println("[ERROR] 临时通信未启用，请检查配置文件中 tempchat.enabled 是否为 true")
+		return
+	}
+
+	if len(args) < 2 {
+		fmt.Println("用法: tempchat-send <receiver_id> <message>")
+		fmt.Println("示例: tempchat-send connector-B Hello")
+		return
+	}
+
+	receiverID := args[0]
+	message := strings.Join(args[1:], " ")
+
+	messageID, err := tempChatClient.SendMessage(receiverID, []byte(message), "")
+	if err != nil {
+		fmt.Printf("[ERROR] 发送失败: %v\n", err)
+	} else {
+		fmt.Printf("[OK] 消息已发送\n")
+		fmt.Printf("   消息ID: %s\n", messageID)
+		fmt.Printf("   接收方: %s\n", receiverID)
+		fmt.Printf("   内容: %s\n", message)
+	}
+}

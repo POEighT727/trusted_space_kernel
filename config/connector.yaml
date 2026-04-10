@@ -11,6 +11,8 @@ connector:
   data_catalog_file: "connector/data_catalog_sample.json"
 
 kernel:
+  # 内核ID（用于跨内核通信标识）
+  id: "kernel-1"
   # 内核服务器地址
   # 本地部署: "localhost" 或 "127.0.0.1"
   # 跨主机部署: 使用远程主机的IP地址或域名，例如: "192.168.1.100" 或 "kernel.example.com"
@@ -38,3 +40,13 @@ database:
   password: "123456"
   database: "connector_a"  # 连接器自己的数据库名
 
+# 临时通信配置（运维方模式）
+tempchat:
+  # 是否启用临时通信功能
+  enabled: true
+  # 临时通信服务地址（运维方监听地址）
+  server_addr: "192.168.31.155:50055"
+  # 是否向其他内核暴露本连接器
+  # false - 不暴露：其他内核的连接器看不到该连接器，无法向其发送临时消息
+  # true - 暴露（默认）：互联后其他内核可以通过 tempchat-list 发现该连接器
+  expose_to_others: true

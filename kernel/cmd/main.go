@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"gopkg.in/yaml.v3"
 
@@ -22,8 +23,10 @@ import (
 	"github.com/trusted-space/kernel/kernel/control"
 	"github.com/trusted-space/kernel/kernel/database"
 	"github.com/trusted-space/kernel/kernel/evidence"
+	"github.com/trusted-space/kernel/kernel/operator_peer"
 	"github.com/trusted-space/kernel/kernel/security"
 	"github.com/trusted-space/kernel/kernel/server"
+	"github.com/trusted-space/kernel/kernel/tempchat"
 )
 
 // SeedKernelConfig 种子内核配置
@@ -92,6 +95,20 @@ type Config struct {
 			DefaultCompressData  bool   `yaml:"default_compress_data"`
 		} `yaml:"evidence"`
 	} `yaml:"channel"`
+
+	TempChat struct {
+		Enabled           bool `yaml:"enabled"`
+		Port              int  `yaml:"port"`
+		SessionTimeout    int  `yaml:"session_timeout"`
+		HeartbeatInterval int  `yaml:"heartbeat_interval"`
+		SyncInterval      int  `yaml:"sync_interval"`
+	} `yaml:"tempchat"`
+
+	// P2P 运维方直连配置
+	P2P struct {
+		Enabled     bool   `yaml:"enabled"`
+		ListenAddr string `yaml:"listen_addr"`
+	} `yaml:"p2p"`
 }
 
 func main() {
@@ -137,6 +154,26 @@ func main() {
 	}
 	if config.Security.KernelKeyPath == "" {
 		config.Security.KernelKeyPath = config.Security.ServerKeyPath
+	}
+
+	// TempChat 配置默认值
+	if config.TempChat.Port == 0 {
+		config.TempChat.Port = config.Server.Port + 1 // 临时通信服务端口默认为主端口+1
+	}
+	if config.TempChat.SessionTimeout == 0 {
+		config.TempChat.SessionTimeout = 60
+	}
+	if config.TempChat.HeartbeatInterval == 0 {
+		config.TempChat.HeartbeatInterval = 15
+	}
+	if config.TempChat.SyncInterval == 0 {
+		config.TempChat.SyncInterval = 30
+	}
+
+	// P2P 配置默认值
+	if config.P2P.ListenAddr == "" {
+		// 默认使用 kernel_port+3（P2P端口约定为kernel端口+3）
+		config.P2P.ListenAddr = fmt.Sprintf("0.0.0.0:%d", config.MultiKernel.KernelPort+3)
 	}
 
 	// 使用配置文件中的值覆盖命令行参数（如果配置文件中有设置）
@@ -363,7 +400,110 @@ func main() {
 
 	log.Println("[OK] Multi-kernel manager initialized")
 
-	// 8. mTLS 配置
+	// 9. 临时通信管理器（运维方功能）
+	var tempChatManager *tempchat.TempChatManager
+	if config.TempChat.Enabled {
+		log.Println("[INFO] Initializing TempChat manager (ops mode)...")
+
+		tempChatMgrConfig := &tempchat.TempChatConfig{
+			HeartbeatInterval: config.TempChat.HeartbeatInterval,
+			SessionTimeout:     config.TempChat.SessionTimeout,
+			SyncInterval:      config.TempChat.SyncInterval,
+		}
+
+		tempChatManager = tempchat.NewTempChatManager(config.Kernel.ID, tempChatMgrConfig)
+		log.Printf("[OK] TempChat manager initialized (port: %d)", config.TempChat.Port)
+	}
+
+	// 10. P2P运维方直连管理器
+	var p2pManager *operator_peer.P2PManager
+	if config.P2P.Enabled {
+		log.Println("[INFO] Initializing P2P operator peer manager...")
+
+		p2pMgrConfig := operator_peer.DefaultP2PManagerConfig()
+		p2pMgrConfig.KernelID = config.Kernel.ID
+		p2pMgrConfig.ListenAddr = config.P2P.ListenAddr
+		p2pMgrConfig.LocalKernelAddr = config.Server.Address
+		p2pMgrConfig.LocalKernelPort = config.MultiKernel.KernelPort
+
+		var err error
+		p2pManager, err = operator_peer.NewP2PManager(p2pMgrConfig)
+		if err != nil {
+			log.Fatalf("Failed to initialize P2P manager: %v", err)
+		}
+
+		// 设置TempChatManager引用（用于获取本地连接器信息）
+		if tempChatManager != nil {
+			p2pManager.SetTempChatManager(tempChatManager)
+		}
+
+		// 将 MultiKernelManager 注入 P2PManager（提供按需连接时所需的地址信息）
+		if multiKernelManager != nil {
+			multiKernelManager.SetP2PManager(p2pManager)
+		}
+
+		// 设置消息投递回调（将P2P接收到的消息投递到本地连接器）
+		p2pManager.SetOnMessageDelivered(func(senderKernelID, senderID, receiverID string, payload []byte, flowID string) error {
+			// 解析真正的连接器ID（格式为 "kernelID:connectorID"，或直接是 "connectorID"）
+			connectorID := receiverID
+			if idx := strings.LastIndex(receiverID, ":"); idx >= 0 {
+				connectorID = receiverID[idx+1:]
+			}
+
+			// 通过TempChatManager投递消息
+			if tempChatManager != nil {
+				msg := &pb.TempMessage{
+					MessageId:      uuid.New().String(),
+					SenderId:       senderID,
+					ReceiverId:     connectorID,
+					Payload:        payload,
+					Timestamp:      time.Now().Unix(),
+					FlowId:        flowID,
+					SourceKernelId: senderKernelID,
+				}
+				return tempChatManager.DeliverMessage(connectorID, msg)
+			}
+			return fmt.Errorf("tempChatManager not available")
+		})
+
+		// 设置跨内核消息转发回调（将TempChat消息转发到P2P）
+		if tempChatManager != nil {
+			tempChatManager.SetRelayHandler(func(receiverKernelID, receiverID string, payload []byte) error {
+				// 按需建立 P2P 连接（如果尚未连接）
+				if p2pManager != nil {
+					if err := p2pManager.EnsurePeerConnected(receiverKernelID, "TempChat-relay"); err != nil {
+						log.Printf("[P2P] Failed to ensure peer connected for relay: %v", err)
+						// P2P 连接失败时静默降级，不阻塞 TempChat 消息（可扩展为 gRPC 回退）
+						return nil
+					}
+				}
+
+				relayMsg := &operator_peer.RelayMessagePayload{
+					SenderID:       tempChatManager.GetKernelID(),
+					SenderKernelID: tempChatManager.GetKernelID(),
+					ReceiverID:     receiverKernelID + ":" + receiverID,
+					Payload:        payload,
+					Timestamp:      time.Now().Unix(),
+				}
+				return p2pManager.RelayMessage(receiverKernelID, relayMsg)
+			})
+		}
+
+		// 启动P2P服务器
+		if err := p2pManager.Start(); err != nil {
+			log.Fatalf("Failed to start P2P manager: %v", err)
+		}
+
+		log.Printf("[OK] P2P manager started on %s", config.P2P.ListenAddr)
+
+		// P2P 连接不再在启动时预连接，而是按需建立：
+		// 当内核需要与某个远程内核通信时（TempChat relay 或 sync），
+		// 由 EnsurePeerConnected() 动态建立连接
+		// 这样避免了内核启动时不知道将要与哪些内核互联的问题
+		// (config.P2P.Peers 配置保留，仅作参考/记录用途)
+	}
+
+	// 10. mTLS 配置
 	mtlsConfig := &security.MTLSConfig{
 		CACertPath:     config.Security.CACertPath,
 		ServerCertPath: config.Security.ServerCertPath,
@@ -455,6 +595,19 @@ func main() {
 	pb.RegisterKernelServiceServer(grpcServer, kernelService)
 	log.Println("[OK] Kernel-to-kernel service registered")
 
+	// 注册临时通信服务（运维方功能）- 使用独立服务器
+	var tempChatServer *grpc.Server
+	if tempChatManager != nil {
+		tempChatServer = grpc.NewServer(
+			grpc.Creds(creds),
+			grpc.MaxRecvMsgSize(10*1024*1024),
+			grpc.MaxSendMsgSize(10*1024*1024),
+		)
+		tempChatService := tempchat.NewTempChatServiceServer(tempChatManager)
+		pb.RegisterTempChatServiceServer(tempChatServer, tempChatService)
+		log.Println("[OK] TempChat service registered")
+	}
+
 	log.Println("[OK] gRPC services registered")
 
 	// 创建引导服务（允许无证书连接，用于首次注册）
@@ -494,6 +647,21 @@ func main() {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 
+	// 启动独立 TempChat 服务器
+	if tempChatServer != nil {
+		tempChatAddr := fmt.Sprintf("%s:%d", config.Server.Address, config.TempChat.Port)
+		tempChatListener, err := net.Listen("tcp", tempChatAddr)
+		if err != nil {
+			log.Fatalf("Failed to listen on TempChat port: %v", err)
+		}
+		go func() {
+			log.Printf("[INFO] TempChat server started on %s", tempChatAddr)
+			if err := tempChatServer.Serve(tempChatListener); err != nil {
+				log.Printf("[ERROR] TempChat server error: %v", err)
+			}
+		}()
+	}
+
 	// 优雅关闭
 	go func() {
 		sigChan := make(chan os.Signal, 1)
@@ -503,6 +671,9 @@ func main() {
 		log.Println("[INFO] Shutting down gracefully...")
 		bootstrapServer.GracefulStop()
 		grpcServer.GracefulStop()
+		if tempChatServer != nil {
+			tempChatServer.GracefulStop()
+		}
 		auditLog.Close()
 		log.Println("[OK] Shutdown complete")
 		os.Exit(0)
@@ -519,7 +690,7 @@ func main() {
 		log.Println("[OK] gRPC server is running in the background")
 		log.Println("[OK] Interactive commands are enabled")
 		log.Println("[OK] Ready to accept connector connections")
-		go runInteractiveKernelShell(config, channelManager, registry, multiKernelManager, multiHopConfigManager)
+		go runInteractiveKernelShell(config, channelManager, registry, multiKernelManager, multiHopConfigManager, p2pManager)
 	}
 
 	if err := grpcServer.Serve(listener); err != nil {
@@ -530,7 +701,8 @@ func main() {
 // runInteractiveKernelShell 运行交互式内核命令行
 func runInteractiveKernelShell(config *Config, channelManager *circulation.ChannelManager,
 	registry *control.Registry, multiKernelManager *server.MultiKernelManager,
-	multiHopConfigManager *server.MultiHopConfigManager) {
+	multiHopConfigManager *server.MultiHopConfigManager,
+	p2pManager *operator_peer.P2PManager) {
 
 	kernelID := config.Kernel.ID
 	scanner := bufio.NewScanner(os.Stdin)
@@ -541,6 +713,9 @@ func runInteractiveKernelShell(config *Config, channelManager *circulation.Chann
 	fmt.Printf("Kernel ID: %s\n", kernelID)
 	fmt.Println("Multi-kernel: enabled (default)")
 	fmt.Println("gRPC Server: Running (accepting connector connections)")
+	if p2pManager != nil {
+		fmt.Println("P2P Operator: enabled")
+	}
 	fmt.Println("Management: Interactive commands enabled")
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Println("Type 'help' for available commands or 'status' for kernel status")
@@ -570,7 +745,7 @@ func runInteractiveKernelShell(config *Config, channelManager *circulation.Chann
 		case "help", "h":
 			printKernelHelp()
 		case "status":
-			handleKernelStatus(config, channelManager, registry, multiKernelManager)
+			handleKernelStatus(config, channelManager, registry, multiKernelManager, p2pManager)
 		case "connectors", "cs":
 			handleKernelConnectors(registry, multiKernelManager)
 		case "channels", "ch":
@@ -597,6 +772,12 @@ func runInteractiveKernelShell(config *Config, channelManager *circulation.Chann
 			handleDisableRoute(multiHopConfigManager, args)
 		case "route-info":
 			handleRouteInfo(multiKernelManager, multiHopConfigManager, args)
+		case "peers", "ps":
+			handleP2PPeers(p2pManager)
+		case "connect-peer":
+			handleConnectPeer(p2pManager, args)
+		case "disconnect-peer":
+			handleDisconnectPeer(p2pManager, args)
 		case "exit", "quit", "q":
 			fmt.Println("Shutting down kernel...")
 			os.Exit(0)
@@ -618,6 +799,12 @@ func printKernelHelp() {
 	fmt.Println("  disconnect-kernel <kernel_id> - Disconnect from a kernel")
 	fmt.Println("  pending-requests              - List pending interconnect requests awaiting approval")
 	fmt.Println("  approve-request <request_id>  - Approve a pending interconnect request (establish connection)")
+	fmt.Println()
+	fmt.Println("P2P Operator Peer Commands:")
+	fmt.Println("  peers, ps                     - List connected P2P peers")
+	fmt.Println("  connect-peer <kernel_id> <addr> <port>")
+	fmt.Println("                                - Connect to a P2P peer (operator)")
+	fmt.Println("  disconnect-peer <kernel_id>    - Disconnect from a P2P peer")
 	fmt.Println()
 	fmt.Println("Multi-Hop Route Commands:")
 	fmt.Println("  routes, rt                    - List all configured multi-hop routes")
@@ -642,6 +829,9 @@ func printKernelHelp() {
 	fmt.Println("    Use `routes` to see configured routes, `route-info <name>` for details.")
 	fmt.Println("    Use `-route <route_name>` with `connect-kernel` to specify the route.")
 	fmt.Println()
+	fmt.Println("  - P2P peers enable direct TCP connections between operators for faster")
+	fmt.Println("    connector list sync and message relay.")
+	fmt.Println()
 	fmt.Println("  help, h                       - Show this help message")
 	fmt.Println("  exit, quit, q                 - Exit the kernel")
 	fmt.Println()
@@ -649,7 +839,8 @@ func printKernelHelp() {
 
 // handleKernelStatus 处理状态查询命令
 func handleKernelStatus(config *Config, channelManager *circulation.ChannelManager,
-	registry *control.Registry, multiKernelManager *server.MultiKernelManager) {
+	registry *control.Registry, multiKernelManager *server.MultiKernelManager,
+	p2pManager *operator_peer.P2PManager) {
 
 	fmt.Println("=== Kernel Status ===")
 	fmt.Printf("Kernel ID: %s\n", config.Kernel.ID)
@@ -669,7 +860,86 @@ func handleKernelStatus(config *Config, channelManager *circulation.ChannelManag
 	kernelCount := multiKernelManager.GetConnectedKernelCount()
 	fmt.Printf("Connected Kernels: %d\n", kernelCount)
 
+	// P2P对等方信息
+	if p2pManager != nil && p2pManager.IsRunning() {
+		peerCount := p2pManager.GetPeerCount()
+		fmt.Printf("P2P Peers: %d\n", peerCount)
+	}
+
 	fmt.Println()
+}
+
+// handleP2PPeers 处理P2P对等方列表命令
+func handleP2PPeers(p2pManager *operator_peer.P2PManager) {
+	if p2pManager == nil || !p2pManager.IsRunning() {
+		fmt.Println("P2P mode not enabled")
+		return
+	}
+
+	peers := p2pManager.ListPeers()
+	if len(peers) == 0 {
+		fmt.Println("No P2P peers connected")
+		return
+	}
+
+	fmt.Println("=== P2P Peers ===")
+	fmt.Println(strings.Repeat("-", 70))
+	fmt.Printf("%-25s %-20s %-15s\n", "Kernel ID", "Address", "Status")
+	fmt.Println(strings.Repeat("-", 70))
+
+	for _, peer := range peers {
+		fmt.Printf("%-25s %-20s %-15s\n", peer.KernelID, fmt.Sprintf("%s:%d", peer.Address, peer.Port), peer.Status)
+	}
+	fmt.Println()
+}
+
+// handleConnectPeer 处理连接P2P对等方命令
+func handleConnectPeer(p2pManager *operator_peer.P2PManager, args []string) {
+	if p2pManager == nil || !p2pManager.IsRunning() {
+		fmt.Println("P2P mode not enabled")
+		return
+	}
+
+	if len(args) < 3 {
+		fmt.Println("Usage: connect-peer <kernel_id> <address> <port>")
+		return
+	}
+
+	kernelID := args[0]
+	address := args[1]
+	port, err := strconv.Atoi(args[2])
+	if err != nil {
+		fmt.Printf("Invalid port: %s\n", args[2])
+		return
+	}
+
+	if err := p2pManager.ConnectPeer(kernelID, address, port); err != nil {
+		fmt.Printf("Failed to connect: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Connecting to peer %s at %s:%d...\n", kernelID, address, port)
+}
+
+// handleDisconnectPeer 处理断开P2P对等方命令
+func handleDisconnectPeer(p2pManager *operator_peer.P2PManager, args []string) {
+	if p2pManager == nil || !p2pManager.IsRunning() {
+		fmt.Println("P2P mode not enabled")
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: disconnect-peer <kernel_id>")
+		return
+	}
+
+	kernelID := args[0]
+	if err := p2pManager.DisconnectPeer(kernelID); err != nil {
+		fmt.Printf("Failed to disconnect: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Disconnected from peer %s\n", kernelID)
 }
 
 // handleKernelConnectors 处理连接器列表命令

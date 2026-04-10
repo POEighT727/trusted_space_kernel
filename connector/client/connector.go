@@ -130,7 +130,7 @@ type Config struct {
 // NewConnector 创建新的连接器
 func NewConnector(config *Config) (*Connector, error) {
 	// 加载 TLS 凭证
-	tlsConfig, err := loadTLSConfig(config.CACertPath, config.ClientCertPath, config.ClientKeyPath, config.ServerName)
+	tlsConfig, err := LoadTLSConfig(config.CACertPath, config.ClientCertPath, config.ClientKeyPath, config.ServerName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load TLS config: %w", err)
 	}

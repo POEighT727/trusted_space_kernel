@@ -119,6 +119,9 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 			log.Printf("Client connection established for approved kernel %s", req.KernelId)
 		}
 
+		// 自动建立P2P连接（P2P端口 = kernelPort + 3）
+		go s.multiKernelManager.connectP2PToKernel(req.KernelId, req.Address, targetPort)
+
 		// 广播本内核已知的其他内核给新注册的内核
 		go s.multiKernelManager.BroadcastKnownKernels(req.KernelId)
 
@@ -224,6 +227,9 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 	} else {
 		log.Printf("Client connection established for kernel %s", req.KernelId)
 	}
+
+	// 自动建立P2P连接（P2P端口 = kernelPort + 3）
+	go s.multiKernelManager.connectP2PToKernel(req.KernelId, req.Address, targetPort)
 
 	// 广播本内核已知的其他内核给新注册的内核
 	go s.multiKernelManager.BroadcastKnownKernels(req.KernelId)
@@ -1029,8 +1035,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 	//     signature     = 当前 kernel 对传入签名的 RSA 签名
 	//   数据包链（仅 kernel-2/3）：RecordDataHash
 	// ================================================================
-	log.Printf("[DEBUG ForwardData] business_chain check: flowID='%s', isEndPacket=%v, businessChainManager=%v, currentKernelID=%s, req.SourceKernelId=%s",
-		flowID, isEndPacket, s.businessChainManager != nil, currentKernelID, req.SourceKernelId)
+	
 
 	if flowID != "" && !isEndPacket && s.businessChainManager != nil {
 		if isAckPacket {
@@ -1049,8 +1054,6 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 				}
 			// dataPacket.Signature 已在 PushData 之前更新为 currentKernelAckSig
 		} else if currentKernelID != req.SourceKernelId {
-			log.Printf("[DEBUG ForwardData] Will record data hash: currentKernelID=%s != req.SourceKernelId=%s",
-				currentKernelID, req.SourceKernelId)
 			// ---- kernel-2/3：业务数据包写入业务哈希链 ----
 			// data_hash 直接使用 packetDataHashFromProto（来自 connector，不重新计算）
 			// 数据库链的 prev_hash（上一跳 kernel 在 DB 中记录的 data_hash）
@@ -1062,8 +1065,6 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 			// prevSignature = 上一跳 kernel 的签名（原始请求中的 Signature）
 			prevSignature := req.DataPacket.GetSignature()
 			// 使用预先计算好的签名 currentKernelDataSig
-			log.Printf("[DEBUG ForwardData] RecordDataHash: channel=%s, computedDataHash=%s, prevHash='%s', prevSignature='%s', currentKernelDataSig='%s'",
-				req.ChannelId, computedDataHash, prevHash, prevSignature, currentKernelDataSig)
 			if err := s.businessChainManager.RecordDataHash(
 				"", req.ChannelId, computedDataHash, prevHash,
 				prevSignature, currentKernelDataSig,

@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package trusted_space.kernel.v1;
+
+option go_package = "github.com/trusted-space/kernel/api/v1;kernelv1";
+
+// 引入其他 proto 文件的消息定义
+import "kernel/v1/tempchat.proto";
+
+// ================================================================
+// P2P 运维方直连协议 (OperatorPeer Protocol)
+// ================================================================
+// 运维方之间直接建立TCP连接，用于：
+// 1. 同步在线连接器列表
+// 2. 转发连接器间的临时消息
+// 3. 心跳保活
+
+// P2P协议消息类型
+enum P2PMessageType {
+    // 握手
+    P2P_HANDSHAKE = 0;           // 握手请求
+    P2P_HANDSHAKE_ACK = 1;       // 握手响应
+
+    // 连接器同步
+    P2P_SYNC_CONNECTORS = 10;    // 同步在线连接器列表
+    P2P_SYNC_CONNECTORS_ACK = 11;// 同步响应
+
+    // 消息转发
+    P2P_RELAY_MESSAGE = 20;       // 转发连接器消息
+    P2P_RELAY_MESSAGE_ACK = 21;  // 转发确认
+
+    // 心跳
+    P2P_HEARTBEAT = 30;          // P2P心跳
+    P2P_HEARTBEAT_ACK = 31;      // 心跳响应
+
+    // 断开
+    P2P_DISCONNECT = 40;          // 通知对方断开连接
+}
+
+// P2P数据包（用于TCP传输）
+message P2PPacket {
+    P2PMessageType type = 1;      // 消息类型
+    string source_kernel_id = 2;  // 源内核ID
+    string target_kernel_id = 3;   // 目标内核ID（用于路由，可为空表示广播）
+    bytes payload = 4;             // 消息载荷（序列化后的消息）
+    int64 timestamp = 5;          // 时间戳
+    string trace_id = 6;          // 追踪ID（用于日志和调试）
+}
+
+// ================================================================
+// 握手消息
+// ================================================================
+message P2PHandshakeRequest {
+    string kernel_id = 1;         // 本内核ID
+    string kernel_address = 2;     // 本内核地址（用于反向连接）
+    int32 kernel_port = 3;        // 本内核端口
+    int32 peer_port = 4;          // 本运维方P2P端口
+    string version = 5;            // 协议版本
+    int64 timestamp = 6;          // 时间戳
+}
+
+message P2PHandshakeResponse {
+    bool success = 1;
+    string message = 2;
+    string kernel_id = 3;         // 对方内核ID
+    string version = 4;           // 协议版本
+    int64 timestamp = 5;          // 时间戳
+}
+
+// ================================================================
+// 连接器同步消息
+// ================================================================
+message P2PSyncConnectorsRequest {
+    string source_kernel_id = 1;  // 源内核ID
+    repeated ConnectorOnlineInfo connectors = 2; // 本内核在线连接器列表
+    int64 timestamp = 3;         // 同步时间戳
+    string trace_id = 4;          // 追踪ID
+}
+
+message P2PSyncConnectorsResponse {
+    bool success = 1;
+    string message = 2;
+    repeated ConnectorOnlineInfo remote_connectors = 3; // 对方的在线连接器
+    int64 timestamp = 4;
+}
+
+// ================================================================
+// 消息转发消息
+// ================================================================
+message P2PRelayMessageRequest {
+    string message_id = 1;        // 消息ID
+    string sender_id = 2;         // 发送者连接器ID
+    string sender_kernel_id = 3;  // 发送者所属内核ID
+    string receiver_id = 4;       // 接收者连接器ID
+    bytes payload = 5;             // 消息载荷
+    int64 timestamp = 6;          // 时间戳
+    string flow_id = 7;           // 业务流程ID（可选）
+    string trace_id = 8;          // 追踪ID
+}
+
+message P2PRelayMessageResponse {
+    bool success = 1;
+    string message = 2;
+    string message_id = 3;        // 消息ID
+    int64 delivered_at = 4;       // 投递时间
+}
+
+// ================================================================
+// 心跳消息
+// ================================================================
+message P2PHeartbeatRequest {
+    string kernel_id = 1;         // 本内核ID
+    int64 timestamp = 2;         // 时间戳
+    int32 connected_connectors = 3; // 本内核连接器数量
+    int32 active_peers = 4;       // 当前活跃的P2P连接数
+}
+
+message P2PHeartbeatResponse {
+    bool success = 1;
+    string kernel_id = 2;         // 对方内核ID
+    int64 timestamp = 3;         // 服务器时间
+    int32 connected_connectors = 4;
+    int32 active_peers = 5;
+}

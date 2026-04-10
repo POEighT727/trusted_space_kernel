@@ -1,35 +1,9 @@
 # Trusted Data Space Kernel (可信数据空间内核)
 
-A standardized, lightweight core component for Trusted Data Space, implementing the "Kernel + Extension" architecture design.
+A **standardized, lightweight** core component for Trusted Data Space, implementing the **Kernel + Extension** dual-component architecture. The kernel provides standardized interfaces and services, while extension components (Connectors) flexibly adapt to various business scenarios.
 
 [![Go Version](https://img.shields.io/badge/Go-1.21%2B-blue)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-
-## Overview
-
-This project implements a **standardized, lightweight Trusted Data Space Kernel** with the following core components:
-
-### Core Kernel Layer
-
-1. **Security Module**
-   - Internal CA: Certificate issuance and revocation
-   - mTLS Termination: TLS 1.3 based mutual authentication
-
-2. **Control Module**
-   - Identity Registry: Manages connector information
-   - Policy Engine: Validates request legitimacy based on policies
-
-3. **Circulation Module**
-   - Channel Management: Manages data transmission channels
-   - Data Relay: Provides encrypted data streaming relay
-
-4. **Evidence Module**
-   - Audit Logging: Records hashes of all critical events
-   - Chain Storage: Ensures audit logs are tamper-proof
-
-### Extension Layer
-
-- **Connector**: Acts as the gateway for entities to enter the data space, interacting with the kernel via standard gRPC interfaces
 
 ---
 
@@ -37,8 +11,8 @@ This project implements a **standardized, lightweight Trusted Data Space Kernel*
 
 - **Kernel Standardization**: The kernel is a standardized "operating system" providing unified interface specifications
 - **Extension Flexibility**: Connectors as extension components can flexibly adapt to various business scenarios
-- **Interoperability**: Standard gRPC interfaces enable cross-organization and cross-system interoperability
-- **Security Foundation**: Zero-trust security architecture based on mTLS
+- **Interoperability**: Standard gRPC interfaces and P2P direct connection protocol enable cross-organization and cross-system interoperability
+- **Security Foundation**: Zero-trust security architecture based on mTLS with RSA-PSS digital signatures
 
 ---
 
@@ -47,402 +21,177 @@ This project implements a **standardized, lightweight Trusted Data Space Kernel*
 ### Overall Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Trusted Data Space                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│    Organization-A                   Organization-B              Organization-C│
-│  ┌─────────────┐               ┌─────────────┐               ┌───────────┐ │
-│  │   Kernel   │◄─────────────►│   Kernel   │◄─────────────►│   Kernel  │ │
-│  │ kernel-1   │    mTLS      │ kernel-2   │    mTLS      │ kernel-3  │ │
-│  │ :50051     │               │ :50051     │               │ :50051    │ │
-│  │ :50053     │               │ :50053     │               │ :50053    │ │
-│  └──────┬──────┘               └──────┬──────┘               └─────┬─────┘ │
-│         │                              │                              │       │
-│    ┌────┴────┐                    ┌────┴────┐                    ┌────┴────┐  │
-│    │Connector │                    │Connector │                    │Connector │  │
-│    │  A1     │                    │  B1     │                    │  C1     │  │
-│    │  A2     │                    │  B2     │                    │  C2     │  │
-│    └─────────┘                    └─────────┘                    └─────────┘  │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           Trusted Data Space                                        │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│    Organization-A                      Organization-B                   Organization-C│
+│  ┌─────────────┐                ┌─────────────┐                   ┌───────────┐    │
+│  │   Kernel   │◄───────────────►│   Kernel   │◄─────────────────►│   Kernel  │    │
+│  │ kernel-1   │      mTLS       │ kernel-2   │       mTLS         │ kernel-3  │    │
+│  │ :50051     │                │ :50051     │                    │ :50051    │    │
+│  │ :50052     │                │ :50052     │                    │ :50052    │    │
+│  │ :50053     │                │ :50053     │                    │ :50053    │    │
+│  │ :50055     │                │ :50055     │                    │ :50055    │    │
+│  └──────┬──────┘                └──────┬──────┘                   └─────┬─────┘    │
+│         │                               │                                │           │
+│    ┌────┴────┐                     ┌────┴────┐                     ┌────┴────┐     │
+│    │Connector│                     │Connector│                     │Connector│     │
+│    │  A1     │                     │  B1     │                     │  C1     │     │
+│    │  A2     │                     │  B2     │                     │  C2     │     │
+│    └─────────┘                     └─────────┘                     └─────────┘     │
+│                                                                                     │
+│  ┌────────────────────────────── P2P Operator Direct ──────────────────────────┐ │
+│  │  Operator ↔ Operator (TCP Direct, Custom Binary Protocol, Sync Connectors)    │ │
+│  └───────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Three-Layer Architecture
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│                    Entity Extension Layer                               │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                             │
+│  │Database  │  │Algorithm │  │Application│                            │
+│  │Connector│  │Connector│  │Connector  │                            │
+│  └────┬────┘  └────┬────┘  └────┬────┘                               │
+└───────┼────────────┼────────────┼─────────────────────────────────────┘
+        │ mTLS       │ mTLS       │ mTLS
+┌───────┼────────────┼────────────┼─────────────────────────────────────┐
+│       │       Trusted Interaction Layer (gRPC/mTLS)      │              │
+│       ↓            ↓            ↓            ↓              │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                  Kernel Layer                            │  │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │  │
+│  │  │ Security │  │ Control  │  │Circulation│  │ Evidence │  │  │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │  │
+│  │  ┌──────────┐  ┌──────────┐                             │  │
+│  │  │Multi-Kernel│ │Multi-Hop│                             │  │
+│  │  └──────────┘  └──────────┘                             │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────┘
+
+Note: Circulation Module includes:
+  - Channel Management: logical data pipeline with pub-sub pattern
+  - TempChat: lightweight temporary messaging without formal channels
+  - Operator Peer: direct TCP connections for connector sync and message relay
 ```
 
 ---
 
-## Event Types
+## Core Modules
 
-### Authentication Events
-| Event Type | Description |
-|-----------|-------------|
-| AUTH_SUCCESS | Connector authentication successful |
-| AUTH_FAILED | Connector authentication failed |
-| AUTH_TIMEOUT | Authentication timeout |
+### 1. Security Module
 
-### Interconnection Events
-| Event Type | Description |
-|-----------|-------------|
-| INTERCONNECT_REQUESTED | Kernel interconnection request initiated |
-| INTERCONNECT_APPROVED | Interconnection request approved |
-| INTERCONNECT_REJECTED | Interconnection request rejected |
-| INTERCONNECT_CLOSED | Interconnection closed |
+Implements **mTLS (Mutual TLS)** for zero-trust security architecture:
 
-### Channel Management Events
-| Event Type | Description |
-|-----------|-------------|
-| CHANNEL_PROPOSED | Channel proposal created |
-| CHANNEL_ACCEPTED | Channel proposal accepted |
-| CHANNEL_REJECTED | Channel proposal rejected |
-| CHANNEL_CREATED | Channel officially created |
-| CHANNEL_CLOSED | Channel closed |
-| CHANNEL_SUBSCRIBED | Channel subscribed |
-| CHANNEL_UNSUBSCRIBED | Channel unsubscribed |
+- **Root CA**: Self-signed root certificate as trust anchor
+- **Server Certificate**: Certificate held by kernel server
+- **Client Certificate**: Each connector holds a certificate with CN matching connector ID
+- **Dynamic Registration**: Connectors can apply for certificates on first connection (Bootstrap service, port 50052)
+- **RSA-PSS Digital Signature**: RSA-PSS algorithm for signing evidence records
+- **SHA-256 Hashing**: SHA-256 algorithm for data hashing
 
-### Data Transfer Events
-| Event Type | Description |
-|-----------|-------------|
-| DATA_SEND | Data sent (connector→kernel or kernel→kernel) |
-| DATA_RECEIVE | Data received (kernel→connector or kernel→kernel) |
+### 2. Control Module
 
-### Permission Management Events
-| Event Type | Description |
-|-----------|-------------|
-| PERMISSION_REQUESTED | Permission change requested |
-| PERMISSION_GRANTED | Permission granted |
-| PERMISSION_REJECTED | Permission rejected |
-| PERMISSION_REVOKED | Permission revoked |
+Manages connector identity and data transfer permissions:
 
----
+- **Identity Registry** (`registry.go`): Manages complete lifecycle of connectors
+- **Heartbeat Mechanism**: Client sends heartbeat every 15s, server detects offline after 30s
+- **Policy Engine** (`policy.go`): Rule-based access control with exact match and wildcard support
+- **Connector Status**: Supports `active` / `inactive` / `closed` states
 
-## Typical Data Flow Scenarios
+### 3. Circulation Module
 
-### Scenario 1: Single Kernel Data Transfer
+Manages data transmission through **Channels (Channel)**, including **TempChat** and **P2P Operator Peer**:
 
-```
-connector-A ──────► kernel-1 ──────► connector-B
+#### 3.1 Channel Management
 
-Evidence Records:
-1. DATA_SEND: connector-A → kernel-1
-2. DATA_RECEIVE: kernel-1 → connector-B
-```
+- **Channel**: Logical data transmission pipeline providing relay, buffering and distribution
+- **Pub-Sub Pattern**: Sender pushes data to channel, receiver subscribes to get data
+- **Negotiation**: Two-phase channel creation (propose-accept)
+- **Cross-Kernel Channel**: Supports cross-kernel channel creation and data forwarding
+- **Multi-Hop Routing**: Supports multi-hop routing configuration
+- **Subscription Approval**: Sender can approve receiver's subscription request
 
-### Scenario 2: Cross-Kernel Data Transfer (Two Hops)
+#### 3.2 TempChat
+
+Provides lightweight temporary session capability for connector communication without formal channels (e.g., ops messages, debug commands):
+
+- **Session Registration**: Connectors register temporary sessions with ID and session key
+- **Heartbeat Keep-Alive**: Sessions stay alive through heartbeat
+- **Message Exchange**: Real-time bidirectional messaging
+- **Cross-Kernel Forwarding**: Messages route across kernels to target connector's kernel
+- **Remote Connector Cache**: Caches remote connector list during cross-kernel communication
+
+**Architecture**:
 
 ```
-connector-A ──► kernel-1 ──► kernel-2 ──► connector-U
-
-Evidence Records:
-1. DATA_SEND: connector-A → kernel-1         (local send)
-2. DATA_SEND: kernel-1 → kernel-2           (cross-kernel forward)
-3. DATA_RECEIVE: kernel-1 → kernel-2        (arrived at target kernel)
-4. DATA_RECEIVE: kernel-2 → connector-U     (delivered to receiver)
+Connector ↔ TempChatService (gRPC, port 50055) ↔ TempChatManager (in-memory)
+                                    ↓
+                    Cross-kernel forwarding (gRPC ForwardTempMessage / P2P RelayMessage)
 ```
 
----
+#### 3.3 P2P Operator Peer — Part of Circulation
 
-## Quick Start
+Implements direct TCP connections between operators for syncing online connector list and relaying temporary messages, avoiding gRPC dependency:
 
-### Prerequisites
+- **On-Demand Connection**: No pre-connection, establishes connection when needed
+- **Full-Duplex Multiplexing**: Active and passive connections unified as `PeerClient`
+- **Auto-Reconnect**: Built-in auto-reconnect mechanism
+- **Connector Sync**: `SyncConnectors` message syncs online connector list
+- **Message Relay**: `RelayMessage` relays temporary messages between connectors
+- **TempChat Integration**: Messages delivered to `TempChatManager.DeliverMessage()`
 
-- Go 1.21+
-- Protocol Buffers compiler (protoc)
-- OpenSSL (for generating test certificates)
-- Make (optional, for simplified building)
-- MySQL 5.7+ (optional, file storage is used by default)
-
-### Installation Steps
-
-#### 1. Clone and Install Dependencies
-
-```bash
-git clone <repository-url>
-cd trusted-space-kernel
-
-# Install Go dependencies
-go mod download
-
-# Install protoc plugins
-go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-```
-
-#### 2. Generate Protobuf Code
-
-```bash
-make proto
-```
-
-Or manually:
-
-```bash
-mkdir -p api/v1
-protoc --go_out=. --go_opt=paths=source_relative \
-    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-    proto/kernel/v1/*.proto
-```
-
-#### 3. Generate Test Certificates
-
-**Linux/Mac:**
-
-```bash
-chmod +x scripts/gen_certs.sh
-./scripts/gen_certs.sh
-```
-
-**Windows (PowerShell):**
-
-```powershell
-.\scripts\gen_certs.ps1
-```
-
-#### 4. Create Log Directory
-
-```bash
-mkdir -p logs
-```
-
-#### 5. Build Kernel and Connector
-
-```bash
-make all
-```
-
-Or manually:
-
-```bash
-go build -o bin/kernel.exe ./kernel/cmd
-go build -o bin/connector.exe ./connector/cmd
-```
-
-### Running Examples
-
-#### Terminal 1: Start Kernel
-
-```bash
-./bin/kernel.exe --config config/kernel.yaml
-```
-
-Output should include:
+**Custom TCP Protocol** (Binary Header + JSON Payload):
 
 ```
-✓ Registry initialized
-✓ Policy engine initialized
-✓ Channel manager initialized
-✓ Audit log initialized
-✓ mTLS configured
-✓ gRPC services registered
-🚀 Trusted Data Space Kernel started on 0.0.0.0:50051
+┌──────────────────────────────────────┐
+│  Header (28 bytes)                   │
+│  Magic(4) + Ver(1) + Type(1)        │
+│  Flags(1) + Reserved(1)              │
+│  Len(4) + TraceID(16)                │
+├──────────────────────────────────────┤
+│  Payload (variable, ≤8MB)            │
+│  JSON format message content          │
+└──────────────────────────────────────┘
 ```
 
-#### Terminal 2: Start Connector
+### 4. Evidence Module
 
-```bash
-./bin/connector.exe --config config/connector.yaml
-```
+Uses **timestamp-ordered hash chain records**:
 
-The connector will automatically register and obtain a certificate on first run.
+- **60+ Event Types**: Covers data transfer, channel management, permission, security, interconnection events
+- **Integrity Protection**: RSA-PSS digital signature + hash chain ensures tamper-proof
+- **Multi-Backend**: File storage / MySQL / hybrid storage
+- **Business Hash Chain**: Connectors can build signed hash chains of local business data
+- **Auto-Fallback**: Automatic fallback to file storage on evidence failure
 
----
+### 5. Multi-Kernel Module
 
-## Interactive Commands
+Supports multiple kernels forming P2P distributed network:
 
-### Kernel Commands
-
-```bash
-# View status
-status
-
-# List connectors
-connectors or cs
-
-# List channels
-channels or ch
-
-# List known kernels
-kernels or ks
-
-# Connect to another kernel
-connect-kernel <kernel_id> <address> <port>
-# Example: connect-kernel kernel-2 192.168.202.136 50053
-
-# Approve interconnection request
-approve-request <request_id>
-
-# List pending requests
-pending-requests
-
-# Disconnect kernel
-disconnect-kernel <kernel_id>
-
-# Multi-hop routes
-routes, rt                    # List all routes
-load-route <filename>         # Load route configuration
-connect-route <route_name>    # Connect to specified route
-route-info <route_name>       # View route details
-
-# Exit
-exit or quit
-```
-
-### Connector Commands
-
-```bash
-# List connectors
-list or ls
-
-# View connector info
-info <connector_id>
-
-# Create channel (proposal)
-create --config <config_file>
-create --sender <sender_ids> --receiver <receiver_ids> --reason <reason>
-
-# Accept channel proposal
-accept <channel_id> <proposal_id>
-
-# Reject channel proposal
-reject <channel_id> <proposal_id> --reason <reason>
-
-# Send data
-sendto <channel_id> [file_path]
-# Example: sendto <channel-id>
-#         (enter data, press Enter to send, type END to finish)
-
-# Subscribe to channel
-subscribe <channel_id>
-
-# View joined channels
-channels or ch
-
-# Query evidence records
-query-evidence --channel <channel_id>
-query-evidence --connector <connector_id>
-query-evidence --flow <flow_id>
-
-# Permission management
-request-permission <channel_id> <change_type> <target_id> <reason>
-approve-permission <channel_id> <request_id>
-reject-permission <channel_id> <request_id> <reason>
-list-permissions <channel_id>
-
-# Set status
-status [active|inactive|closed]
-
-# Help
-help
-```
-
----
-
-## Demo: Cross-Kernel Data Transfer
-
-### 1. Environment Setup
-
-```
-┌─────────────────────┐          ┌─────────────────────┐
-│   kernel-1          │          │   kernel-2          │
-│   192.168.31.155    │◄────────►│   192.168.202.136  │
-│   (Windows)         │   mTLS   │   (Linux VM)       │
-└─────────┬───────────┘          └─────────┬───────────┘
-          │                              │
-    connector-A                    connector-U
-```
-
-### 2. Start Services
-
-```bash
-# Start kernel-1 (Windows)
-.\bin\kernel.exe --config .\config\kernel.yaml
-
-# Start kernel-2 (Linux)
-./bin/kernel.exe --config config/kernel.yaml
-```
-
-### 3. Establish Kernel Interconnection
-
-```bash
-# On kernel-1
-connect-kernel kernel-2 192.168.202.136 50053
-
-# On kernel-2
-approve-request <request_id>
-```
-
-### 4. Connectors Join
-
-```bash
-# On kernel-1
-.\bin\connector.exe --config .\config\connector-A.yaml
-
-# On kernel-2
-./bin/connector.exe --config config/connector-U.yaml
-```
-
-### 5. Create Cross-Kernel Channel
-
-```bash
-# On connector-A
-create --sender connector-A --receiver kernel-2:connector-U --reason "Test data transfer"
-
-# On connector-U
-accept <channel_id> <proposal_id>
-```
-
-### 6. Send Data
-
-```bash
-# On connector-A
-sendto <channel_id>
-# Enter data content
-# Type END to finish sending
-```
-
-### 7. View Evidence Records
-
-```bash
-# Query on kernel
-query-evidence --channel <channel_id>
-```
-
----
-
-## Evidence Record Examples
-
-When connector-A sends "hello" data to connector-U through a cross-kernel channel, the following evidence records are generated:
-
-### kernel-1 Evidence Records
-
-| Event Type | source_id | target_id | Description |
-|-----------|-----------|-----------|-------------|
-| AUTH_SUCCESS | connector-A | kernel-1 | Connector authentication successful |
-| INTERCONNECT_REQUESTED | kernel-1 | kernel-2 | Kernel interconnection initiated |
-| CHANNEL_CREATED | kernel-1 | kernel-1 | Channel created successfully |
-| DATA_SEND | connector-A | kernel-1 | connector-A sends data to kernel |
-| DATA_SEND | kernel-1 | kernel-2 | Kernel forwards to target kernel |
-| DATA_SEND | kernel-1 | kernel-2 | Forward completion confirmed (with data_hash) |
-
-### kernel-2 Evidence Records
-
-| Event Type | source_id | target_id | Description |
-|-----------|-----------|-----------|-------------|
-| AUTH_SUCCESS | connector-U | kernel-2 | Connector authentication successful |
-| INTERCONNECT_APPROVED | kernel-2 | kernel-1 | Interconnection request approved |
-| CHANNEL_CREATED | kernel-2 | kernel-2 | Channel created successfully |
-| DATA_RECEIVE | kernel-1 | kernel-2 | Data received from kernel-1 |
-| DATA_RECEIVE | kernel-2 | connector-U | Delivered to target connector |
+- **Kernel Discovery**: Sync known kernel list via `SyncKnownKernels`
+- **Direct Connection**: Kernels establish direct gRPC connections (port 50053)
+- **Multi-Hop Routing**: Supports multi-hop route configuration
+- **Heartbeat Maintenance**: 60s heartbeat detects connection status
+- **Cross-Kernel Channel**: Supports cross-kernel data transmission channels
+- **Connector Info Sync**: Cross-kernel sync of connector online status and basic info
 
 ---
 
 ## Port Configuration
 
-Each kernel uses three ports for communication:
+Each kernel uses four ports:
 
 | Port | Purpose | Description |
 |------|---------|-------------|
-| 50051 | Main Service | Provides IdentityService, ChannelService, EvidenceService |
-| 50052 | Bootstrap | Used for connector certificate application during first registration |
-| 50053 | Kernel-to-Kernel | Used for kernel interconnection (P2P communication) |
+| 50051 | Main Service | IdentityService, ChannelService, EvidenceService, BusinessChainService |
+| 50052 | Bootstrap | Connector certificate application during first registration (no mTLS) |
+| 50053 | Kernel-to-Kernel | Kernel interconnection (mTLS encrypted gRPC) |
+| 50055 | TempChat | Connector temporary session communication (gRPC) |
 
 ---
 
@@ -514,6 +263,423 @@ service KernelService {
 }
 ```
 
+### 5. BusinessChainService
+
+```protobuf
+service BusinessChainService {
+  rpc SubmitHashChain(SubmitHashChainRequest) returns (SubmitHashChainResponse);
+  rpc QueryHashChain(QueryHashChainRequest) returns (QueryHashChainResponse);
+  rpc VerifyHashChain(VerifyHashChainRequest) returns (VerifyHashChainResponse);
+}
+```
+
+### 6. TempChatService
+
+```protobuf
+service TempChatService {
+  rpc RegisterSession(RegisterSessionRequest) returns (RegisterSessionResponse);
+  rpc HeartbeatSession(HeartbeatSessionRequest) returns (HeartbeatSessionResponse);
+  rpc UnregisterSession(UnregisterSessionRequest) returns (UnregisterSessionResponse);
+  rpc ListOnlineConnectors(ListOnlineConnectorsRequest) returns (ListOnlineConnectorsResponse);
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  rpc ReceiveMessage(ReceiveMessageRequest) returns (stream Message);
+  rpc ForwardTempMessage(ForwardTempMessageRequest) returns (ForwardTempMessageResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+}
+```
+
+---
+
+## Event Types
+
+### Authentication Events
+
+| Event Type | Description |
+|------------|-------------|
+| AUTH_SUCCESS | Connector authentication successful |
+| AUTH_FAILED | Connector authentication failed |
+| AUTH_TIMEOUT | Authentication timeout |
+
+### Interconnection Events
+
+| Event Type | Description |
+|------------|-------------|
+| INTERCONNECT_REQUESTED | Kernel interconnection request initiated |
+| INTERCONNECT_APPROVED | Interconnection request approved |
+| INTERCONNECT_REJECTED | Interconnection request rejected |
+| INTERCONNECT_CLOSED | Interconnection closed |
+
+### Channel Management Events
+
+| Event Type | Description |
+|------------|-------------|
+| CHANNEL_PROPOSED | Channel proposal created |
+| CHANNEL_ACCEPTED | Channel proposal accepted |
+| CHANNEL_REJECTED | Channel proposal rejected |
+| CHANNEL_CREATED | Channel officially created |
+| CHANNEL_CLOSED | Channel closed |
+| CHANNEL_SUBSCRIBED | Channel subscribed |
+| CHANNEL_UNSUBSCRIBED | Channel unsubscribed |
+
+### Data Transfer Events
+
+| Event Type | Description |
+|------------|-------------|
+| DATA_SEND | Data sent (connector→kernel or kernel→kernel) |
+| DATA_RECEIVE | Data received (kernel→connector or kernel→kernel) |
+
+### Permission Management Events
+
+| Event Type | Description |
+|------------|-------------|
+| PERMISSION_REQUESTED | Permission change requested |
+| PERMISSION_GRANTED | Permission granted |
+| PERMISSION_REJECTED | Permission rejected |
+| PERMISSION_REVOKED | Permission revoked |
+
+---
+
+## Typical Data Flow Scenarios
+
+### Scenario 1: Single Kernel Data Transfer
+
+```
+connector-A ──────► kernel-1 ──────► connector-B
+
+Evidence Records:
+1. DATA_SEND: connector-A → kernel-1
+2. DATA_RECEIVE: kernel-1 → connector-B
+```
+
+### Scenario 2: Cross-Kernel Data Transfer (Two Hops)
+
+```
+connector-A ──► kernel-1 ──► kernel-2 ──► connector-U
+
+Evidence Records:
+1. DATA_SEND: connector-A → kernel-1         (local send)
+2. DATA_SEND: kernel-1 → kernel-2           (cross-kernel forward)
+3. DATA_RECEIVE: kernel-1 → kernel-2        (arrived at target kernel)
+4. DATA_RECEIVE: kernel-2 → connector-U     (delivered to receiver)
+```
+
+### Scenario 3: Temporary Session Message
+
+```
+connector-A ──► kernel-1 (TempChat) ──► kernel-2 (TempChat) ──► connector-U
+
+1. Connector registers TempChat session
+2. Sender sends temporary message via gRPC SendMessage
+3. If target connector on remote kernel, ForwardTempMessage routes cross-kernel
+4. Receiver receives message via ReceiveMessage stream
+```
+
+---
+
+## Project Structure
+
+```
+trusted_space_kernel/
+├── bin/                              # Compiled executables
+│   ├── kernel.exe                    # Kernel executable
+│   └── connector.exe                 # Connector executable
+├── certs/                            # Certificate directory
+│   ├── ca.crt / ca.key              # CA root certificate
+│   ├── kernel.crt / kernel.key      # Kernel certificate
+│   └── connector-{A,B,C,X}*.crt/.key # Connector certificates
+├── config/                           # Configuration files
+│   ├── kernel.yaml                   # Kernel main config
+│   ├── connector.yaml               # Connector A config
+│   ├── connector-B.yaml             # Connector B config
+│   ├── connector-C.yaml             # Connector C config
+│   └── connector-X.yaml             # Connector X config
+├── channels/                         # Channel data directory
+│   └── {connector-id}/             # Subdirectory per connector
+├── kernel_configs/                    # Multi-hop route config (JSON)
+├── connector/                         # Connector implementation
+│   ├── cmd/
+│   │   └── main.go                   # Connector entry (2118 lines)
+│   ├── client/
+│   │   ├── connector.go             # Connector core client (2196 lines)
+│   │   └── tls.go                   # TLS config loader
+│   ├── database/
+│   │   ├── store.go                 # Local data storage
+│   │   ├── hash_chain.go            # Business hash chain (RSA signing)
+│   │   └── mysql.go                  # MySQL support
+│   └── tempchat/
+│       └── client.go                # TempChat client
+├── kernel/                           # Kernel implementation
+│   ├── cmd/
+│   │   └── main.go                   # Kernel entry (1505 lines)
+│   ├── circulation/                   # Circulation module
+│   │   ├── channel_manager.go       # Channel manager
+│   │   └── channel_config.go         # Channel config manager
+│   ├── control/                      # Control module
+│   │   ├── registry.go              # Identity registry
+│   │   └── policy.go                 # Policy engine
+│   ├── database/                      # Database module
+│   │   ├── mysql.go                  # MySQL connection
+│   │   ├── evidence_store.go        # Evidence storage
+│   │   └── business_chain_store.go  # Business chain storage
+│   ├── evidence/                      # Evidence module
+│   │   └── audit_log.go             # Audit log (60+ event types)
+│   ├── security/                      # Security module
+│   │   ├── ca.go                     # CA certificate management
+│   │   ├── mtls.go                  # mTLS config generator
+│   │   └── signing.go                # RSA-PSS digital signature
+│   ├── server/                        # gRPC service implementation
+│   │   ├── channel_service.go        # Channel service (20+ methods)
+│   │   ├── identity_service.go       # Identity service
+│   │   ├── evidence_service.go       # Evidence service
+│   │   ├── kernel_service.go          # Kernel-to-kernel service
+│   │   ├── multi_kernel_manager.go   # Multi-kernel P2P manager
+│   │   ├── multi_hop_config.go       # Multi-hop config manager
+│   │   └── business_chain_manager.go # Business chain service
+│   ├── tempchat/                      # TempChat module
+│   │   ├── manager.go                # Session manager
+│   │   └── service.go                # gRPC service
+│   └── operator_peer/                 # P2P Operator Peer
+│       ├── packet.go                  # P2P packet codec
+│       ├── server.go                  # P2P server
+│       ├── client.go                  # P2P client (with auto-reconnect)
+│       └── manager.go                 # P2P manager
+├── proto/                            # Protocol Buffers definitions
+│   └── kernel/
+│       └── v1/
+│           ├── kernel.proto          # Kernel-to-kernel service
+│           ├── channel.proto          # Channel service
+│           ├── identity.proto         # Identity service
+│           ├── evidence.proto         # Evidence service
+│           ├── business_chain.proto   # Business chain service
+│           ├── tempchat.proto        # TempChat service
+│           └── operator_peer.proto   # P2P Operator Peer protocol
+├── scripts/                           # Script tools
+│   ├── gen_certs.sh / gen_certs.ps1 # Certificate generation
+│   └── package_all.sh / package_all.ps1 # Packaging
+├── docs/                              # Documentation
+│   └── CORE.md                       # Core module design doc
+├── go.mod                            # Go module definition
+├── go.sum                            # Dependency checksum
+├── Makefile                          # Build script
+└── README.md / README_CN.md         # English/Chinese documentation
+```
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- **Go**: 1.21 or higher
+- **Database**: MySQL 5.7+ (optional, file storage by default)
+- **OS**: Linux / macOS / Windows
+
+### 1. Generate Certificates
+
+```bash
+# Linux/Mac
+./scripts/gen_certs.sh
+
+# Windows
+.\scripts\gen_certs.ps1
+```
+
+### 2. Database Setup (Optional)
+
+```sql
+CREATE DATABASE IF NOT EXISTS trusted_space CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+Then modify database config in `config/kernel.yaml`.
+
+### 3. Start Kernel
+
+```bash
+# Interactive mode (recommended)
+./bin/kernel.exe --config config/kernel.yaml
+
+# Daemon mode
+./bin/kernel.exe --config config/kernel.yaml -daemon
+```
+
+### 4. Start Connector
+
+```bash
+# First run auto-registers and obtains certificate
+./bin/connector.exe --config config/connector.yaml
+```
+
+---
+
+## Interactive Commands
+
+### Kernel Commands
+
+```bash
+# View status
+status
+
+# List connectors
+connectors or cs
+
+# List channels
+channels or ch
+
+# List known kernels
+kernels or ks
+
+# Connect to another kernel
+connect-kernel <kernel_id> <address> <port>
+
+# Approve interconnection request
+approve-request <request_id>
+
+# List pending requests
+pending-requests
+
+# Disconnect kernel
+disconnect-kernel <kernel_id>
+
+# Multi-hop routes
+routes, rt                    # List all routes
+load-route <filename>         # Load route config
+connect-route <route_name>    # Connect specified route
+route-info <route_name>       # View route details
+
+# P2P Operator Peer commands
+connect-peer <kernel_id> <address> <port>  # Connect to operator
+disconnect-peer <kernel_id>                 # Disconnect operator
+peers or ps                               # List connected operators
+peer-info <kernel_id>                      # View operator details
+
+# TempChat commands
+list-sessions                    # List current sessions
+tempchat-connectors              # List connectors with TempChat sessions
+
+# Exit
+exit or quit
+```
+
+### Connector Commands
+
+```bash
+# List connectors
+list or ls
+
+# View connector info
+info <connector_id>
+
+# Create channel (proposal)
+create --config <config_file>
+create --sender <sender_ids> --receiver <receiver_ids> --reason <reason>
+
+# Accept/reject channel proposal
+accept <channel_id> <proposal_id>
+reject <channel_id> <proposal_id> --reason <reason>
+
+# Send data
+sendto <channel_id> [file_path]
+
+# Subscribe to channel
+subscribe <channel_id>
+
+# View joined channels
+channels or ch
+
+# Query evidence records
+query-evidence --channel <channel_id>
+query-evidence --connector <connector_id>
+query-evidence --flow <flow_id>
+
+# Permission management
+request-permission <channel_id> <change_type> <target_id> <reason>
+approve-permission <channel_id> <request_id>
+reject-permission <channel_id> <request_id> <reason>
+list-permissions <channel_id>
+
+# Set status
+status [active|inactive|closed]
+
+# TempChat
+tempchat list                  # List registered TempChat connectors
+tempchat send <connector_id> <message>  # Send temporary message
+tempchat receive               # Receive temporary messages
+
+# Help
+help
+```
+
+---
+
+## Demo: Cross-Kernel Data Transfer
+
+### 1. Environment Setup
+
+```
+┌─────────────────────┐          ┌─────────────────────┐
+│   kernel-1          │          │   kernel-2          │
+│   192.168.31.155    │◄────────►│   192.168.202.136  │
+│   (Windows)         │   mTLS   │   (Linux VM)       │
+└─────────┬───────────┘          └─────────┬───────────┘
+          │                              │
+    connector-A                    connector-U
+```
+
+### 2. Start Services
+
+```bash
+# kernel-1 (Windows)
+.\bin\kernel.exe --config .\config\kernel.yaml
+
+# kernel-2 (Linux)
+./bin/kernel.exe --config config/kernel.yaml
+```
+
+### 3. Establish Interconnection
+
+```bash
+# On kernel-1
+connect-kernel kernel-2 192.168.202.136 50053
+
+# On kernel-2
+approve-request <request_id>
+```
+
+### 4. Connectors Join
+
+```bash
+# On kernel-1
+.\bin\connector.exe --config .\config\connector-A.yaml
+
+# On kernel-2
+./bin/connector.exe --config config/connector-U.yaml
+```
+
+### 5. Create Cross-Kernel Channel
+
+```bash
+# On connector-A
+create --sender connector-A --receiver kernel-2:connector-U --reason "Test data transfer"
+
+# On connector-U
+accept <channel_id> <proposal_id>
+```
+
+### 6. Send Data
+
+```bash
+# On connector-A
+sendto <channel_id>
+# Enter data, type END to finish
+```
+
+### 7. View Evidence
+
+```bash
+# On kernel
+query-evidence --channel <channel_id>
+```
+
 ---
 
 ## Evidence Chain Structure
@@ -529,7 +695,7 @@ Record N:
   TargetID: "kernel-1",
   ChannelID: "channel-uuid",
   DataHash: "sha256(...)",
-  Signature: "RSA signature",
+  Signature: "RSA-PSS signature",
   Hash: "sha256(this record)",
   PrevHash: "hash of Record N-1"
 }
@@ -537,7 +703,7 @@ Record N:
     ↓ Link
 Record N+1:
 {
-  PrevHash: "hash of Record N",  ← Points to previous
+  PrevHash: "hash of Record N",
   Hash: "sha256(this record)"
 }
 ```
@@ -553,10 +719,118 @@ Record N+1:
 | target_id | Target ID (next hop) |
 | channel_id | Associated channel ID |
 | data_hash | Data hash (optional) |
-| signature | Kernel digital signature |
+| signature | Kernel RSA-PSS digital signature |
 | hash | Record content hash |
 | prev_hash | Previous record's hash (hash chain) |
 | metadata | Extended metadata (JSON) |
+
+---
+
+## Business Hash Chain
+
+Connectors can build local business data hash chains for data non-repudiation:
+
+```
+Data Record:
+{
+  DataID: "uuid",
+  Data: "business data content",
+  Hash: "sha256(Data)",
+  Timestamp: "2026-04-10T10:00:00Z",
+  ConnectorID: "connector-A",
+  Signature: "RSA-PSS signature on Hash"
+}
+
+Chain Structure:
+Record 1 → Record 2 → Record 3 → ... → Record N
+  ↓         ↓         ↓               ↓
+PrevHash ← Hash ← Hash ← ... ← Hash ← PrevHash
+```
+
+**gRPC Interface** (`BusinessChainService`):
+- `SubmitHashChain`: Submit business hash chain records
+- `QueryHashChain`: Query business hash chain
+- `VerifyHashChain`: Verify hash chain integrity
+
+---
+
+## P2P Operator Peer Protocol
+
+### Protocol Format
+
+Custom TCP protocol with binary header + JSON payload:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  Header (28 bytes)                                             │
+│  ┌────────┬──────┬────────┬────────┬──────────────────────────┐ │
+│  │ Magic  │ Ver  │ Type  │ Flags │ Reserved (1 byte)        │ │
+│  │ 4 bytes│1 byte│1 byte │1 byte │                          │ │
+│  ├────────┴──────┴────────┴────────┴──────────────────────────┤ │
+│  │ Len (4 bytes, big-endian)    │ TraceID (16 bytes)          │ │
+│  └─────────────────────────────┴───────────────────────────────┘ │
+├────────────────────────────────────────────────────────────────┤
+│  Payload (variable, ≤8MB)                                      │
+│  JSON format message content                                    │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Message Types
+
+| Type | Name | Purpose |
+|------|------|---------|
+| 0x01 | Handshake | Handshake to negotiate kernel ID |
+| 0x02 | SyncConnectors | Sync online connector list |
+| 0x03 | RelayMessage | Relay temporary messages between connectors |
+| 0x04 | Heartbeat | P2P heartbeat keep-alive |
+| 0x05 | Disconnect | Notify disconnection |
+
+---
+
+## Deployment Topology
+
+### Single Node (Test Environment)
+
+```
+┌──────────────────────────────────────┐
+│          Kernel                       │
+│  50051 (Main)  50052 (Bootstrap)     │
+│  50053 (Kernel)  50055 (TempChat)     │
+└──────────────────────────────────────┘
+         ↑ ↑ ↑ ↑
+    Conn-A  Conn-B  Conn-C
+```
+
+### Cluster (Production)
+
+```
+              ┌─────────────┐
+              │Load Balancer │
+              └──────┬───────┘
+                     │
+        ┌────────────┼────────────┐
+        ↓            ↓            ↓
+   Kernel-1      Kernel-2     Kernel-3
+   (50051-53)    (50051-53)   (50051-53)
+   (50055)       (50055)      (50055)
+        └────────────┴────────────┘
+                     │
+            ┌────────┴────────┐
+            ↓                 ↓
+      PostgreSQL         Blockchain
+      (Audit Logs)       (Evidence)
+```
+
+---
+
+## Performance Features
+
+- **Streaming**: gRPC bidirectional streaming, large file chunked transfer
+- **Buffer Queue**: 1000 packets buffer per channel
+- **Concurrent Subscription**: Multiple subscribers per channel
+- **Batch Write**: Batch persistence for evidence operations
+- **Connection Pool**: Reuse gRPC connections
+- **Auto-Reconnect**: P2P client built-in auto-reconnect
 
 ---
 
@@ -565,121 +839,10 @@ Record N+1:
 | Layer | Mechanism |
 |-------|-----------|
 | Transport | TLS 1.3 Encryption |
-| Authentication | mTLS Mutual Authentication |
-| Authorization | Policy Engine Fine-grained Control |
-| Audit | Full Evidence Recording |
-
----
-
-## Project Structure
-
-```
-trusted_space_kernel/
-├── bin/                        # Compiled executables
-│   ├── kernel.exe              # Kernel executable
-│   └── connector.exe           # Connector executable
-├── certs/                      # Certificate directory
-│   ├── ca.crt                  # CA root certificate
-│   ├── kernel.crt              # Kernel certificate
-│   └── ...
-├── channel_configs/            # Channel configuration directory
-├── channels/                   # Channel data directory
-├── config/                     # Configuration files
-│   ├── kernel.yaml            # Kernel configuration
-│   ├── connector.yaml          # Connector configuration
-│   └── ...
-├── connector/                  # Connector implementation
-│   ├── cmd/
-│   │   └── main.go             # Connector entry
-│   └── client/
-│       └── connector.go        # Connector client
-├── docs/                       # Documentation
-│   ├── CORE.md                # Core module documentation
-│   └── MULTI_KERNEL_NETWORK.md # Multi-kernel network documentation
-├── kernel/                     # Kernel implementation
-│   ├── bin/
-│   ├── circulation/            # Circulation module
-│   │   ├── channel_manager.go  # Channel manager
-│   │   └── channel_config.go  # Channel configuration
-│   ├── cmd/
-│   │   └── main.go            # Kernel entry
-│   ├── control/                # Control module
-│   │   ├── policy.go           # Policy engine
-│   │   └── registry.go        # Identity registry
-│   ├── database/               # Database module
-│   │   ├── evidence_store.go   # Evidence storage
-│   │   └── mysql.go           # MySQL support
-│   ├── evidence/              # Evidence module
-│   │   └── audit_log.go       # Audit log
-│   ├── security/              # Security module
-│   │   ├── ca.go              # CA certificate management
-│   │   ├── mtls.go            # mTLS configuration
-│   │   └── signing.go         # Digital signature
-│   └── server/                 # gRPC services
-│       ├── channel_service.go  # Channel service
-│       ├── identity_service.go # Identity service
-│       ├── evidence_service.go # Evidence service
-│       ├── kernel_service.go   # Kernel service
-│       ├── multi_kernel_manager.go    # Multi-kernel manager
-│       └── multi_hop_config.go        # Multi-hop configuration
-├── kernel_configs/             # Multi-hop route configuration
-├── proto/                      # Protocol Buffers definitions
-│   └── kernel/
-│       └── v1/
-│           ├── kernel.proto    # Kernel-to-kernel communication
-│           ├── channel.proto   # Channel service
-│           ├── identity.proto  # Identity service
-│           └── evidence.proto  # Evidence service
-├── scripts/                    # Script tools
-│   ├── gen_certs.sh/ps1       # Certificate generation
-│   ├── quick_start.sh/ps1     # Quick start
-│   └── package_all.sh/ps1     # Packaging tool
-├── go.mod                      # Go module definition
-├── go.sum                      # Dependency checksum
-└── Makefile                    # Build script
-```
-
----
-
-## Configuration
-
-### Kernel Configuration (config/kernel.yaml)
-
-```yaml
-server:
-  address: "0.0.0.0"
-  port: 50051
-
-security:
-  ca_cert_path: "certs/ca.crt"
-  server_cert_path: "certs/kernel.crt"
-  server_key_path: "certs/kernel.key"
-
-evidence:
-  persistent: true
-  log_file_path: "logs/audit.log"
-
-policy:
-  default_allow: true
-```
-
-### Connector Configuration (config/connector.yaml)
-
-```yaml
-connector:
-  id: "connector-A"
-  entity_type: "data_source"
-
-kernel:
-  address: "localhost"
-  port: 50051
-
-security:
-  ca_cert_path: "certs/ca.crt"
-  client_cert_path: "certs/connector-A.crt"
-  client_key_path: "certs/connector-A.key"
-  server_name: "trusted-data-space-kernel"
-```
+| Authentication | mTLS Mutual Authentication (Bootstrap for first registration) |
+| Authorization | Policy Engine fine-grained control (exact match + wildcard) |
+| Audit | Full evidence recording (60+ event types) |
+| Signature | RSA-PSS Digital Signature + SHA-256 Hash Chain |
 
 ---
 
@@ -688,11 +851,17 @@ security:
 ### Build
 
 ```bash
+# Generate Protobuf code
+make proto
+
+# Generate test certificates
+make certs
+
 # Build kernel
-make build-kernel
+make kernel
 
 # Build connector
-make build-connector
+make connector
 
 # Build all
 make build
@@ -719,34 +888,28 @@ make build
 | Permission denied | Check ACL policy configuration |
 | Evidence failure | Auto-fallback to file storage |
 | Cross-kernel forward failure | Retry mechanism, retain original data |
+| P2P connection lost | Auto-reconnect mechanism |
+| TempChat session expired | Heartbeat timeout auto-cleanup |
 
 ---
 
-## Production Deployment Recommendations
+## Extensibility
 
-1. **Certificate Management**
-   - Use formal PKI infrastructure
-   - Regularly rotate certificates
-   - Implement Certificate Revocation List (CRL)
+### Plugin Extensions
 
-2. **Log Storage**
-   - Persist audit logs to distributed storage
-   - Consider blockchain integration for evidence
+```go
+// Policy Plugin
+type PolicyPlugin interface {
+    Name() string
+    CheckPermission(req *PermissionRequest) (bool, error)
+}
 
-3. **High Availability**
-   - Deploy multiple kernel instances
-   - Use load balancer
-   - Implement failover mechanism
-
-4. **Monitoring and Alerting**
-   - Integrate Prometheus/Grafana
-   - Monitor connector online status
-   - Alert on abnormal authentication attempts
-
-5. **Security Hardening**
-   - Enable firewall rules
-   - Implement IP whitelist
-   - Regular security audits
+// Evidence Backend Plugin
+type EvidenceBackend interface {
+    Store(record *EvidenceRecord) error
+    Query(query *Query) ([]*EvidenceRecord, error)
+}
+```
 
 ---
 
@@ -764,9 +927,9 @@ Welcome to submit Issues and Pull Requests!
 
 ## Contact
 
-- Project Maintainer: [Your Name]
-- Email: [your@email.com]
+- Project Maintainer: Trusted Data Space Team
+- Email: trusted-space@example.com
 
 ---
 
-**Note**: The certificates generated by this project are for testing purposes only. Do not use in production environments.
+**Note**: Certificates generated by this project are for testing only. Do not use in production environments.

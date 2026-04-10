@@ -28,18 +28,26 @@
 **可信数据空间内核 (Trusted Space Kernel)** 是一个标准化、轻量化的数据空间核心组件，采用**内核 + 外延 (Kernel + Connector)** 的设计理念。
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                      可信数据空间                              │
-│  ┌──────────┐        ┌──────────┐        ┌──────────┐       │
-│  │  内核-1   │◄──────►│  内核-2   │◄──────►│  内核-3   │       │
-│  │ (kernel) │  mTLS  │ (kernel) │  mTLS  │ (kernel) │       │
-│  └────┬─────┘        └────┬─────┘        └────┬─────┘       │
-│       │                    │                    │             │
-│  ┌────┴────┐          ┌────┴────┐          ┌────┴────┐      │
-│  │连接器A  │          │连接器B  │          │连接器C  │      │
-│  │Connector│          │Connector│          │Connector│      │
-│  └─────────┘          └─────────┘          └─────────┘      │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              可信数据空间                                              │
+│  ┌──────────┐        ┌──────────┐        ┌──────────┐       ┌──────────┐          │
+│  │  内核-1   │◄──────►│  内核-2   │◄──────►│  内核-3   │◄─────►│  内核-N   │          │
+│  │ (kernel) │  mTLS  │ (kernel) │  mTLS  │ (kernel) │  mTLS  │ (kernel) │          │
+│  │ :50051   │        │ :50051   │        │ :50051   │        │ :50051   │          │
+│  │ :50052   │        │ :50052   │        │ :50052   │        │ :50052   │          │
+│  │ :50053   │        │ :50053   │        │ :50053   │        │ :50053   │          │
+│  │ :50055   │        │ :50055   │        │ :50055   │        │ :50055   │          │
+│  └────┬─────┘        └────┬─────┘        └────┬─────┘        └────┬─────┘          │
+│       │                    │                    │                    │                │
+│  ┌────┴────┐          ┌────┴────┐          ┌────┴────┐          ┌────┴────┐        │
+│  │连接器A  │          │连接器B  │          │连接器C  │          │连接器X  │        │
+│  └─────────┘          └─────────┘          └─────────┘          └─────────┘        │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+说明：流通调度模块 (Circulation) 包含三大能力：
+  - 频道管理：逻辑数据传输管道，发布-订阅模式
+  - 临时会话：无需建立正式频道的轻量级临时通信（TempChat）
+  - P2P 运维直连：运维方直接 TCP 连接，同步连接器/转发消息（Operator Peer）
 ```
 
 ### 1.2 核心能力
@@ -47,10 +55,12 @@
 | 能力 | 说明 |
 |------|------|
 | **互联互通** | 支持跨组织、跨系统的数据流通 |
-| **安全底座** | mTLS 双向认证 + RSA 数字签名 + 哈希链 |
+| **安全底座** | mTLS 双向认证 + RSA-PSS 数字签名 + SHA-256 哈希链 |
 | **完整存证** | 60+ 事件类型，覆盖数据传输全生命周期 |
 | **多内核网络** | P2P 形态的多内核分布式网络 |
 | **多跳路由** | 支持通过中间内核转发数据 |
+| **临时会话** | 连接器间无需正式频道的轻量级临时通信 |
+| **P2P 运维直连** | 运维方直接 TCP 连接，同步连接器列表和临时消息 |
 
 ### 1.3 端口配置
 
@@ -59,6 +69,7 @@
 | **50051** | 主服务端口（连接器服务） | mTLS |
 | **50052** | 引导服务端口（首次注册） | TLS（无需客户端证书） |
 | **50053** | 内核间通信端口 | mTLS |
+| **50055** | TempChat 服务端口（临时会话） | gRPC |
 
 ---
 
@@ -94,7 +105,7 @@ require (
 |------|------|
 | TLS 1.3 | 传输层加密 |
 | mTLS | 双向证书认证 |
-| RSA-PSS | 数字签名 |
+| RSA-PSS | 数字签名（替代 PKCS#1 v1.5） |
 | SHA-256 | 哈希计算 |
 | 哈希链 | 存证记录防篡改 |
 
@@ -104,85 +115,103 @@ require (
 
 ```
 trusted_space_kernel/
-├── bin/                           # 编译后的可执行文件
-│   ├── kernel.exe                 # 内核可执行文件
-│   └── connector.exe              # 连接器可执行文件
+├── bin/                              # 编译后的可执行文件
+│   ├── kernel.exe                   # 内核可执行文件
+│   └── connector.exe               # 连接器可执行文件
 │
-├── certs/                         # 证书目录
-│   ├── ca.crt / ca.key           # CA 根证书
-│   ├── kernel.crt / kernel.key   # 内核证书
-│   └── connector-*.crt/key       # 连接器证书
+├── certs/                            # 证书目录
+│   ├── ca.crt / ca.key             # CA 根证书
+│   ├── kernel.crt / kernel.key     # 内核证书
+│   └── connector-*.crt/key         # 连接器证书
 │
-├── config/                        # 配置文件目录
-│   ├── kernel.yaml               # 内核配置
-│   ├── connector.yaml            # 连接器配置
-│   └── connector-*.yaml          # 多连接器配置
+├── config/                            # 配置文件目录
+│   ├── kernel.yaml                 # 内核配置
+│   ├── connector.yaml              # 连接器 A 配置
+│   ├── connector-B.yaml            # 连接器 B 配置
+│   ├── connector-C.yaml            # 连接器 C 配置
+│   └── connector-X.yaml            # 连接器 X 配置
 │
-├── kernel_configs/                # 多跳路由配置
-│   └── multi-hop-route-*.json
+├── channels/                         # 频道数据目录
+│   └── {connector-id}/             # 每个连接器一个子目录
+│       ├── channel-{id}.json      # 频道元数据
+│       └── data/                   # 数据文件
 │
-├── logs/                          # 日志目录
+├── kernel_configs/                    # 多跳路由配置
+│   └── multi-hop-route-*.json       # 多跳路由 JSON 配置
 │
-├── connector/                     # 连接器模块（外延层）
+├── logs/                              # 日志目录
+│
+├── connector/                         # 连接器模块（外延层）
 │   ├── cmd/
-│   │   └── main.go               # 连接器入口 (1676行)
+│   │   └── main.go                 # 连接器入口 (2118 行)
 │   ├── client/
-│   │   ├── connector.go          # 连接器核心客户端 (2196行)
-│   │   └── tls.go                # TLS 配置
-│   └── database/
-│       ├── store.go              # 本地存储
-│       ├── hash_chain.go         # 业务哈希链
-│       └── mysql.go              # 数据库支持
+│   │   ├── connector.go            # 连接器核心客户端 (2196 行)
+│   │   └── tls.go                  # TLS 配置
+│   ├── database/
+│   │   ├── store.go                # 本地存储
+│   │   ├── hash_chain.go           # 业务哈希链（RSA 签名）
+│   │   └── mysql.go                # 数据库支持
+│   └── tempchat/
+│       └── client.go               # 临时会话客户端
 │
-├── kernel/                        # 内核模块（核心层）
+├── kernel/                           # 内核模块（核心层）
 │   ├── cmd/
-│   │   └── main.go               # 内核入口 (1239行)
-│   ├── circulation/              # 流通调度模块
-│   │   ├── channel_manager.go    # 频道管理器 (3184行)
-│   │   └── channel_config.go     # 频道配置
-│   ├── control/                  # 管控模块
-│   │   ├── registry.go           # 身份注册表
-│   │   └── policy.go            # 权限策略
-│   ├── database/                 # 数据库模块
-│   │   ├── mysql.go             # MySQL 连接
-│   │   ├── evidence_store.go    # 证据存储
-│   │   └── business_chain_store.go  # 业务哈希链存储
-│   ├── evidence/                 # 存证模块
-│   │   └── audit_log.go         # 审计日志
-│   ├── security/                 # 安全模块
-│   │   ├── ca.go                # CA 证书管理
-│   │   ├── mtls.go              # mTLS 配置
-│   │   └── signing.go          # 数字签名
-│   └── server/                   # gRPC 服务实现
-│       ├── channel_service.go    # 频道服务 (2950行)
-│       ├── identity_service.go   # 身份服务
-│       ├── evidence_service.go   # 存证服务
-│       ├── kernel_service.go     # 内核间服务
-│       ├── multi_kernel_manager.go    # 多内核管理 (1974行)
-│       ├── multi_hop_config.go         # 多跳配置
-│       └── business_chain_manager.go   # 业务哈希链管理
+│   │   └── main.go                 # 内核入口 (1505 行)
+│   ├── circulation/                 # 流通调度模块
+│   │   ├── channel_manager.go      # 频道管理器 (3184 行)
+│   │   └── channel_config.go       # 频道配置管理器
+│   ├── control/                     # 管控模块
+│   │   ├── registry.go             # 身份注册表
+│   │   └── policy.go               # 权限策略
+│   ├── database/                    # 数据库模块
+│   │   ├── mysql.go                # MySQL 连接
+│   │   ├── evidence_store.go       # 证据存储
+│   │   └── business_chain_store.go # 业务哈希链存储
+│   ├── evidence/                    # 存证模块
+│   │   └── audit_log.go            # 审计日志（60+ 事件类型）
+│   ├── security/                    # 安全模块
+│   │   ├── ca.go                   # CA 证书管理
+│   │   ├── mtls.go                 # mTLS 配置
+│   │   └── signing.go              # RSA-PSS 数字签名
+│   ├── server/                      # gRPC 服务实现
+│   │   ├── channel_service.go      # 频道服务 (2950 行)
+│   │   ├── identity_service.go     # 身份服务
+│   │   ├── evidence_service.go     # 存证服务
+│   │   ├── kernel_service.go       # 内核间服务
+│   │   ├── multi_kernel_manager.go # 多内核管理 (1974 行)
+│   │   ├── multi_hop_config.go     # 多跳配置
+│   │   └── business_chain_manager.go # 业务哈希链管理
+│   ├── tempchat/                    # 临时会话模块
+│   │   ├── manager.go              # 会话管理器 (561 行)
+│   │   └── service.go              # gRPC 服务端
+│   └── operator_peer/               # P2P 运维方直连
+│       ├── packet.go               # P2P 数据包编解码
+│       ├── server.go               # P2P 服务端
+│       ├── client.go               # P2P 客户端（支持自动重连）
+│       └── manager.go              # P2P 管理器
 │
-├── proto/kernel/v1/               # Protocol Buffers 定义
-│   ├── kernel.proto              # 内核间通信
-│   ├── channel.proto             # 频道服务
-│   ├── identity.proto            # 身份服务
-│   ├── evidence.proto            # 存证服务
-│   └── business_chain.proto      # 业务哈希链
+├── proto/kernel/v1/                  # Protocol Buffers 定义
+│   ├── kernel.proto                # 内核间通信
+│   ├── channel.proto               # 频道服务
+│   ├── identity.proto              # 身份服务
+│   ├── evidence.proto              # 存证服务
+│   ├── business_chain.proto        # 业务哈希链
+│   ├── tempchat.proto             # 临时会话服务
+│   └── operator_peer.proto        # P2P 运维方直连协议
 │
-├── scripts/                       # 工具脚本
+├── scripts/                          # 工具脚本
 │   ├── gen_certs.sh / gen_certs.ps1
 │   ├── quick_start.sh / quick_start.ps1
 │   └── package_all.sh / package_all.ps1
 │
-├── docs/                          # 文档
-│   ├── CORE.md                  # 核心模块说明
-│   └── MULTI_KERNEL_NETWORK.md  # 多内核网络说明
+├── docs/                             # 文档
+│   └── CORE.md                     # 核心模块说明
 │
-├── go.mod                         # Go 模块定义
-├── go.sum                         # 依赖校验
-├── Makefile                       # 构建脚本
-├── README.md                      # 英文文档
-└── README_CN.md                   # 中文文档
+├── go.mod                            # Go 模块定义
+├── go.sum                            # 依赖校验
+├── Makefile                          # 构建脚本
+├── README.md                         # 英文文档
+└── README_CN.md                      # 中文文档
 ```
 
 ---
@@ -197,6 +226,8 @@ trusted_space_kernel/
 - 数据传输路由
 - 存证记录
 - 多内核互联
+- 临时会话（TempChat）
+- P2P 运维方直连
 
 ### 4.2 连接器 (Connector)
 
@@ -205,6 +236,7 @@ trusted_space_kernel/
 - 创建/订阅频道
 - 发送/接收数据
 - 管理本地业务哈希链
+- 支持临时会话通信
 
 ### 4.3 频道 (Channel)
 
@@ -228,7 +260,45 @@ type Channel struct {
 proposed (提议) ──[所有参与方确认]──> active (活跃) ──[关闭]──> closed
 ```
 
-### 4.4 跨内核 ID 格式
+### 4.4 临时会话 (TempChat)
+
+临时会话是连接器间**无需建立正式频道**的轻量级通信机制，用于运维消息、调试命令等场景：
+
+- **会话注册**：连接器向内核 TempChat 服务注册会话
+- **心跳保活**：通过心跳保持会话活跃
+- **消息收发**：支持实时双向消息
+- **跨内核路由**：消息可跨内核转发到目标连接器
+
+**架构**：
+
+```
+Connector ↔ TempChatService (gRPC, port 50055) ↔ TempChatManager (内存)
+                                    ↓
+                         跨内核转发（gRPC ForwardTempMessage / P2P RelayMessage）
+```
+
+### 4.5 P2P 运维方直连 (Operator Peer)
+
+运维方之间的直接 TCP 连接，用于同步在线连接器列表和转发临时消息：
+
+- **按需连接**：不预连接，需要时建立
+- **自定义协议**：二进制包头 + JSON 载荷
+- **自动重连**：内置重连机制
+- **连接器同步**：通过 `SyncConnectors` 消息同步在线连接器
+
+**协议格式**：
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  包头 (28 字节)                                                 │
+│  Magic(4) + Ver(1) + Type(1) + Flags(1) + Reserved(1)        │
+│  Len(4) + TraceID(16)                                          │
+├────────────────────────────────────────────────────────────────┤
+│  载荷 (变长, ≤8MB) - JSON 格式                                   │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 4.6 跨内核 ID 格式
 
 当参与者位于远端内核时，使用 `kernelID:connectorID` 格式：
 
@@ -247,7 +317,7 @@ if strings.Contains(id, ":") {
 }
 ```
 
-### 4.5 连接器状态
+### 4.7 连接器状态
 
 ```go
 const (
@@ -283,11 +353,17 @@ tlsConfig := &tls.Config{
 
 #### 数字签名 (`signing.go`)
 ```go
-// RSA-PSS 签名
+// RSA-PSS 签名（推荐使用）
 func SignData(data []byte, privateKey *rsa.PrivateKey) (string, error) {
     hash := sha256.Sum256(data)
     signature, err := rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, hash[:], nil)
     return base64.StdEncoding.EncodeToString(signature), err
+}
+
+// RSA-PSS 验签
+func VerifySignature(data []byte, signature []byte, publicKey *rsa.PublicKey) error {
+    hash := sha256.Sum256(data)
+    return rsa.VerifyPSS(publicKey, crypto.SHA256, hash[:], signature, nil)
 }
 ```
 
@@ -314,14 +390,15 @@ func (r *Registry) IsOnline(connectorID string) bool {
 
 ### 5.3 流通调度模块 (`kernel/circulation/`)
 
-#### 频道管理器 (`channel_manager.go`)
+#### 5.3.1 频道管理 (`channel_manager.go`)
 ```go
 type ChannelManager struct {
-    channels            map[string]*Channel
-    forwardToKernel    func(kernelID string, packet *DataPacket, isFinal bool) error
-    signForForward      func(dataHash, prevSignature string) (string, error)
-    GetNextHopKernel    func(currentKernelID, targetKernelID string) (...) bool
-    kernelID            string  // 当前内核ID
+    mu                   sync.RWMutex
+    channels             map[string]*Channel
+    forwardToKernel      func(kernelID string, packet *DataPacket, isFinal bool) error
+    signForForward       func(dataHash, prevSignature string) (string, error)
+    GetNextHopKernel     func(currentKernelID, targetKernelID string) (...) bool
+    kernelID             string  // 当前内核ID
 }
 ```
 
@@ -331,6 +408,149 @@ type ChannelManager struct {
 - 数据缓冲（离线暂存）
 - 跨内核转发
 - 多跳路由
+
+#### 5.3.2 临时会话 (`kernel/tempchat/`)
+
+**会话管理器** (`manager.go`)：
+```go
+type TempChatManager struct {
+    mu               sync.RWMutex
+    sessions         map[string]*TempChatSession  // key: connectorID
+    remoteConnectors map[string][]string           // key: kernelID, value: connectorIDs
+    deliverCallback  func(fromKernelID, fromConnectorID, toConnectorID, message string) error
+}
+```
+
+**核心功能**：
+- `RegisterSession`：注册临时会话
+- `HeartbeatSession`：会话心跳保活
+- `UnregisterSession`：注销会话
+- `RouteMessage`：路由消息（本地 vs 跨内核）
+- `SetRemoteConnectors`：设置远程内核连接器列表
+
+**gRPC 服务端** (`service.go`)：
+
+实现 `TempChatServiceServer` 接口（8 个 RPC 方法）：
+
+```protobuf
+service TempChatService {
+    rpc RegisterSession(RegisterSessionRequest) returns (RegisterSessionResponse);
+    rpc HeartbeatSession(HeartbeatSessionRequest) returns (HeartbeatSessionResponse);
+    rpc UnregisterSession(UnregisterSessionRequest) returns (UnregisterSessionResponse);
+    rpc ListOnlineConnectors(ListOnlineConnectorsRequest) returns (ListOnlineConnectorsResponse);
+    rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+    rpc ReceiveMessage(ReceiveMessageRequest) returns (stream Message);
+    rpc ForwardTempMessage(ForwardTempMessageRequest) returns (ForwardTempMessageResponse);
+    rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+}
+```
+
+#### 5.3.3 P2P 运维方直连 (`kernel/operator_peer/`)
+
+**协议常量** (`packet.go`)：
+```go
+const (
+    Magic      = "TSKP"                   // 4 字节魔数
+    Version    = 1                         // 协议版本
+    MaxMsgSize = 8 * 1024 * 1024          // 最大消息 8MB
+)
+
+const (
+    PacketTypeHandshake      = 0x01
+    PacketTypeSyncConnectors = 0x02
+    PacketTypeRelayMessage   = 0x03
+    PacketTypeHeartbeat      = 0x04
+    PacketTypeDisconnect     = 0x05
+)
+```
+
+**数据包结构**：
+```go
+type Packet struct {
+    Magic    [4]byte  // "TSKP"
+    Version  uint8
+    Type     uint8
+    Flags    uint8
+    Reserved uint8
+    Len      uint32  // big-endian
+    TraceID  [16]byte
+    Payload  []byte // JSON
+}
+```
+
+**Payload 结构体**：
+```go
+// Handshake
+type HandshakePayload struct {
+    KernelID string `json:"kernel_id"`
+    Version  string `json:"version"`
+}
+
+// SyncConnectors
+type SyncConnectorsPayload struct {
+    Connectors []ConnectorInfo `json:"connectors"`
+}
+
+// RelayMessage
+type RelayMessagePayload struct {
+    FromConnector string `json:"from_connector"`
+    ToConnector   string `json:"to_connector"`
+    Message       string `json:"message"`
+    Timestamp     string `json:"timestamp"`
+    MessageID     string `json:"message_id"`
+}
+```
+
+**P2P 服务端** (`server.go`)：
+```go
+type P2PServer struct {
+    listener net.Listener
+    handler  PacketHandler
+    kernelID string
+}
+
+type PeerConnection struct {
+    conn       net.Conn
+    kernelID   string
+    remoteID   string
+    sendChan   chan []byte
+    lastActive time.Time
+}
+```
+
+**P2P 客户端** (`client.go`)：
+```go
+// 基础客户端
+type PeerClient struct {
+    conn     net.Conn
+    kernelID string
+}
+
+// 带自动重连的客户端
+type PeerClientWithReconnect struct {
+    PeerClient
+    maxRetries    int
+    retryInterval time.Duration
+    onDisconnect  func()
+}
+```
+
+**P2P 管理器** (`manager.go`)：
+```go
+type P2PManager struct {
+    server          *P2PServer
+    kernelID        string
+    kernelProvider  KernelInfoProvider  // 获取内核地址
+    clients         map[string]*PeerClient  // 已连接的对端
+    mu              sync.RWMutex
+    messageCallback func(fromKernelID string, message []byte) error
+}
+```
+
+**核心功能**：
+- `EnsurePeerConnected`：按需连接（不预连接）
+- `BroadcastConnectors`：广播连接器列表
+- `RelayMessage`：转发临时消息
 
 ### 5.4 存证模块 (`kernel/evidence/`)
 
@@ -345,6 +565,7 @@ type ChannelManager struct {
 | 频道 | CHANNEL_PROPOSED, CHANNEL_ACCEPTED, CHANNEL_CREATED, CHANNEL_CLOSED |
 | 数据 | DATA_SEND, DATA_RECEIVE, ACK_RECEIVED |
 | 权限 | PERMISSION_REQUESTED, PERMISSION_GRANTED, PERMISSION_REJECTED |
+| 临时会话 | TEMPCHAT_REGISTERED, TEMPCHAT_MESSAGE_SENT, TEMPCHAT_MESSAGE_RECEIVED |
 
 **哈希链结构**：
 ```go
@@ -356,7 +577,7 @@ type EvidenceRecord struct {
     TargetID   string  // 直接下一跳
     ChannelID  string
     DataHash   string  // SHA-256
-    Signature  string  // RSA 签名
+    Signature  string  // RSA-PSS 签名
     Hash       string  // 记录内容哈希
     PrevHash   string  // 上一条记录哈希
 }
@@ -451,28 +672,26 @@ service ChannelService {
     // 数据传输
     rpc StreamData (stream DataPacket) returns (stream TransferStatus);  // 上传
     rpc SubscribeData (SubscribeRequest) returns (stream DataPacket);       // 下载
-    
+
     // 频道管理
     rpc CreateChannel (CreateChannelRequest) returns (CreateChannelResponse);
     rpc CloseChannel (CloseChannelRequest) returns (CloseChannelResponse);
     rpc GetChannelInfo (GetChannelInfoRequest) returns (GetChannelInfoResponse);
-    
+
     // 频道协商（两阶段）
     rpc ProposeChannel (ProposeChannelRequest) returns (ProposeChannelResponse);
     rpc AcceptChannelProposal (AcceptChannelProposalRequest) returns (AcceptChannelProposalResponse);
     rpc RejectChannelProposal (RejectChannelProposalRequest) returns (RejectChannelProposalResponse);
-    
+
     // 订阅申请（频道外连接器）
     rpc RequestChannelSubscription (RequestChannelSubscriptionRequest) returns (RequestChannelSubscriptionResponse);
     rpc ApproveChannelSubscription (ApproveChannelSubscriptionRequest) returns (ApproveChannelSubscriptionResponse);
-    
+    rpc RejectChannelSubscription (RejectChannelSubscriptionRequest) returns (RejectChannelSubscriptionResponse);
+
     // 权限变更
     rpc RequestPermissionChange (RequestPermissionChangeRequest) returns (RequestPermissionChangeResponse);
     rpc ApprovePermissionChange (ApprovePermissionChangeRequest) returns (ApprovePermissionChangeResponse);
-    rpc GetPermissionRequests (GetPermissionRequestsRequest) returns (GetPermissionRequestsResponse);
-    
-    // ACK
-    rpc SendAck (AckPacket) returns (SendAckResponse);
+    rpc RejectPermissionChange (RejectPermissionChangeRequest) returns (RejectPermissionChangeResponse);
 }
 ```
 
@@ -518,15 +737,6 @@ service EvidenceService {
 }
 ```
 
-**调用示例**：
-```go
-// 查询存证记录
-resp, err := evidenceSvc.QueryEvidence(ctx, &pb.QueryRequest{
-    ChannelId: channelID,
-    Limit:     50,
-})
-```
-
 ### 6.4 内核服务 (KernelService)
 
 ```protobuf
@@ -539,10 +749,65 @@ service KernelService {
     rpc ForwardData (ForwardDataRequest) returns (ForwardDataResponse);
     rpc GetCrossKernelChannelInfo (GetCrossKernelChannelInfoRequest) returns (GetCrossKernelChannelInfoResponse);
     rpc SyncConnectorInfo (SyncConnectorInfoRequest) returns (SyncConnectorInfoResponse);
+    rpc ForwardTempMessage (ForwardTempMessageRequest) returns (ForwardTempMessageResponse);  // 临时会话跨内核转发
 }
 ```
 
-### 6.5 数据包格式 (DataPacket)
+### 6.5 业务哈希链服务 (BusinessChainService)
+
+```protobuf
+service BusinessChainService {
+    rpc SubmitHashChain (SubmitHashChainRequest) returns (SubmitHashChainResponse);
+    rpc QueryHashChain (QueryHashChainRequest) returns (QueryHashChainResponse);
+    rpc VerifyHashChain (VerifyHashChainRequest) returns (VerifyHashChainResponse);
+}
+```
+
+### 6.6 临时会话服务 (TempChatService)
+
+```protobuf
+service TempChatService {
+    rpc RegisterSession (RegisterSessionRequest) returns (RegisterSessionResponse);
+    rpc HeartbeatSession (HeartbeatSessionRequest) returns (HeartbeatSessionResponse);
+    rpc UnregisterSession (UnregisterSessionRequest) returns (UnregisterSessionResponse);
+    rpc ListOnlineConnectors (ListOnlineConnectorsRequest) returns (ListOnlineConnectorsResponse);
+    rpc SendMessage (SendMessageRequest) returns (SendMessageResponse);
+    rpc ReceiveMessage (ReceiveMessageRequest) returns (stream Message);
+    rpc ForwardTempMessage (ForwardTempMessageRequest) returns (ForwardTempMessageResponse);
+    rpc ListSessions (ListSessionsRequest) returns (ListSessionsResponse);
+}
+```
+
+**调用示例**：
+
+```go
+// 1. 注册会话
+resp, err := tempChatSvc.RegisterSession(ctx, &pb.RegisterSessionRequest{
+    ConnectorId:  "connector-A",
+    SessionKey:   "session-secret-key",
+})
+
+// 2. 发送消息
+_, err = tempChatSvc.SendMessage(ctx, &pb.SendMessageRequest{
+    FromConnector: "connector-A",
+    ToConnector:   "connector-B",
+    Message:       "临时消息内容",
+})
+
+// 3. 接收消息（流）
+stream, err := tempChatSvc.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+    ConnectorId: "connector-B",
+})
+for {
+    msg, err := stream.Recv()
+    if err == io.EOF {
+        break
+    }
+    fmt.Printf("收到消息: %s\n", msg.Message)
+}
+```
+
+### 6.7 数据包格式 (DataPacket)
 
 ```protobuf
 message DataPacket {
@@ -716,9 +981,32 @@ func (nm *NotificationManager) Notify(receiverID string, notification *pb.Channe
 ┌─────────────────────────────────────────┐
 │    业务数据哈希链 (connector/database)    │
 │  dataHash = SHA256(data + prevHash)      │
-│  signature = HEX(dataHash + prevSig)    │
+│  signature = HEX(dataHash + prevSig)     │
 │  用于：数据传输完整性证明                  │
 └─────────────────────────────────────────┘
+```
+
+### 8.4 按需连接模式（P2P）
+
+```go
+// P2PManager 不预连接所有节点
+func (m *P2PManager) EnsurePeerConnected(kernelID string, caller string) error {
+    m.mu.RLock()
+    client, exists := m.clients[kernelID]
+    m.mu.RUnlock()
+
+    if exists {
+        return nil  // 已连接
+    }
+
+    // 按需建立连接
+    addr, err := m.kernelProvider.GetKernelAddress(kernelID)
+    if err != nil {
+        return err
+    }
+
+    return m.connectToPeer(kernelID, addr)
+}
 ```
 
 ---
@@ -745,6 +1033,7 @@ func (nm *NotificationManager) Notify(receiverID string, notification *pb.Channe
 |------|------|----------|
 | 连接器 → 内核 | 15秒 | 30秒离线 |
 | 内核 → 内核 | 60秒 | 可配置 |
+| 连接器 → TempChat | 30秒 | 60秒会话失效 |
 
 **状态恢复逻辑**：
 ```go
@@ -783,7 +1072,7 @@ record := &database.BusinessChainRecord{
 ```
 提议者 ──ProposeChannel──> 状态: proposed
          <──ProposalID──
-所有参与方 ──AcceptChannelProposal──> 
+所有参与方 ──AcceptChannelProposal──>
                               全部确认后
                               状态: active
 ```
@@ -816,6 +1105,14 @@ type PendingHopInfo struct {
 }
 ```
 
+### 9.8 P2P 运维方直连注意事项
+
+1. **协议魔数**：所有数据包以 "TSKP" (Trusted Space Kernel Protocol) 开头
+2. **字节序**：长度字段使用 big-endian
+3. **TraceID**：16 字节，用于请求追踪
+4. **自动重连**：客户端内置指数退避重连
+5. **消息路由**：优先尝试本地路由，失败后跨内核转发
+
 ---
 
 ## 10. 扩展开发指南
@@ -835,7 +1132,7 @@ const (
 
 ```go
 auditLog.SubmitBasicEvidenceWithMetadata(
-    sourceID, EventTypeYourNewEvent, channelID, dataHash, 
+    sourceID, EventTypeYourNewEvent, channelID, dataHash,
     evidence.DirectionInternal, targetID, flowID, metadata,
 )
 ```
@@ -887,7 +1184,37 @@ yourSvc := server.NewYourServiceServer(/* dependencies */)
 pb.RegisterYourServiceServer(grpcServer, yourSvc)
 ```
 
-### 10.3 添加新频道状态
+### 10.3 添加 P2P 消息类型
+
+**步骤 1**：在 `kernel/operator_peer/packet.go` 添加类型常量：
+
+```go
+const (
+    PacketTypeYourMessage = 0x06  // 新消息类型
+)
+```
+
+**步骤 2**：定义 Payload 结构体：
+
+```go
+type YourPayload struct {
+    Field1 string `json:"field_1"`
+    Field2 int    `json:"field_2"`
+}
+```
+
+**步骤 3**：在 `P2PServer.handlePacket()` 添加处理逻辑：
+
+```go
+case PacketTypeYourMessage:
+    var payload YourPayload
+    if err := json.Unmarshal(packet.Payload, &payload); err != nil {
+        return err
+    }
+    return s.handleYourMessage(conn, &payload)
+```
+
+### 10.4 添加新频道状态
 
 **步骤 1**：在 `kernel/circulation/channel_manager.go`：
 
@@ -905,7 +1232,7 @@ const (
 
 **步骤 2**：更新状态转换逻辑
 
-### 10.4 添加新配置项
+### 10.5 添加新配置项
 
 **步骤 1**：在 `config/kernel.yaml` 添加配置：
 
@@ -965,6 +1292,18 @@ type Config struct {
 2. 检查多跳路由配置
 3. 查看两端内核日志中的 `KernelService` 相关日志
 
+### 11.6 临时会话问题
+
+1. 检查 TempChat 端口 (50055) 是否可达
+2. 检查连接器是否已注册会话
+3. 查看内核日志中的 `TempChat` 相关日志
+
+### 11.7 P2P 连接问题
+
+1. 检查目标内核地址是否可达
+2. 查看 P2P 日志中的 `PeerConnection` 相关日志
+3. 检查防火墙是否允许 TCP 连接
+
 ---
 
 ## 附录 A：配置文件模板
@@ -979,6 +1318,14 @@ kernel:
 server:
   address: "0.0.0.0"
   port: 50051
+
+tempchat:
+  enabled: true
+  port: 50055
+
+p2p:
+  enabled: true
+  port: 50056
 
 multi_kernel:
   kernel_port: 50053
@@ -1025,6 +1372,10 @@ kernel:
   address: "localhost"
   port: 50051
 
+tempchat:
+  enabled: true
+  port: 50055
+
 security:
   ca_cert_path: "certs/ca.crt"
   client_cert_path: "certs/connector-A.crt"
@@ -1051,6 +1402,19 @@ kernels / ks        - 列出已知内核
 connect-kernel <id> <addr> <port>  - 连接其他内核
 approve-request <id>                - 批准互联请求
 routes / rt        - 列出多跳路由
+load-route <filename>               - 加载路由配置
+connect-route <route_name>         - 连接指定路由
+
+# P2P 运维方直连
+connect-peer <kernel_id> <addr> <port>  - 连接运维方
+disconnect-peer <kernel_id>             - 断开运维方
+peers / ps                               - 列出已连接的运维方
+peer-info <kernel_id>                    - 查看运维方详情
+
+# 临时会话
+list-sessions                - 列出当前会话
+tempchat-connectors          - 列出已注册临时会话的连接器
+
 exit / quit        - 退出
 ```
 
@@ -1065,6 +1429,12 @@ subscribe <ch_id>            - 订阅频道
 channels / ch                - 查看参与的频道
 query-evidence --channel <id> - 查询存证
 status [active|inactive]     - 查看/设置状态
+
+# 临时通信
+tempchat list                  - 查看已注册的临时会话连接器
+tempchat send <connector_id> <message>  - 发送临时消息
+tempchat receive               - 接收临时消息
+
 help                        - 帮助
 ```
 
@@ -1093,11 +1463,17 @@ help                        - 帮助
 ### Token 事件
 - TOKEN_GENERATED, TOKEN_VALIDATED, TOKEN_EXPIRED
 
+### 临时会话事件
+- TEMPCHAT_REGISTERED, TEMPCHAT_UNREGISTERED, TEMPCHAT_HEARTBEAT, TEMPCHAT_MESSAGE_SENT, TEMPCHAT_MESSAGE_RECEIVED, TEMPCHAT_FORWARDED
+
+### P2P 运维事件
+- OPERATOR_CONNECTED, OPERATOR_DISCONNECTED, OPERATOR_HANDSHAKE, OPERATOR_SYNC_CONNECTORS, OPERATOR_RELAY_MESSAGE
+
 ### 系统事件
 - SYSTEM_STARTUP, SYSTEM_SHUTDOWN, CONFIG_CHANGED, POLICY_VIOLATION
 
 ---
 
-*文档版本：v1.0*
-*最后更新：2026-03-31*
+*文档版本：v1.1*
+*最后更新：2026-04-10*
 *项目：可信数据空间内核 (Trusted Space Kernel)*

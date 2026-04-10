@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-func loadTLSConfig(caCertPath, clientCertPath, clientKeyPath, serverName string) (*tls.Config, error) {
+func LoadTLSConfig(caCertPath, clientCertPath, clientKeyPath, serverName string) (*tls.Config, error) {
 	// 加载 CA 证书
 	caCert, err := os.ReadFile(caCertPath)
 	if err != nil {

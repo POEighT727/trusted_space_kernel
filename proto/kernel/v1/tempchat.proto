@@ -1,0 +1,182 @@
+syntax = "proto3";
+
+package trusted_space.kernel.v1;
+
+option go_package = "github.com/trusted-space/kernel/api/v1;kernelv1";
+
+// ================================================================
+// 临时会话服务 (TempChat Service)
+// ================================================================
+// 对应文档中的"选项C"模式 - 连接器通过运维方进行临时通信
+// 运维方作为消息中转站，连接器都与各自的运维方保持TCP连接
+
+service TempChatService {
+  // 连接器注册临时会话
+  // 连接器启动时调用，上报自己的地址信息（IP:Port）
+  rpc RegisterTempSession(RegisterTempSessionRequest) returns (RegisterTempSessionResponse);
+
+  // 连接器心跳保活
+  // 连接器定期调用，证明自己仍然在线
+  rpc TempSessionHeartbeat(TempSessionHeartbeatRequest) returns (TempSessionHeartbeatResponse);
+
+  // 连接器注销会话
+  // 连接器关闭时调用，清理注册信息
+  rpc UnregisterTempSession(UnregisterTempSessionRequest) returns (UnregisterTempSessionResponse);
+
+  // 查询在线连接器
+  // 查看本内核和跨内核的在线连接器列表（用于 ls 命令展示）
+  rpc ListOnlineConnectors(ListOnlineConnectorsRequest) returns (ListOnlineConnectorsResponse);
+
+  // 发送临时消息（连接器 -> 运维方）
+  // 连接器通过运维方发送消息给目标连接器
+  rpc SendTempMessage(SendTempMessageRequest) returns (SendTempMessageResponse);
+
+  // 接收临时消息（流式，运维方 -> 连接器）
+  // 连接器订阅来自运维方的消息推送
+  rpc ReceiveTempMessage(ReceiveTempMessageRequest) returns (stream TempMessage);
+
+  // 运维方之间同步在线连接器列表
+  // 用于跨内核查询在线连接器
+  rpc SyncOnlineConnectors(SyncOnlineConnectorsRequest) returns (SyncOnlineConnectorsResponse);
+
+  // 运维方之间转发消息
+  // 当目标连接器在远端内核时，通过运维方间通道转发
+  rpc ForwardTempMessage(ForwardTempMessageRequest) returns (ForwardTempMessageResponse);
+}
+
+// ================================================================
+// 消息定义
+// ================================================================
+
+// 连接器临时会话注册请求
+message RegisterTempSessionRequest {
+  string connector_id = 1;      // 连接器ID
+  string kernel_id = 2;       // 连接器所属内核ID
+  string address = 3;          // 连接器IP地址
+  int32 port = 4;             // 连接器监听端口
+  string entity_type = 5;     // 连接器实体类型
+  bool expose_to_others = 6;  // 是否向其他内核暴露
+}
+
+// 连接器临时会话注册响应
+message RegisterTempSessionResponse {
+  bool success = 1;
+  string session_id = 2;       // 分配的会话ID
+  string message = 3;
+}
+
+// 连接器心跳请求
+message TempSessionHeartbeatRequest {
+  string session_id = 1;        // 会话ID
+  string connector_id = 2;     // 连接器ID
+  int64 timestamp = 3;        // 时间戳
+}
+
+// 连接器心跳响应
+message TempSessionHeartbeatResponse {
+  bool success = 1;
+  string message = 2;
+  int64 server_time = 3;       // 服务器时间
+}
+
+// 连接器注销会话请求
+message UnregisterTempSessionRequest {
+  string session_id = 1;        // 会话ID
+  string connector_id = 2;     // 连接器ID
+}
+
+// 连接器注销会话响应
+message UnregisterTempSessionResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// 查询在线连接器请求
+message ListOnlineConnectorsRequest {
+  string requester_id = 1;     // 请求者ID
+  string kernel_id = 2;        // 指定内核ID（为空表示查询所有）
+  bool include_remote = 3;      // 是否包含远程内核的连接器
+}
+
+// 在线连接器信息
+message ConnectorOnlineInfo {
+  string connector_id = 1;      // 连接器ID
+  string kernel_id = 2;        // 连接器所属内核ID
+  string address = 3;          // 连接器IP地址
+  int32 port = 4;             // 连接器监听端口
+  string entity_type = 5;      // 连接器实体类型
+  string session_id = 6;        // 会话ID
+  int64 last_heartbeat = 7;   // 最后心跳时间
+  int64 registered_at = 8;     // 注册时间
+  bool expose_to_others = 9;  // 是否向其他内核暴露
+}
+
+// 查询在线连接器响应
+message ListOnlineConnectorsResponse {
+  bool success = 1;
+  repeated ConnectorOnlineInfo connectors = 2;  // 在线连接器列表
+  string message = 3;
+}
+
+// 发送临时消息请求
+message SendTempMessageRequest {
+  string sender_id = 1;         // 发送者ID
+  string receiver_id = 2;       // 接收者ID（目标连接器ID）
+  bytes payload = 3;            // 消息载荷
+  int64 timestamp = 4;         // 时间戳
+  string flow_id = 5;           // 业务流程ID（可选）
+}
+
+// 发送临时消息响应
+message SendTempMessageResponse {
+  bool success = 1;
+  string message_id = 2;        // 消息ID
+  string message = 3;
+}
+
+// 接收临时消息请求
+message ReceiveTempMessageRequest {
+  string connector_id = 1;      // 连接器ID
+  string session_id = 2;        // 会话ID
+}
+
+// 临时消息（流式推送）
+message TempMessage {
+  string message_id = 1;        // 消息ID
+  string sender_id = 2;         // 发送者ID
+  string receiver_id = 3;       // 接收者ID
+  bytes payload = 4;             // 消息载荷
+  int64 timestamp = 5;          // 时间戳
+  string flow_id = 6;           // 业务流程ID（可选）
+  string source_kernel_id = 7;   // 源内核ID
+}
+
+// 同步在线连接器请求（运维方之间）
+message SyncOnlineConnectorsRequest {
+  string source_kernel_id = 1;  // 源内核ID
+  repeated ConnectorOnlineInfo connectors = 2;  // 本内核在线连接器列表
+  int64 timestamp = 3;         // 同步时间戳
+}
+
+// 同步在线连接器响应（运维方之间）
+message SyncOnlineConnectorsResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// 转发临时消息请求（运维方之间）
+message ForwardTempMessageRequest {
+  string sender_id = 1;         // 原始发送者ID
+  string sender_kernel_id = 2;   // 发送者所属内核ID
+  string receiver_id = 3;        // 接收者ID（目标连接器ID）
+  bytes payload = 4;             // 消息载荷
+  int64 timestamp = 5;           // 时间戳
+  string flow_id = 6;           // 业务流程ID（可选）
+  string message_id = 7;        // 原始消息ID
+}
+
+// 转发临时消息响应（运维方之间）
+message ForwardTempMessageResponse {
+  bool success = 1;
+  string message = 2;
+}

@@ -19,6 +19,7 @@ import (
 	"github.com/trusted-space/kernel/kernel/circulation"
 	"github.com/trusted-space/kernel/kernel/control"
 	"github.com/trusted-space/kernel/kernel/evidence"
+	"github.com/trusted-space/kernel/kernel/operator_peer"
 )
 type RemotePermissionRequest struct {
 	RequestID     string
@@ -73,6 +74,9 @@ type MultiKernelManager struct {
 
 	// multiHopConfigManager 多跳路由配置管理器（由外部注入）
 	multiHopConfigManager *MultiHopConfigManager
+
+	// p2pManager P2P连接管理器（由外部注入，用于自动建立P2P连接）
+	p2pManager *operator_peer.P2PManager
 
 	kernels   map[string]*KernelInfo
 	kernelsMu sync.RWMutex
@@ -137,6 +141,79 @@ func (m *MultiKernelManager) SetBusinessChainManager(bcm *BusinessChainManager) 
 // SetMultiHopConfigManager 设置多跳路由配置管理器
 func (m *MultiKernelManager) SetMultiHopConfigManager(mhcm *MultiHopConfigManager) {
 	m.multiHopConfigManager = mhcm
+}
+
+// SetP2PManager 设置P2P连接管理器（用于自动建立P2P连接）
+func (m *MultiKernelManager) SetP2PManager(p2pMgr *operator_peer.P2PManager) {
+	m.p2pManager = p2pMgr
+
+	// 注入内核信息提供者，使 P2PManager 能够按需连接
+	if p2pMgr != nil {
+		p2pMgr.SetKernelInfoProvider(m)
+	}
+}
+
+// GetKernelAddress 根据内核ID获取内核地址信息和P2P端口
+func (m *MultiKernelManager) GetKernelAddress(kernelID string) (address string, p2pPort int, found bool) {
+	m.kernelsMu.RLock()
+	defer m.kernelsMu.RUnlock()
+
+	kernelInfo, exists := m.kernels[kernelID]
+	if !exists {
+		return "", 0, false
+	}
+
+	// P2P 端口约定为 kernel 间通信端口 + 3
+	// kernelInfo.Port 是内核间通信端口 (kernelPort)
+	p2pPort = kernelInfo.Port + 3
+	return kernelInfo.Address, p2pPort, true
+}
+
+// GetKnownRemoteKernelIDs 获取所有已知远程内核的ID列表（排除本内核）
+func (m *MultiKernelManager) GetKnownRemoteKernelIDs() []string {
+	m.kernelsMu.RLock()
+	defer m.kernelsMu.RUnlock()
+
+	var kernelIDs []string
+	for id := range m.kernels {
+		if id == m.config.KernelID {
+			continue // 排除本内核自己
+		}
+		kernelIDs = append(kernelIDs, id)
+	}
+	return kernelIDs
+}
+
+// connectP2PToKernel 尝试自动建立到目标内核的P2P连接
+// P2P地址通过约定规则计算：P2P端口 = kernelPort + 3
+// 仅当P2P管理器已注入且尚未建立P2P连接时触发
+func (m *MultiKernelManager) connectP2PToKernel(kernelID, address string, kernelPort int) {
+	if m.p2pManager == nil {
+		return
+	}
+
+	// 检查是否已建立P2P连接
+	if m.p2pManager.IsPeerConnected(kernelID) {
+		return
+	}
+
+	// 根据约定规则计算P2P地址：kernel_port + 3
+	p2pAddr := fmt.Sprintf("%s:%d", address, kernelPort+3)
+
+	log.Printf("[P2P] Auto-connecting to peer %s at %s", kernelID, p2pAddr)
+
+	go func() {
+		// 使用 P2PManager 的 ConnectToPeer，port 参数为 P2P 端口（kernelPort+3）
+		if err := m.p2pManager.ConnectToPeer(kernelID, address, kernelPort+3); err != nil {
+			if strings.Contains(err.Error(), "already connected") {
+				log.Printf("[P2P] Already connected to peer %s", kernelID)
+			} else {
+				log.Printf("[P2P] Auto-connect failed for %s: %v", kernelID, err)
+			}
+		} else {
+			log.Printf("[P2P] Auto-connected to peer %s at %s", kernelID, p2pAddr)
+		}
+	}()
 }
 
 // PendingInterconnectRequest 表示一个待审批的内核互联请求
@@ -694,6 +771,9 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 
 	log.Printf("[OK] Connected to kernel %s at %s:%d", kernelID, address, port)
 
+	// 自动建立P2P连接（P2P端口 = kernelPort + 3）
+	go m.connectP2PToKernel(kernelID, address, port)
+
 	// 广播本内核已知的其他内核给新连接的内核
 	go m.BroadcastKnownKernels(kernelID)
 
@@ -889,6 +969,10 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int,
 	go m.kernelHeartbeat(kernelID)
 
 	log.Printf("[OK] Connected to kernel %s at %s:%d", kernelID, address, port)
+
+	// 自动建立P2P连接（P2P端口 = kernelPort + 3）
+	go m.connectP2PToKernel(kernelID, address, port)
+
 	return nil
 }
 

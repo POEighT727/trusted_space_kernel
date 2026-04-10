@@ -71,3 +71,26 @@ channel:
     # 默认压缩存证数据
     default_compress_data: true
 
+# 临时通信配置（运维方功能）
+tempchat:
+  # 是否启用临时通信功能
+  enabled: true
+  # 临时通信服务监听端口（独立于主服务端口）
+  port: 50055
+  # 会话超时时间（秒）- 连接器多久不心跳则视为离线
+  session_timeout: 60
+  # 心跳间隔（秒）- 连接器发送心跳的频率
+  heartbeat_interval: 15
+  # 运维方同步间隔（秒）- 与其他运维方同步在线连接器列表的频率
+  sync_interval: 30
+
+# P2P运维方直连配置
+# 运维方之间直接建立TCP连接：
+# 1. 直接同步在线连接器列表
+# 2. 直接转发连接器间的临时消息
+# 连接采用"按需建立"模式，无需配置 peers 列表
+p2p:
+  # 是否启用P2P直连功能
+  enabled: true
+  # P2P服务监听地址（默认: kernel_port+3）
+  # listen_addr: "0.0.0.0:50054"
