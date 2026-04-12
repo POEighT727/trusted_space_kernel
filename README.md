@@ -134,7 +134,7 @@ Connector ↔ TempChatService (gRPC, port 50055) ↔ TempChatManager (in-memory)
                     Cross-kernel forwarding (gRPC ForwardTempMessage / P2P RelayMessage)
 ```
 
-#### 3.3 P2P Operator Peer — Part of Circulation
+#### 3.3 P2P Operator Peer
 
 Implements direct TCP connections between operators for syncing online connector list and relaying temporary messages, avoiding gRPC dependency:
 

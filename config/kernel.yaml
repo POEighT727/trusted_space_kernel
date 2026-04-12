@@ -52,10 +52,6 @@ database:
   password: "123456"
   database: "trusted_space"
 
-policy:
-  # 默认策略：true=允许所有连接，false=需要显式授权
-  default_allow: true
-
 channel:
   evidence:
     # 默认存证方式：none, internal, external, hybrid

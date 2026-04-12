@@ -81,10 +81,6 @@ type Config struct {
 		Database string `yaml:"database"`
 	} `yaml:"database"`
 
-	Policy struct {
-		DefaultAllow bool `yaml:"default_allow"`
-	} `yaml:"policy"`
-
 	Channel struct {
 		Evidence struct {
 			DefaultMode          string `yaml:"default_mode"`
@@ -196,12 +192,7 @@ func main() {
 	registry.StartHealthCheck()
 	log.Println("[OK] Registry initialized")
 
-	// 2. 权限策略引擎
-	policyEngine := control.NewPolicyEngine(config.Policy.DefaultAllow)
-	policyEngine.LoadDefaultRules()
-	log.Println("[OK] Policy engine initialized")
-
-	// 3. 频道管理器
+	// 2. 频道管理器
 	channelManager := circulation.NewChannelManager()
 	channelManager.SetKernelID(config.Kernel.ID) // 设置当前内核ID
 	channelManager.StartCleanupRoutine()
@@ -524,7 +515,7 @@ func main() {
 	)
 
 	// 注册服务
-	channelService := server.NewChannelServiceServer(channelManager, policyEngine, registry, auditLog, multiKernelManager, dbManager)
+	channelService := server.NewChannelServiceServer(channelManager, registry, auditLog, multiKernelManager, dbManager)
 	
 	// 设置权限变更回调：当权限被批准时，通知被添加的连接器（含跨内核转发）
 	channelManager.SetPermissionChangeCallback(func(channelID, connectorID, changeType string) {

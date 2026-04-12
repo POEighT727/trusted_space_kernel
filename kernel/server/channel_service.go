@@ -147,7 +147,6 @@ func (nm *NotificationManager) autoSubscribe(connectorID, channelID string) {
 type ChannelServiceServer struct {
 	pb.UnimplementedChannelServiceServer
 	channelManager       *circulation.ChannelManager
-	policyEngine         *control.PolicyEngine
 	registry             *control.Registry
 	auditLog             *evidence.AuditLog
 	NotificationManager  *NotificationManager
@@ -159,7 +158,6 @@ type ChannelServiceServer struct {
 // NewChannelServiceServer 创建频道服务
 func NewChannelServiceServer(
 	channelManager *circulation.ChannelManager,
-	policyEngine *control.PolicyEngine,
 	registry *control.Registry,
 	auditLog *evidence.AuditLog,
 	multiKernelManager *MultiKernelManager,
@@ -168,12 +166,11 @@ func NewChannelServiceServer(
 	businessChainManager := NewBusinessChainManager(dbManager)
 
 	server := &ChannelServiceServer{
-		channelManager:       channelManager,
-		policyEngine:        policyEngine,
-		registry:            registry,
-		auditLog:            auditLog,
-		NotificationManager: NewNotificationManager(channelManager, registry),
-		multiKernelManager:  multiKernelManager,
+		channelManager:        channelManager,
+		registry:              registry,
+		auditLog:              auditLog,
+		NotificationManager:  NewNotificationManager(channelManager, registry),
+		multiKernelManager:    multiKernelManager,
 		businessChainManager: businessChainManager,
 	}
 
@@ -453,27 +450,6 @@ func (s *ChannelServiceServer) ProposeChannel(ctx context.Context, req *pb.Propo
 	encrypted := req.Encrypted
 	if !req.Encrypted {
 		encrypted = true // 统一频道默认加密
-	}
-
-	// 权限检查：检查所有发送方到所有接收方的权限（ACL）
-	for _, senderID := range req.SenderIds {
-		for _, receiverID := range req.ReceiverIds {
-			allowed, reason := s.policyEngine.CheckPermission(senderID, receiverID)
-			if !allowed {
-			s.auditLog.SubmitBasicEvidence(
-				creatorID,
-				evidence.EventTypePermissionChange,
-				"",
-				"",
-				evidence.DirectionInternal,
-				senderID,
-			)
-				return &pb.ProposeChannelResponse{
-					Success: false,
-					Message: fmt.Sprintf("permission denied: %s cannot send data to %s: %s", senderID, receiverID, reason),
-				}, nil
-			}
-		}
 	}
 
 	// 确定批准者ID
