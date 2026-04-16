@@ -150,11 +150,12 @@ message SetConnectorStatusResponse {
 // 证书注册服务消息定义
 // ------------------------------------------------------------
 message RegisterConnectorRequest {
-  string connector_id = 1;      // 连接器ID
-  string entity_type = 2;       // 实体类型
-  string public_key = 3;        // 用于应用层加密的公钥
-  string config_yaml = 4;       // 连接器配置（YAML格式）
-  int64 timestamp = 5;
+  string connector_id = 1;       // 连接器ID
+  string entity_type = 2;        // 实体类型
+  string public_key = 3;         // 用于应用层加密的公钥
+  string config_yaml = 4;        // 连接器配置（YAML格式）
+  string registration_code = 5;  // Bootstrap 一次性注册码（用于无证书首次注册）
+  int64 timestamp = 6;
 }
 
 message RegisterConnectorResponse {

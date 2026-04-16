@@ -9,6 +9,9 @@ connector:
   # true - 公开：互联后其他内核可以通过发现机制获取该连接器信息
   expose_to_others: true
   data_catalog_file: "connector/data_catalog_sample.json"
+  # Bootstrap 一次性注册码（用于首次无证书注册）
+  # 如果已有证书，此项留空即可；若无证书，需填写内核管理员分发的 token
+  bootstrap_token: "TSK-BOOT-6fb9c65a-912906e8"
 
 kernel:
   # 内核ID（用于跨内核通信标识）

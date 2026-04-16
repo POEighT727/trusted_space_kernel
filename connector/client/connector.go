@@ -69,6 +69,7 @@ type Connector struct {
 	dataCatalogItems   []*DataCatalogItem // 结构化数据目录（新版，支持 exposed 字段）
 	dataCatalogFile    string          // 数据目录文件路径（用于保存变更）
 	clientKeyPath      string          // connector 私钥路径（用于签名）
+	bootstrapToken     string          // Bootstrap 一次性注册码（用于无证书首次注册）
 
 	conn         *grpc.ClientConn
 	identitySvc  pb.IdentityServiceClient
@@ -118,6 +119,8 @@ type Config struct {
 	DataCatalogItems []*DataCatalogItem
 	// 数据目录文件路径（用于保存变更）
 	DataCatalogFile string
+	// Bootstrap 一次性注册码（用于无证书首次注册）
+	BootstrapToken string
 	// 数据库配置
 	DatabaseEnabled  bool
 	DatabaseHost     string
@@ -1107,7 +1110,7 @@ func (c *Connector) WaitForChannelNotification() (<-chan *pb.ChannelNotification
 }
 
 // RegisterConnector 首次注册连接器并获取证书（使用引导端点，不需要证书）
-func RegisterConnector(bootstrapAddr string, connectorID, entityType, publicKey, configYAML string) (certPEM, keyPEM, caCertPEM []byte, err error) {
+func RegisterConnector(bootstrapAddr string, connectorID, entityType, publicKey, configYAML, registrationCode string) (certPEM, keyPEM, caCertPEM []byte, err error) {
 	// 使用普通TLS连接到引导端点（不需要客户端证书）
 	// 注意：首次注册时连接器还没有CA证书，所以暂时跳过证书验证
 	// 注册成功后，连接器会获得CA证书，后续连接将使用mTLS进行验证
@@ -1133,11 +1136,12 @@ func RegisterConnector(bootstrapAddr string, connectorID, entityType, publicKey,
 	
 	// 发送注册请求
 	resp, err := identitySvc.RegisterConnector(context.Background(), &pb.RegisterConnectorRequest{
-		ConnectorId: connectorID,
-		EntityType:  entityType,
-		PublicKey:   publicKey,
-		ConfigYaml:  configYAML,
-		Timestamp:   time.Now().Unix(),
+		ConnectorId:      connectorID,
+		EntityType:       entityType,
+		PublicKey:        publicKey,
+		ConfigYaml:       configYAML,
+		RegistrationCode: registrationCode,
+		Timestamp:        time.Now().Unix(),
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to register connector: %w", err)

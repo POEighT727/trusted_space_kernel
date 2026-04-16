@@ -105,6 +105,13 @@ type Config struct {
 		Enabled     bool   `yaml:"enabled"`
 		ListenAddr string `yaml:"listen_addr"`
 	} `yaml:"p2p"`
+
+	// Bootstrap 一次性注册码配置
+	Bootstrap struct {
+		Enabled              bool   `yaml:"enabled"`
+		DefaultExpiry        string `yaml:"default_expiry,omitempty"`   // 如 "168h"
+		TokenConfigFile      string `yaml:"token_config_file,omitempty"` // token 配置文件路径
+	} `yaml:"bootstrap"`
 }
 
 func main() {
@@ -119,6 +126,16 @@ func main() {
 	defaultEvidenceCompress := flag.Bool("default-evidence-compress", true, "compress evidence data by default")
 
 	flag.Parse()
+
+	// 处理子命令
+	if flag.NArg() > 0 {
+		command := flag.Arg(0)
+		switch command {
+		case "token":
+			handleTokenCommand(flag.Args()[1:], configPath)
+			return
+		}
+	}
 
 	// 加载配置
 	config, err := loadConfig(*configPath)
@@ -183,6 +200,29 @@ func main() {
 		*defaultEvidenceRetention = config.Channel.Evidence.DefaultRetentionDays
 	}
 	*defaultEvidenceCompress = config.Channel.Evidence.DefaultCompressData
+
+	// Bootstrap 配置默认值和解析
+	bootstrapTokenConfigFile := "./config/bootstrap_tokens.yaml"
+	if config.Bootstrap.TokenConfigFile != "" {
+		bootstrapTokenConfigFile = config.Bootstrap.TokenConfigFile
+	}
+
+	// 初始化 TokenManager
+	tokenManager := control.NewTokenManager(bootstrapTokenConfigFile)
+	// 加载 token 配置
+	if err := tokenManager.LoadConfig(); err != nil {
+		log.Printf("[WARN] Failed to load bootstrap token config: %v", err)
+	}
+
+	// 如果配置了 default_expiry，覆盖默认值
+	if config.Bootstrap.DefaultExpiry != "" {
+		if dur, err := time.ParseDuration(config.Bootstrap.DefaultExpiry); err == nil {
+			// 使用 Setter 方法设置默认有效期
+			tokenManager.SetDefaultExpiryDuration(dur)
+		} else {
+			log.Printf("[WARN] Invalid bootstrap default_expiry: %v", err)
+		}
+	}
 
 	// 初始化组件
 	log.Println("[INFO] Initializing kernel components...")
@@ -570,7 +610,7 @@ func main() {
 
 	pb.RegisterChannelServiceServer(grpcServer, channelService)
 
-	identityService := server.NewIdentityServiceServer(registry, auditLog, ca, channelManager, channelService.NotificationManager, multiKernelManager)
+	identityService := server.NewIdentityServiceServer(registry, auditLog, ca, channelManager, channelService.NotificationManager, multiKernelManager, tokenManager)
 	pb.RegisterIdentityServiceServer(grpcServer, identityService)
 
 	evidenceService := server.NewEvidenceServiceServer(auditLog, channelManager)
@@ -1491,5 +1531,138 @@ func handleRouteInfo(multiKernelManager *server.MultiKernelManager, configManage
 		for _, k := range knownKernels {
 			fmt.Printf("  %s: %s:%d (%s)\n", k.KernelID, k.Address, k.Port, k.Status)
 		}
+	}
+}
+
+// handleTokenCommand 处理 token 子命令
+func handleTokenCommand(args []string, configPath *string) {
+	// 重新解析子命令参数
+	tokenCmd := flag.NewFlagSet("token", flag.ExitOnError)
+	generateCmd := tokenCmd.Bool("generate", false, "generate a new bootstrap token")
+	listCmd := tokenCmd.Bool("list", false, "list all bootstrap tokens")
+	revokeCmd := tokenCmd.Bool("revoke", false, "revoke a bootstrap token")
+	connectorID := tokenCmd.String("connector-id", "", "bind token to a specific connector ID")
+	expiry := tokenCmd.String("expiry", "", "token expiry duration (e.g. 168h, 7d)")
+	tokenCode := tokenCmd.String("code", "", "token code to revoke")
+
+	tokenCmd.Parse(args)
+
+	// 加载配置
+	config, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 初始化 TokenManager
+	bootstrapTokenConfigFile := "./config/bootstrap_tokens.yaml"
+	if config.Bootstrap.TokenConfigFile != "" {
+		bootstrapTokenConfigFile = config.Bootstrap.TokenConfigFile
+	}
+
+	tokenManager := control.NewTokenManager(bootstrapTokenConfigFile)
+	if err := tokenManager.LoadConfig(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load bootstrap token config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 设置默认过期时间
+	if config.Bootstrap.DefaultExpiry != "" {
+		if dur, err := time.ParseDuration(config.Bootstrap.DefaultExpiry); err == nil {
+			tokenManager.SetDefaultExpiryDuration(dur)
+		}
+	}
+
+	// 执行子命令
+	switch {
+	case *generateCmd:
+		// 生成新 Token
+		var expiryDur *time.Duration
+		if *expiry != "" {
+			dur, err := time.ParseDuration(*expiry)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Invalid expiry duration: %v\n", err)
+				os.Exit(1)
+			}
+			expiryDur = &dur
+		}
+
+		token, err := tokenManager.GenerateToken(*connectorID, expiryDur)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to generate token: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("[OK] Bootstrap token generated:\n")
+		fmt.Printf("  Code:        %s\n", token.Code)
+		fmt.Printf("  ConnectorID: %s\n", token.ConnectorID)
+		fmt.Printf("  Status:      %s\n", token.Status)
+		fmt.Printf("  CreatedAt:   %s\n", token.CreatedAt.Format(time.RFC3339))
+		if token.ExpiresAt != nil {
+			fmt.Printf("  ExpiresAt:   %s\n", token.ExpiresAt.Format(time.RFC3339))
+		} else {
+			fmt.Printf("  ExpiresAt:   never\n")
+		}
+
+	case *listCmd:
+		// 列出所有 Token
+		tokens := tokenManager.ListTokens()
+		if len(tokens) == 0 {
+			fmt.Println("No bootstrap tokens found")
+			return
+		}
+
+		fmt.Printf("%-25s %-20s %-10s %-20s %s\n", "Code", "ConnectorID", "Status", "CreatedAt", "ExpiresAt")
+		fmt.Println(strings.Repeat("-", 100))
+
+		for _, t := range tokens {
+			expiresAt := "never"
+			if t.ExpiresAt != nil {
+				expiresAt = t.ExpiresAt.Format(time.RFC3339)
+			}
+
+		status := t.Status
+		if t.IsValid() {
+			status = "valid"
+		} else if t.Status == control.BootstrapTokenStatusUsed {
+			status = "used"
+		} else if t.Status == control.BootstrapTokenStatusExpired {
+			status = "expired"
+		} else if t.Status == control.BootstrapTokenStatusRevoked {
+			status = "revoked"
+		}
+
+			fmt.Printf("%-25s %-20s %-10s %-20s %s\n",
+				t.Code[:20]+"...", // 截断显示
+				t.ConnectorID,
+				status,
+				t.CreatedAt.Format("2006-01-02 15:04:05"),
+				expiresAt,
+			)
+		}
+		fmt.Printf("\nTotal: %d token(s)\n", len(tokens))
+
+	case *revokeCmd:
+		// 撤销 Token
+		if *tokenCode == "" {
+			fmt.Fprintf(os.Stderr, "Error: --code is required for revoke command\n")
+			tokenCmd.Usage()
+			os.Exit(1)
+		}
+
+		if err := tokenManager.RevokeToken(*tokenCode); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to revoke token: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("[OK] Token %s has been revoked\n", *tokenCode)
+
+	default:
+		tokenCmd.Usage()
+		fmt.Println("\nExamples:")
+		fmt.Println("  kernel token -generate -connector-id connector-A")
+		fmt.Println("  kernel token -generate -connector-id connector-B -expiry 48h")
+		fmt.Println("  kernel token -list")
+		fmt.Println("  kernel token -revoke -code TSK-BOOT-XXXXXXXX-XXXX")
 	}
 }

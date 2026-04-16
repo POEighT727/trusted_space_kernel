@@ -97,4 +97,3 @@ Write-Host "   CA:          $CERTS_DIR/ca.crt"
 Write-Host "   Kernel:      $CERTS_DIR/kernel.crt, $CERTS_DIR/kernel.key"
 Write-Host ""
 Write-Host "⚠️  These are TEST certificates. Do NOT use in production!" -ForegroundColor Yellow
-

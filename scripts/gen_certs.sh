@@ -91,4 +91,3 @@ echo "   CA:          $CERTS_DIR/ca.crt"
 echo "   Kernel:      $CERTS_DIR/kernel.crt, $CERTS_DIR/kernel.key"
 echo ""
 echo "⚠️  These are TEST certificates. Do NOT use in production!"
-

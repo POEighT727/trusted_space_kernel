@@ -90,3 +90,15 @@ p2p:
   enabled: true
   # P2P服务监听地址（默认: kernel_port+3）
   # listen_addr: "0.0.0.0:50054"
+
+# Bootstrap 一次性注册码配置
+# 用于无证书首次注册时验证连接器身份
+bootstrap:
+  # 是否启用 Bootstrap Token 验证（默认: true）
+  enabled: true
+  # 默认 Token 有效期（如不设置，默认 168h = 7天）
+  default_expiry: "168h"
+  # Token 配置文件路径（单独存储，便于管理）
+  token_config_file: "config/bootstrap_tokens.yaml"
+  # 内联 Token 列表（可选，方便测试）
+  tokens: []

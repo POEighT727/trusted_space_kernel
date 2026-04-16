@@ -5,7 +5,7 @@ package trusted_space.kernel.v1;
 option go_package = "github.com/trusted-space/kernel/api/v1;kernelv1";
 
 // 引入其他 proto 文件的消息定义
-import "kernel/v1/tempchat.proto";
+import "tempchat.proto";
 
 // ================================================================
 // P2P 运维方直连协议 (OperatorPeer Protocol)

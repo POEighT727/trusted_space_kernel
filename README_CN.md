@@ -56,7 +56,7 @@
 │                                                                 │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │                      通信协议层                             │  │
-│  │            gRPC (mTLS) + 自定义 TCP (P2P)                 │  │
+│  │                      gRPC + mTLS                           │  │
 │  └─────────────────────────────────┬───────────────────────────┘  │
 │                                    │                              │
 │  ┌─────────────────────────────────┴───────────────────────────┐  │
@@ -564,10 +564,50 @@ CREATE DATABASE IF NOT EXISTS trusted_space CHARACTER SET utf8mb4 COLLATE utf8mb
 
 ### 4. 启动连接器
 
+首次启动连接器需要先获取一个 Bootstrap Token（一次性注册码），然后才能注册获取证书。
+
+#### 4.1 生成 Bootstrap Token（内核管理员操作）
+
+启动内核后，使用以下命令生成 Token：
+
 ```bash
-# 首次启动会自动注册并获取证书
+# 进入内核交互管理界面
+./bin/kernel --config config/kernel.yaml
+
+# 生成 Token（绑定到 connector-A，默认有效期 7 天）
+kernel token -generate -connector-id connector-A
+
+# 列出所有 Token
+kernel token -list
+
+# 撤销 Token
+kernel token -revoke -code TSK-BOOT-XXXXXXXX-XXXX
+```
+
+#### 4.2 配置连接器 Token
+
+将生成的 Token 填入连接器配置文件 `config/connector.yaml`：
+
+```yaml
+connector:
+  id: "connector-A"
+  entity_type: "data_source"
+  public_key: "mock_public_key_abc123"
+  bootstrap_token: "TSK-BOOT-A7K9M2P4-8F3A"  # ← 填写此处
+```
+
+#### 4.3 启动连接器
+
+```bash
 ./bin/connector.exe --config config/connector.yaml
 ```
+
+首次启动时，连接器会携带 Token 向内核注册，验证通过后获得证书文件：
+- `certs/connector-A.crt` (证书)
+- `certs/connector-A.key` (私钥)
+- `certs/ca.crt` (CA 证书)
+
+后续启动将使用证书进行 mTLS 认证，不再需要 Token。
 
 ---
 

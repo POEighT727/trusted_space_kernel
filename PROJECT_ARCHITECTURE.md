@@ -331,6 +331,102 @@ const (
 
 ---
 
+### 4.X Bootstrap Token 机制 (一次性注册码)
+
+#### 4.X.1 概述
+
+为了控制谁能加入可信数据空间，内核采用 **Bootstrap Token（一次性注册码）** 机制来验证首次注册的连接器身份。
+
+#### 4.X.2 工作流程
+
+```
+1. 管理员生成 Token（绑定 connector_id，可选过期时间）
+   ↓
+2. 将 Token 分发给连接器运维人员
+   ↓
+3. 连接器在 config/connector.yaml 中配置 bootstrap_token
+   ↓
+4. 首次启动时，连接器携带 Token 调用 RegisterConnector API
+   ↓
+5. 内核验证 Token 有效性（存在、未使用、未过期、connector_id 匹配）
+   ↓
+6. 验证通过后签发证书，并标记 Token 为已使用
+   ↓
+7. 后续连接使用证书进行 mTLS 认证，不再需要 Token
+```
+
+#### 4.X.3 Token 特性
+
+| 特性 | 说明 |
+|------|------|
+| 一次性 | 每个 Token 只能使用一次 |
+| 绑定性 | 可绑定到特定 `connector_id` |
+| 过期性 | 可设置有效期（默认 7 天） |
+| 持久化 | Token 状态保存到 YAML 配置文件 |
+
+#### 4.X.4 Token 格式
+
+```
+TSK-BOOT-{8位随机hex}-{8位时间戳hex}
+示例：TSK-BOOT-A7K9M2P4-8F3A9B2C
+```
+
+#### 4.X.5 配置文件
+
+**kernel.yaml (Bootstrap 配置节)**：
+```yaml
+bootstrap:
+  enabled: true                       # 是否启用 Token 验证
+  default_expiry: "168h"             # 默认有效期（7天）
+  token_config_file: "config/bootstrap_tokens.yaml"  # Token 配置文件
+```
+
+**bootstrap_tokens.yaml (Token 存储)**：
+```yaml
+enabled: true
+default_expiry: 168h0m0s
+tokens:
+  - code: "TSK-BOOT-XXXXXXXX-XXXX"
+    connector_id: "connector-A"
+    status: "used"
+    created_at: "2026-04-10T10:00:00Z"
+    expires_at: "2026-04-17T10:00:00Z"
+    used_at: "2026-04-10T11:00:00Z"
+    used_by: "connector-A"
+```
+
+**connector.yaml (连接器配置)**：
+```yaml
+connector:
+  id: "connector-A"
+  bootstrap_token: "TSK-BOOT-A7K9M2P4-8F3A"  # 从管理员获取的 Token
+```
+
+#### 4.X.6 CLI 管理命令
+
+```bash
+# 生成 Token（绑定到 connector-A，默认 7 天有效期）
+kernel token -generate -connector-id connector-A
+
+# 生成 Token（指定 48 小时有效期）
+kernel token -generate -connector-id connector-B -expiry 48h
+
+# 列出所有 Token
+kernel token -list
+
+# 撤销 Token
+kernel token -revoke -code TSK-BOOT-XXXXXXXX-XXXX
+```
+
+#### 4.X.7 Token 验证规则
+
+1. **存在性检查**：Token 必须存在于配置文件
+2. **状态检查**：Token 状态必须为 `valid`
+3. **过期检查**：Token 未超过 `expires_at` 时间
+4. **绑定检查**：如果 Token 绑定了 `connector_id`，请求中的 `connector_id` 必须匹配
+
+---
+
 ## 5. 核心模块详解
 
 ### 5.1 安全模块 (`kernel/security/`)

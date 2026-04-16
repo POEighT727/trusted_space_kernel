@@ -30,6 +30,7 @@ type Config struct {
 		Exposed          bool   `yaml:"expose_to_others"` // 是否向其他内核公开自己的信息，默认为true
 		DataCatalog      []string `yaml:"data_catalog"`   // 数据类型/分类目录（支持直接内联列表）
 		DataCatalogFile  string   `yaml:"data_catalog_file"` // 数据目录文件路径（支持从文件加载，JSON 或纯文本，每行一个）
+		BootstrapToken   string   `yaml:"bootstrap_token"` // Bootstrap 一次性注册码（用于无证书首次注册）
 	} `yaml:"connector"`
 
 	Kernel struct {
@@ -101,6 +102,7 @@ func main() {
 			config.Connector.EntityType,
 			config.Connector.PublicKey,
 			configYAML,
+			config.Connector.BootstrapToken,
 		)
 		if err != nil {
 			log.Fatalf("注册失败: %v", err)

@@ -22,23 +22,25 @@ const KernelVersion = "v1.0.0"
 // IdentityServiceServer 实现身份与准入服务
 type IdentityServiceServer struct {
 	pb.UnimplementedIdentityServiceServer
-	registry           *control.Registry
-	auditLog           *evidence.AuditLog
-	ca                 *security.CA
-	channelManager     *circulation.ChannelManager
+	registry            *control.Registry
+	auditLog            *evidence.AuditLog
+	ca                  *security.CA
+	channelManager      *circulation.ChannelManager
 	notificationManager *NotificationManager
-	multiKernelManager *MultiKernelManager
+	multiKernelManager  *MultiKernelManager
+	tokenManager        *control.TokenManager // Bootstrap Token 管理器
 }
 
 // NewIdentityServiceServer 创建身份服务
-func NewIdentityServiceServer(registry *control.Registry, auditLog *evidence.AuditLog, ca *security.CA, channelManager *circulation.ChannelManager, notificationManager *NotificationManager, multiKernelManager *MultiKernelManager) *IdentityServiceServer {
+func NewIdentityServiceServer(registry *control.Registry, auditLog *evidence.AuditLog, ca *security.CA, channelManager *circulation.ChannelManager, notificationManager *NotificationManager, multiKernelManager *MultiKernelManager, tokenManager *control.TokenManager) *IdentityServiceServer {
 	return &IdentityServiceServer{
-		registry:           registry,
-		auditLog:           auditLog,
-		ca:                 ca,
-		channelManager:     channelManager,
+		registry:            registry,
+		auditLog:            auditLog,
+		ca:                  ca,
+		channelManager:      channelManager,
 		notificationManager: notificationManager,
-		multiKernelManager: multiKernelManager,
+		multiKernelManager:  multiKernelManager,
+		tokenManager:        tokenManager,
 	}
 }
 
@@ -535,6 +537,34 @@ func (s *IdentityServiceServer) RegisterConnector(ctx context.Context, req *pb.R
 		// 这里可以添加更详细的配置验证逻辑
 	}
 
+	// Bootstrap Token 验证（如果启用）
+	if s.tokenManager.IsEnabled() {
+		registrationCode := req.RegistrationCode
+		if registrationCode == "" {
+			return &pb.RegisterConnectorResponse{
+				Success: false,
+				Message: "bootstrap token required (registration_code is empty)",
+			}, nil
+		}
+
+		// 验证 Token
+		token, err := s.tokenManager.ValidateToken(registrationCode, req.ConnectorId)
+		if err != nil {
+			return &pb.RegisterConnectorResponse{
+				Success: false,
+				Message: fmt.Sprintf("invalid bootstrap token: %v", err),
+			}, nil
+		}
+
+		// 记录 Token 验证成功审��日志
+		s.auditLog.SubmitEvidence(
+			req.ConnectorId,
+			evidence.EventTypeAuthSuccess, // 使用认证成功事件类型
+			"",
+			fmt.Sprintf("bootstrap token %s validated for connector %s", token.Code, req.ConnectorId),
+		)
+	}
+
 	// 使用CA签发证书
 	certPEM, keyPEM, err := s.ca.IssueConnectorCert(req.ConnectorId, nil, nil)
 	if err != nil {
@@ -551,6 +581,22 @@ func (s *IdentityServiceServer) RegisterConnector(ctx context.Context, req *pb.R
 			Success: false,
 			Message: fmt.Sprintf("failed to read CA certificate: %v", err),
 		}, nil
+	}
+
+	// 标记 Token 为已使用（如果提供了 token）
+	if s.tokenManager.IsEnabled() && req.RegistrationCode != "" {
+		if err := s.tokenManager.MarkTokenUsed(req.RegistrationCode, req.ConnectorId); err != nil {
+			// Token 标记失败不应该阻止注册，但记录警告
+			log.Printf("[WARN] Failed to mark token as used: %v", err)
+		} else {
+			// 记录 Token 使用审计日志
+			s.auditLog.SubmitEvidence(
+				req.ConnectorId,
+				evidence.EventTypeAuthSuccess,
+				"",
+				fmt.Sprintf("bootstrap token consumed: %s", req.RegistrationCode),
+			)
+		}
 	}
 
 	// 记录注册事件
