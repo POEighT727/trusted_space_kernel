@@ -439,8 +439,7 @@ func (m *P2PManager) handleHandshake(conn net.Conn, payload *HandshakePayload) (
 
 // handleSyncConnectors 处理连接器同步请求
 func (m *P2PManager) handleSyncConnectors(payload *SyncConnectorsPayload) (*SyncConnectorsAckPayload, error) {
-	log.Printf("[P2P] Handling sync from %s: %d connectors",
-		payload.SourceKernelID, len(payload.Connectors))
+	
 
 	// 缓存发送方（远程）的连接器
 	if len(payload.Connectors) > 0 {
@@ -481,7 +480,6 @@ func (m *P2PManager) handleSyncConnectors(payload *SyncConnectorsPayload) (*Sync
 		}
 	}
 
-	log.Printf("[P2P] handleSyncConnectors: 返回 %d 个本地连接器给 %s", len(localConnectors), payload.SourceKernelID)
 	return &SyncConnectorsAckPayload{
 		Success:          true,
 		Message:          "OK",

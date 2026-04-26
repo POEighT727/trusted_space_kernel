@@ -1117,6 +1117,7 @@ func RegisterConnector(bootstrapAddr string, connectorID, entityType, publicKey,
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true, // 首次注册时跳过验证，因为还没有CA证书
 		MinVersion:         tls.VersionTLS13,
+		NextProtos:         []string{"h2"},
 	}
 	
 	creds := credentials.NewTLS(tlsConfig)

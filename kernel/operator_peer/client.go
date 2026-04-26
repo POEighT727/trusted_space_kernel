@@ -295,9 +295,6 @@ func (c *PeerClient) handlePacket(packet *Packet) {
 		// 同步确认
 		var ack SyncConnectorsAckPayload
 		if err := JSONUnmarshal(packet.Payload, &ack); err == nil {
-			// 同步日志降为 DEBUG，避免刷屏
-			log.Printf("[P2P-DEBUG] Sync completed: %v, received %d remote connectors",
-				ack.Success, len(ack.RemoteConnectors))
 			if c.onSyncAck != nil {
 				c.onSyncAck(ack.RemoteConnectors)
 			}

@@ -8,35 +8,64 @@ set -e
 CERTS_DIR="certs"
 VALIDITY_DAYS=365
 
-echo "🔐 Generating certificates for Trusted Data Space..."
+echo "Generating certificates for Trusted Data Space..."
 
 # 创建证书目录
 mkdir -p "$CERTS_DIR"
 
-# 1. 生成 CA 根证书
-echo "Step 1: Generating CA root certificate..."
+# 1. 生成外部根 CA（自签名）
+echo "Step 1: Generating external root CA (self-signed)..."
+openssl genrsa -out "$CERTS_DIR/root_ca.key" 4096
+
+openssl req -new -x509 -days $((VALIDITY_DAYS * 20)) -key "$CERTS_DIR/root_ca.key" \
+  -out "$CERTS_DIR/root_ca.crt" \
+  -subj "/C=CN/ST=Beijing/L=Beijing/O=Trusted Data Space/CN=Trusted Data Space Root CA"
+
+echo "  [OK] Root CA created: $CERTS_DIR/root_ca.crt"
+
+# 2. 生成内核中间 CA（由根 CA 签发）
+echo "Step 2: Generating kernel intermediate CA (signed by root CA)..."
 openssl genrsa -out "$CERTS_DIR/ca.key" 4096
 
-openssl req -new -x509 -days $((VALIDITY_DAYS * 10)) -key "$CERTS_DIR/ca.key" \
+openssl req -new -key "$CERTS_DIR/ca.key" \
+  -out "$CERTS_DIR/ca.csr" \
+  -subj "/C=CN/ST=Beijing/L=Beijing/O=Trusted Data Space/CN=Trusted Data Space Kernel CA"
+
+# 创建中间 CA 扩展配置
+cat > "$CERTS_DIR/ca.ext" << EOF
+basicConstraints = CA:TRUE, pathlen:1
+keyUsage = cRLSign, keyCertSign, digitalSignature
+extendedKeyUsage = serverAuth, clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+EOF
+
+openssl x509 -req -days $((VALIDITY_DAYS * 10)) \
+  -in "$CERTS_DIR/ca.csr" \
+  -CA "$CERTS_DIR/root_ca.crt" \
+  -CAkey "$CERTS_DIR/root_ca.key" \
+  -CAcreateserial \
   -out "$CERTS_DIR/ca.crt" \
-  -subj "/C=CN/ST=Beijing/L=Beijing/O=Trusted Data Space/CN=Trusted Data Space Internal CA"
+  -extfile "$CERTS_DIR/ca.ext"
 
-echo "✓ CA certificate created"
+rm "$CERTS_DIR/ca.csr" "$CERTS_DIR/ca.ext"
+echo "  [OK] Kernel intermediate CA created: $CERTS_DIR/ca.crt"
 
-# 2. 生成内核服务端证书
-echo "Step 2: Generating kernel server certificate..."
+# 清理根 CA 的 serial 文件
+rm -f "$CERTS_DIR/root_ca.srl"
+
+# 3. 生成内核服务端证书（由内核中间 CA 签发）
+echo "Step 3: Generating kernel server certificate..."
 
 # 自动检测本地IP地址
 local_ips=""
 if command -v hostname >/dev/null 2>&1; then
-    # 尝试使用 hostname -I 获取所有IP地址
     hostname_ips=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -v '^127\.' | head -5)
     if [ -n "$hostname_ips" ]; then
         local_ips="$hostname_ips"
     fi
 fi
 
-# 如果hostname失败，尝试使用ip route
 if [ -z "$local_ips" ] && command -v ip >/dev/null 2>&1; then
     default_ip=$(ip route get 1 2>/dev/null | head -1 | grep -oE 'src [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2)
     if [ -n "$default_ip" ] && [ "$default_ip" != "127.0.0.1" ]; then
@@ -54,7 +83,7 @@ if [ -n "$local_ips" ]; then
     done
 fi
 
-echo "📋 Using Subject Alternative Names: $san_entries"
+echo "  SAN: $san_entries"
 
 openssl genrsa -out "$CERTS_DIR/kernel.key" 2048
 
@@ -77,17 +106,21 @@ openssl x509 -req -days $VALIDITY_DAYS \
   -extfile "$CERTS_DIR/kernel.ext"
 
 rm "$CERTS_DIR/kernel.csr" "$CERTS_DIR/kernel.ext"
-echo "✓ Kernel server certificate created"
 
-
-# 清理临时文件
+# 清理中间 CA 的 serial 文件
 rm -f "$CERTS_DIR/ca.srl"
+
+echo "  [OK] Kernel server certificate created"
 
 echo ""
 echo "[OK] All certificates generated successfully!"
 echo ""
-echo "📁 Certificate files:"
-echo "   CA:          $CERTS_DIR/ca.crt"
-echo "   Kernel:      $CERTS_DIR/kernel.crt, $CERTS_DIR/kernel.key"
+echo "Certificate files:"
+echo "  Root CA (external):      $CERTS_DIR/root_ca.crt, $CERTS_DIR/root_ca.key"
+echo "  Kernel CA (intermediate): $CERTS_DIR/ca.crt, $CERTS_DIR/ca.key"
+echo "  Kernel server:           $CERTS_DIR/kernel.crt, $CERTS_DIR/kernel.key"
 echo ""
-echo "⚠️  These are TEST certificates. Do NOT use in production!"
+echo "Verify certificate chain:"
+echo "  openssl verify -CAfile root_ca.crt -untrusted ca.crt kernel.crt"
+echo ""
+echo "[WARN] These are TEST certificates. Do NOT use in production!"

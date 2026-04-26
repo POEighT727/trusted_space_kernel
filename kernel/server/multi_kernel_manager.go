@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"github.com/trusted-space/kernel/kernel/control"
 	"github.com/trusted-space/kernel/kernel/evidence"
 	"github.com/trusted-space/kernel/kernel/operator_peer"
+	"github.com/trusted-space/kernel/kernel/security"
 )
 type RemotePermissionRequest struct {
 	RequestID     string
@@ -47,6 +50,8 @@ type KernelConfig struct {
 	HeartbeatInterval int
 	ConnectTimeout    int
 	MaxRetries        int
+	IntermediateCAPath string
+	RootCACertPath    string
 }
 
 // KernelInfo 内核信息
@@ -83,6 +88,10 @@ type MultiKernelManager struct {
 	pendingRequests   map[string]*PendingInterconnectRequest
 	pendingRequestsMu sync.RWMutex
 
+	// pendingPeerCACerts 预存的对端中间CA证书
+	pendingPeerCACerts    map[string][]byte
+	pendingPeerCACertsMu sync.RWMutex
+
 	running bool
 	// NotificationManager 用于内核间服务通知本地连接器（由外部注入）
 	notificationManager *NotificationManager
@@ -104,6 +113,17 @@ type MultiKernelManager struct {
 	OnHopEstablished func(req *pb.HopEstablishedRequest)
 }
 
+// PendingPeerCACerts returns the in-memory map of peer intermediate CA certs.
+// The caller must hold at least a read lock on pendingPeerCACertsMu.
+func (m *MultiKernelManager) PendingPeerCACerts() map[string][]byte {
+	return m.pendingPeerCACerts
+}
+
+// PendingPeerCACertsMu returns the mutex protecting the peer CA map.
+func (m *MultiKernelManager) PendingPeerCACertsMu() *sync.RWMutex {
+	return &m.pendingPeerCACertsMu
+}
+
 // NewMultiKernelManager 创建多内核管理器
 func NewMultiKernelManager(config *KernelConfig, registry *control.Registry,
 	channelManager *circulation.ChannelManager) (*MultiKernelManager, error) {
@@ -114,6 +134,7 @@ func NewMultiKernelManager(config *KernelConfig, registry *control.Registry,
 		channelManager: channelManager,
 		kernels:        make(map[string]*KernelInfo),
 		pendingRequests: make(map[string]*PendingInterconnectRequest),
+		pendingPeerCACerts: make(map[string][]byte),
 		remotePermissionRequests: make(map[string][]*RemotePermissionRequest),
 		running:        true,
 		pendingHops:    make(map[string]*PendingHopInfo),
@@ -151,6 +172,23 @@ func (m *MultiKernelManager) SetP2PManager(p2pMgr *operator_peer.P2PManager) {
 	if p2pMgr != nil {
 		p2pMgr.SetKernelInfoProvider(m)
 	}
+}
+
+// SetPendingPeerCACert stores a peer's intermediate CA cert in memory.
+func (m *MultiKernelManager) SetPendingPeerCACert(kernelID string, pem []byte) {
+	m.pendingPeerCACertsMu.Lock()
+	defer m.pendingPeerCACertsMu.Unlock()
+	m.pendingPeerCACerts[kernelID] = pem
+}
+
+// GetPendingPeerCACerts returns all in-memory peer CA certs.
+func (m *MultiKernelManager) GetPendingPeerCACerts(_ string) []byte {
+	m.pendingPeerCACertsMu.RLock()
+	defer m.pendingPeerCACertsMu.RUnlock()
+	for _, pem := range m.pendingPeerCACerts {
+		return pem
+	}
+	return nil
 }
 
 // GetKernelAddress 根据内核ID获取内核地址信息和P2P端口
@@ -339,6 +377,13 @@ func (m *MultiKernelManager) sendInterconnectApprove(req *PendingInterconnectReq
 	}
 
 	caCertPool := x509.NewCertPool()
+
+	// Add root CA (needed to verify the intermediate CA chain).
+	if rootCACert, err := os.ReadFile(m.config.RootCACertPath); err == nil {
+		caCertPool.AppendCertsFromPEM(rootCACert)
+	}
+
+	// Add own intermediate CA.
 	ownCACert, err := os.ReadFile(m.config.CACertPath)
 	if err != nil {
 		return fmt.Errorf("failed to read own CA certificate: %w", err)
@@ -351,6 +396,8 @@ func (m *MultiKernelManager) sendInterconnectApprove(req *PendingInterconnectReq
 	if peerCert, err := os.ReadFile(peerCACertPath); err == nil {
 		_ = caCertPool.AppendCertsFromPEM(peerCert)
 	}
+
+	// Also add peer's root CA from pending map.
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -403,6 +450,13 @@ func (m *MultiKernelManager) notifyRequesterApproveAndMultiHopApproved(req *Pend
 	}
 
 	caCertPool := x509.NewCertPool()
+
+	// Add root CA (needed to verify the intermediate CA chain).
+	if rootCACert, err := os.ReadFile(m.config.RootCACertPath); err == nil {
+		caCertPool.AppendCertsFromPEM(rootCACert)
+	}
+
+	// Add own intermediate CA.
 	ownCACert, err := os.ReadFile(m.config.CACertPath)
 	if err != nil {
 		return fmt.Errorf("failed to read own CA certificate: %w", err)
@@ -415,6 +469,8 @@ func (m *MultiKernelManager) notifyRequesterApproveAndMultiHopApproved(req *Pend
 	if peerCert, err := os.ReadFile(peerCACertPath); err == nil {
 		_ = caCertPool.AppendCertsFromPEM(peerCert)
 	}
+
+	// Also add peer's root CA from pending map.
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -547,41 +603,56 @@ func (m *MultiKernelManager) BroadcastKnownKernels(targetKernelID string) error 
 func (m *MultiKernelManager) StartKernelServer() error {
 	address := fmt.Sprintf("%s:%d", m.config.Address, m.config.KernelPort)
 
-	// 创建TLS配置用于内核间通信
-	cert, err := tls.LoadX509KeyPair(m.config.KernelCertPath, m.config.KernelKeyPath)
-	if err != nil {
-		return fmt.Errorf("failed to load kernel certificates: %w", err)
-	}
-
-	// 创建证书池，包含自己的CA和所有已知对等内核的CA
-	caCertPool := x509.NewCertPool()
-
-	// 添加自己的CA证书
-	ownCACert, err := os.ReadFile(m.config.CACertPath)
-	if err != nil {
-		return fmt.Errorf("failed to read own CA certificate: %w", err)
-	}
-	if !caCertPool.AppendCertsFromPEM(ownCACert) {
-		return fmt.Errorf("failed to append own CA certificate")
-	}
-
-	// 添加所有已知对等内核的CA证书
-	m.kernelsMu.RLock()
-	for kernelID := range m.kernels {
-		peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
-		if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
-			if !caCertPool.AppendCertsFromPEM(peerCACert) {
+	// Build the peer-cert getter that checks in-memory map first,
+	// then falls back to disk (peer CA is saved there by RegisterKernelCA).
+	peerCertGetter := func(kernelID string) []byte {
+		m.pendingPeerCACertsMu.RLock()
+		defer m.pendingPeerCACertsMu.RUnlock()
+		// In-memory map has the freshest cert from the latest exchange.
+		if kernelID == "" {
+			// Empty kernelID: iterate all known peers from in-memory map.
+			for _, pem := range m.pendingPeerCACerts {
+				if len(pem) > 0 {
+					return pem
+				}
 			}
+			// No in-memory entries: scan disk for all peer-*.crt files.
+			if entries, err := os.ReadDir("certs"); err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() {
+						continue
+					}
+					if !strings.HasPrefix(entry.Name(), "peer-") || !strings.HasSuffix(entry.Name(), ".crt") {
+						continue
+					}
+					path := filepath.Join("certs", entry.Name())
+					if pem, err := os.ReadFile(path); err == nil && len(pem) > 0 {
+						return pem
+					}
+				}
+			}
+			return nil
 		}
+		if pem, ok := m.pendingPeerCACerts[kernelID]; ok && len(pem) > 0 {
+			return pem
+		}
+		// Fall back to disk so freshly saved peer certs are picked up too.
+		path := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
+		if pem, err := os.ReadFile(path); err == nil && len(pem) > 0 {
+			return pem
+		}
+		return nil
 	}
-	m.kernelsMu.RUnlock()
 
-	creds := credentials.NewTLS(&tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    caCertPool,
-		RootCAs:      caCertPool,
-	})
+	// Use the dynamic TLS credentials for kernel-to-kernel mutual authentication.
+	creds, err := security.NewDynamicTLSCredentials(
+		m.config.KernelCertPath, m.config.KernelKeyPath,
+		m.config.RootCACertPath, m.config.CACertPath, "certs",
+		peerCertGetter,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create dynamic TLS credentials: %w", err)
+	}
 
 	server := grpc.NewServer(grpc.Creds(creds))
 
@@ -622,10 +693,24 @@ func (m *MultiKernelManager) connectToKernelInternal(kernelID, address string, p
 		return fmt.Errorf("failed to load certificates: %w", err)
 	}
 
-	// 创建证书池，包含自己的CA和可能的对等CA
+	// Append intermediate CA to the certificate chain so the peer receives
+	// the full chain (leaf -> intermediate) during TLS handshake.
+	if icPEM, err := os.ReadFile(m.config.CACertPath); err == nil {
+		block, _ := pem.Decode(icPEM)
+		if block != nil && block.Type == "CERTIFICATE" {
+			cert.Certificate = append(cert.Certificate, block.Bytes)
+		}
+	}
+
+	// 创建证书池，包含根CA和自己的中间CA，以及可能的对等中间CA
 	caCertPool := x509.NewCertPool()
 
-	// 添加自己的CA证书
+	// 添加根 CA（用于验证中间 CA 的签名链）
+	if rootCACert, err := os.ReadFile(m.config.RootCACertPath); err == nil {
+		caCertPool.AppendCertsFromPEM(rootCACert)
+	}
+
+	// 添加自己的中间 CA 证书
 	ownCACert, err := os.ReadFile(m.config.CACertPath)
 	if err != nil {
 		return fmt.Errorf("failed to read own CA certificate: %w", err)
@@ -831,10 +916,24 @@ func (m *MultiKernelManager) ConnectToKernel(kernelID, address string, port int,
 		return fmt.Errorf("failed to load certificates: %w", err)
 	}
 
-	// 创建证书池，包含自己的CA和可能的对等CA
+	// Append intermediate CA to the certificate chain so the peer receives
+	// the full chain (leaf -> intermediate) during TLS handshake.
+	if icPEM, err := os.ReadFile(m.config.CACertPath); err == nil {
+		block, _ := pem.Decode(icPEM)
+		if block != nil && block.Type == "CERTIFICATE" {
+			cert.Certificate = append(cert.Certificate, block.Bytes)
+		}
+	}
+
+	// 创建证书池，包含根CA和自己的中间CA，以及可能的对等中间CA
 	caCertPool := x509.NewCertPool()
 
-	// 添加自己的CA证书
+	// 添加根 CA（用于验证中间 CA 的签名链）
+	if rootCACert, err := os.ReadFile(m.config.RootCACertPath); err == nil {
+		caCertPool.AppendCertsFromPEM(rootCACert)
+	}
+
+	// 添加自己的中间 CA 证书
 	ownCACert, err := os.ReadFile(m.config.CACertPath)
 	if err != nil {
 		return fmt.Errorf("failed to read own CA certificate: %w", err)
@@ -1064,10 +1163,24 @@ func (m *MultiKernelManager) EnsureKernelConnected(kernelID string) error {
 		return fmt.Errorf("failed to load certificates: %w", err)
 	}
 
-	// 创建证书池，包含自己的CA和可能的对等CA
+	// Append intermediate CA to the certificate chain so the peer receives
+	// the full chain (leaf -> intermediate) during TLS handshake.
+	if icPEM, err := os.ReadFile(m.config.CACertPath); err == nil {
+		block, _ := pem.Decode(icPEM)
+		if block != nil && block.Type == "CERTIFICATE" {
+			cert.Certificate = append(cert.Certificate, block.Bytes)
+		}
+	}
+
+	// 创建证书池，包含根CA和自己的中间CA，以及可能的对等中间CA
 	caCertPool := x509.NewCertPool()
 
-	// 添加自己的CA证书
+	// 添加根 CA（用于验证中间 CA 的签名链）
+	if rootCACert, err := os.ReadFile(m.config.RootCACertPath); err == nil {
+		caCertPool.AppendCertsFromPEM(rootCACert)
+	}
+
+	// 添加自己的中间 CA 证书
 	ownCACert, err := os.ReadFile(m.config.CACertPath)
 	if err != nil {
 		return fmt.Errorf("failed to read own CA certificate: %w", err)
@@ -1267,7 +1380,16 @@ func (m *MultiKernelManager) connectToKernelIdentityService(kernel *KernelInfo) 
 
 	caCertPool := x509.NewCertPool()
 
-	// 添加自己的CA证书
+	// Add root CA (needed to verify the intermediate CA chain).
+	if rootCACert, err := os.ReadFile(m.config.RootCACertPath); err == nil {
+		if !caCertPool.AppendCertsFromPEM(rootCACert) {
+			log.Printf("[WARN] connectToKernelIdentityService: root CA PEM parse returned false (pool may be empty)")
+		}
+	} else {
+		log.Printf("[WARN] connectToKernelIdentityService: failed to read root CA: %v", err)
+	}
+
+	// 添加自己的中间 CA 证书
 	ownCACert, err := os.ReadFile(m.config.CACertPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read own CA certificate: %w", err)
@@ -1281,11 +1403,12 @@ func (m *MultiKernelManager) connectToKernelIdentityService(kernel *KernelInfo) 
 	peerCACertExists := false
 	if peerCACert, err := os.ReadFile(peerCACertPath); err == nil {
 		if !caCertPool.AppendCertsFromPEM(peerCACert) {
+			log.Printf("[WARN] connectToKernelIdentityService: peer CA PEM parse returned false for %s", kernel.KernelID)
 		} else {
 			peerCACertExists = true
 		}
 	} else {
-		log.Printf("Warning: peer CA certificate not found for kernel %s: %v", kernel.KernelID, err)
+		log.Printf("[WARN] connectToKernelIdentityService: peer CA not found for %s: %v", kernel.KernelID, err)
 	}
 
 	// 构建TLS配置
@@ -1299,7 +1422,7 @@ func (m *MultiKernelManager) connectToKernelIdentityService(kernel *KernelInfo) 
 	// 如果没有对端CA证书，尝试不使用服务器证书验证的方式连接
 	// 这是为了支持动态发现的内核之间的通信
 	if !peerCACertExists {
-		log.Printf("Attempting insecure connection to kernel %s (no peer CA available)", kernel.KernelID)
+		log.Printf("[WARN] connectToKernelIdentityService: falling back to insecure mode for kernel %s", kernel.KernelID)
 		// 使用 InsecureSkipVerify 允许连接到没有预共享CA的内核
 		// 注意：这仍然要求客户端提供证书进行双向认证
 		insecureCertPool := x509.NewCertPool()
@@ -1317,7 +1440,6 @@ func (m *MultiKernelManager) connectToKernelIdentityService(kernel *KernelInfo) 
 	targetAddr := fmt.Sprintf("%s:%d", kernel.Address, kernel.MainPort) // kernel.MainPort是目标内核的主服务器端口
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.config.ConnectTimeout)*time.Second)
 	defer cancel()
-
 	conn, err := grpc.DialContext(ctx, targetAddr, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to kernel %s identity service: %w", kernel.KernelID, err)
@@ -1347,7 +1469,12 @@ func (m *MultiKernelManager) createKernelClient(kernelID, address string, port i
 
 	caCertPool := x509.NewCertPool()
 
-	// 添加自己的CA证书
+	// Add root CA (needed to verify the intermediate CA chain).
+	if rootCACert, err := os.ReadFile(m.config.RootCACertPath); err == nil {
+		caCertPool.AppendCertsFromPEM(rootCACert)
+	}
+
+	// 添加自己的中间 CA 证书
 	ownCACert, err := os.ReadFile(m.config.CACertPath)
 	if err != nil {
 		log.Printf("[ERROR] Failed to read own CA certificate for %s: %v", kernelID, err)
@@ -1718,6 +1845,13 @@ func (m *MultiKernelManager) SyncKnownKernelsToKernel(kernelID string, address s
 	}
 
 	caCertPool := x509.NewCertPool()
+
+	// Add root CA (needed to verify the intermediate CA chain).
+	if rootCACert, err := os.ReadFile(m.config.RootCACertPath); err == nil {
+		caCertPool.AppendCertsFromPEM(rootCACert)
+	}
+
+	// Add own intermediate CA.
 	ownCACert, err := os.ReadFile(m.config.CACertPath)
 	if err != nil {
 		return
@@ -2061,64 +2195,79 @@ func (m *MultiKernelManager) ConnectMultiHopRoute(config *MultiHopConfigFile) er
 	pendingHopCount := 0
 
 	// 依次建立每一跳的连接
-	// creator 连接到 hop.FromKernel（远端发起方），使用 hop.FromAddress 作为目标地址
 	for i, hop := range config.Hops {
 		hopNum := i + 1
-		log.Printf("--- Hop %d: %s -> %s (creator will connect to %s at %s:%d) ---",
-			hopNum, hop.FromKernel, hop.ToKernel, hop.FromKernel, hop.FromAddress, hop.ToPort)
+		isFirstHop := i == 0
 
-		// 跳过自身：hop.FromKernel 是当前内核本身，不需要建立连接
+		// 跳过自身：目标等于当前内核时跳过
 		if hop.FromKernel == m.config.KernelID {
-			log.Printf("  [SKIP] Skipping hop %d: from_kernel %s is the current kernel",
-				hopNum, hop.FromKernel)
-			continue
+			log.Printf("--- Hop %d: %s -> %s (from is current kernel, skip from connection) ---",
+				hopNum, hop.FromKernel, hop.ToKernel)
 		}
 
-		// 检查是否需要连接（仅当未连接时）
-		// 注意：检查的是 from_kernel（远端发起方）是否已连接
-		m.kernelsMu.RLock()
-		existingKernel, alreadyConnected := m.kernels[hop.FromKernel]
-		m.kernelsMu.RUnlock()
-
-		if alreadyConnected && existingKernel.conn != nil && existingKernel.Client != nil {
-			log.Printf("  [SKIP] %s already connected", hop.FromKernel)
-			continue
+		// 建立连接：第一跳需要建立两个连接（from 和 to），其他跳只需建立 to 连接
+		targets := []struct {
+			kernel  string
+			address string
+			port    int
+			role    string
+		}{
+			{hop.ToKernel, hop.ToAddress, hop.ToPort, "to"},
+		}
+		if isFirstHop {
+			targets = append(targets, struct {
+				kernel  string
+				address string
+				port    int
+				role    string
+			}{hop.FromKernel, hop.FromAddress, hop.ToPort, "from"})
 		}
 
-		// 尝试连接到 hop.FromKernel（远端发起方）
-		// 使用 hop.FromAddress 和 hop.ToPort 作为目标地址
-		// 注意：这里使用 interconnectRequest=true，因为需要对方审批才能建立连接
-		if err := m.connectToKernelInternal(hop.FromKernel, hop.FromAddress, hop.ToPort, true); err != nil {
-			// 检查是否是"已连接"错误
-			if strings.Contains(err.Error(), "already connected") {
+		for _, target := range targets {
+			// 跳过自身
+			if target.kernel == m.config.KernelID {
 				continue
 			}
 
-			// 检查是否是待审批错误
-			if strings.HasPrefix(err.Error(), "interconnect_pending:") {
-				requestID := strings.TrimPrefix(err.Error(), "interconnect_pending:")
+			// 检查是否已连接
+			m.kernelsMu.RLock()
+			existingKernel, alreadyConnected := m.kernels[target.kernel]
+			m.kernelsMu.RUnlock()
 
-				// 注册待审批的 hop 到会话中，以便收到批准通知后自动重连
-				// 注意：连接目标是 from_kernel（远端发起方）
-				hopInfo := &PendingHopInfo{
-					RouteName:  config.RouteName,
-					HopIndex:   hopNum,
-					HopTotal:   len(config.Hops),
-					ToKernelID: hop.FromKernel, // 连接目标是 from_kernel
-					ToAddress:  hop.FromAddress,
-					ToPort:     hop.ToPort,
-					RequestID:  requestID,
-					Approved:   false,
+			if alreadyConnected && existingKernel.conn != nil && existingKernel.Client != nil {
+				log.Printf("--- Hop %d: %s -> %s (connect to %s[%s]) - already connected ---",
+					hopNum, hop.FromKernel, hop.ToKernel, target.kernel, target.role)
+				continue
+			}
+
+			log.Printf("--- Hop %d: %s -> %s (creator connect to %s[%s] at %s:%d) ---",
+				hopNum, hop.FromKernel, hop.ToKernel, target.kernel, target.role, target.address, target.port)
+
+			// 尝试建立连接
+			if err := m.connectToKernelInternal(target.kernel, target.address, target.port, true); err != nil {
+				if strings.Contains(err.Error(), "already connected") {
+					continue
 				}
-				m.RegisterPendingHop(session, hopNum, hopInfo)
-				pendingHopCount++
-				continue
+				if strings.HasPrefix(err.Error(), "interconnect_pending:") {
+					requestID := strings.TrimPrefix(err.Error(), "interconnect_pending:")
+					hopInfo := &PendingHopInfo{
+						RouteName:  config.RouteName,
+						HopIndex:   hopNum,
+						HopTotal:   len(config.Hops),
+						ToKernelID: target.kernel,
+						ToAddress:  target.address,
+						ToPort:     target.port,
+						RequestID:  requestID,
+						Approved:   false,
+					}
+					m.RegisterPendingHop(session, hopNum, hopInfo)
+					pendingHopCount++
+					continue
+				}
+				log.Printf("  [ERROR] Failed to connect to %s: %v", target.kernel, err)
+				return fmt.Errorf("hop %d: failed to connect to %s: %w", hopNum, target.kernel, err)
 			}
-
-			log.Printf("  [ERROR] Failed to connect to %s: %v", hop.FromKernel, err)
-			return fmt.Errorf("hop %d: failed to connect to %s: %w", hopNum, hop.FromKernel, err)
 		}
-
 	}
 
 	// 如果有待审批请求，不再返回错误，而是启动后台等待
@@ -2199,9 +2348,9 @@ func (m *MultiKernelManager) GetMultiHopRouteInfo(config *MultiHopConfigFile) st
 	info += "Path:\n"
 
 	for i, hop := range config.Hops {
-		// 检查连接状态（creator 连接到 from_kernel）
+		// 检查连接状态（creator 连接到 to_kernel，即下一跳）
 		m.kernelsMu.RLock()
-		kernelInfo, connected := m.kernels[hop.FromKernel]
+		kernelInfo, connected := m.kernels[hop.ToKernel]
 		m.kernelsMu.RUnlock()
 
 		status := "[ERROR] Not connected"
@@ -2209,8 +2358,8 @@ func (m *MultiKernelManager) GetMultiHopRouteInfo(config *MultiHopConfigFile) st
 			status = "[OK] Connected"
 		}
 
-		info += fmt.Sprintf("  %d. %s(%s:%d) -> %s [%s]\n",
-			i+1, hop.FromKernel, hop.FromAddress, hop.ToPort, hop.ToKernel, status)
+		info += fmt.Sprintf("  %d. %s -> %s(%s:%d) [%s]\n",
+			i+1, hop.FromKernel, hop.ToKernel, hop.ToAddress, hop.ToPort, status)
 	}
 
 	return info

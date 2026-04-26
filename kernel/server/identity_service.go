@@ -684,3 +684,60 @@ func (s *IdentityServiceServer) SetConnectorStatus(ctx context.Context, req *pb.
 	}, nil
 }
 
+// RegisterKernelCA handles inter-kernel CA certificate exchange.
+// Through the bootstrap port (no mTLS), it exchanges both intermediate CA
+// and root CA certificates so that subsequent mTLS handshakes can verify
+// each other's certificate chains.
+func (s *IdentityServiceServer) RegisterKernelCA(ctx context.Context, req *pb.RegisterKernelCARequest) (*pb.RegisterKernelCAResponse, error) {
+	// 验证请求
+	if req.KernelId == "" {
+		return &pb.RegisterKernelCAResponse{
+			Success: false,
+			Message: "kernel_id is required",
+		}, nil
+	}
+	if len(req.CaCertificate) == 0 {
+		return &pb.RegisterKernelCAResponse{
+			Success: false,
+			Message: "ca_certificate is required",
+		}, nil
+	}
+
+	// 避免自己注册自己
+	if req.KernelId == s.multiKernelManager.config.KernelID {
+		return &pb.RegisterKernelCAResponse{
+			Success: false,
+			Message: fmt.Sprintf("kernel ID conflict: cannot register CA for self (%s)", req.KernelId),
+		}, nil
+	}
+
+	// 保存对方的中间 CA 证书
+	peerCACertPath := fmt.Sprintf("certs/peer-%s-ca.crt", req.KernelId)
+	if err := os.WriteFile(peerCACertPath, req.CaCertificate, 0644); err != nil {
+		log.Printf("[WARN] RegisterKernelCA: failed to save peer CA certificate for %s: %v", req.KernelId, err)
+		return &pb.RegisterKernelCAResponse{
+			Success: false,
+			Message: fmt.Sprintf("failed to save peer CA certificate: %v", err),
+		}, nil
+	}
+	log.Printf("[OK] RegisterKernelCA: saved peer CA certificate for %s from %s", req.KernelId, req.KernelId)
+
+	// 读取自己的中间 CA 证书返回给对方
+	ownCACertPath := s.multiKernelManager.config.CACertPath
+	ownCACertData, err := os.ReadFile(ownCACertPath)
+	if err != nil {
+		log.Printf("[WARN] RegisterKernelCA: failed to read own CA certificate: %v", err)
+		return &pb.RegisterKernelCAResponse{
+			Success:           true,
+			Message:           fmt.Sprintf("peer CA saved, but failed to read own CA: %v", err),
+			PeerCaCertificate: nil,
+		}, nil
+	}
+
+	return &pb.RegisterKernelCAResponse{
+		Success:           true,
+		Message:           fmt.Sprintf("CA exchange completed with %s", req.KernelId),
+		PeerCaCertificate: ownCACertData,
+	}, nil
+}
+

@@ -28,6 +28,10 @@ service IdentityService {
 
   // 证书注册服务：首次连接时动态申请证书
   rpc RegisterConnector (RegisterConnectorRequest) returns (RegisterConnectorResponse);
+
+  // 内核 CA 交换：内核间互联前，预先交换中间 CA 证书，
+  // 使得后续 mTLS 握手时能够验证对方证书链
+  rpc RegisterKernelCA (RegisterKernelCARequest) returns (RegisterKernelCAResponse);
 }
 
 message HandshakeRequest {
@@ -165,5 +169,20 @@ message RegisterConnectorResponse {
   bytes private_key = 4;        // PEM格式的私钥
   bytes ca_certificate = 5;      // PEM格式的CA证书
   string connector_id = 6;      // 确认的连接器ID
+}
+
+// ------------------------------------------------------------
+// 内核 CA 交换消息定义
+// ------------------------------------------------------------
+message RegisterKernelCARequest {
+  string kernel_id = 1;           // 内核ID
+  bytes ca_certificate = 2;        // PEM格式的中间CA证书
+  int64 timestamp = 3;
+}
+
+message RegisterKernelCAResponse {
+  bool success = 1;
+  string message = 2;
+  bytes peer_ca_certificate = 3;  // 对端返回的中间CA证书
 }
 

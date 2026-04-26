@@ -55,7 +55,7 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 	// 验证内核ID不冲突
 	if req.KernelId == s.multiKernelManager.config.KernelID {
 		// 即使ID冲突，也返回本端CA证书以便对方保存
-		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
+		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.IntermediateCAPath)
 		if err != nil {
 			ownCACertData = nil
 		}
@@ -73,7 +73,7 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 
 	if exists {
 		// 即使内核已注册，也需要返回本端CA证书以便对方保存
-		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
+		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.IntermediateCAPath)
 		if err != nil {
 			ownCACertData = nil
 		}
@@ -94,6 +94,8 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 			} else {
 				// suppressed detailed CA saved log
 			}
+			// Also store in-memory so the dynamic TLS server can use it immediately
+			s.multiKernelManager.SetPendingPeerCACert(req.KernelId, req.CaCertificate)
 		}
 
 		// 创建内核信息并保存（直接认为已注册）
@@ -128,7 +130,7 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 		// 注意：kernel-1 作为被批准方（接收方），kernel-2 已在自己的 RegisterKernel 响应中记录了 INTERCONNECT_APPROVED 事件，
 		// 故 kernel-1 此处不再重复记录。
 
-		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
+		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.IntermediateCAPath)
 		if err != nil {
 			ownCACertData = nil
 		}
@@ -163,6 +165,12 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 		// add to pending list
 		s.multiKernelManager.AddPendingRequest(pending)
 
+		// Store the peer CA cert in-memory so the dynamic TLS server can use it
+		// immediately for subsequent connections from this peer.
+		if len(req.CaCertificate) > 0 {
+			s.multiKernelManager.SetPendingPeerCACert(req.KernelId, req.CaCertificate)
+		}
+
 		// 记录互联请求存证
 		if s.auditLog != nil {
 			s.auditLog.SubmitBasicEvidence(
@@ -176,7 +184,7 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 		}
 
 		// 尝试读取自己的 CA 证书返回给对端（方便对端保存）
-		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
+		ownCACertData, err := os.ReadFile(s.multiKernelManager.config.IntermediateCAPath)
 		if err != nil {
 			ownCACertData = nil
 		}
@@ -198,6 +206,8 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 			log.Printf("Warning: failed to save peer CA certificate for %s: %v", req.KernelId, err)
 		} else {
 		}
+		// Also store in-memory so the dynamic TLS server can use it immediately.
+		s.multiKernelManager.SetPendingPeerCACert(req.KernelId, req.CaCertificate)
 	}
 
 	// 创建内核信息
@@ -235,7 +245,7 @@ func (s *KernelServiceServer) RegisterKernel(ctx context.Context, req *pb.Regist
 	go s.multiKernelManager.BroadcastKnownKernels(req.KernelId)
 
 	// 读取自己的CA证书
-	ownCACertData, err := os.ReadFile(s.multiKernelManager.config.CACertPath)
+	ownCACertData, err := os.ReadFile(s.multiKernelManager.config.IntermediateCAPath)
 	if err != nil {
 		log.Printf("Warning: failed to read own CA certificate: %v", err)
 		ownCACertData = nil

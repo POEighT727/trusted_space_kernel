@@ -141,16 +141,22 @@ Test-Port 50052 "引导服务"
 Test-Port 50053 "内核间通信"
 
 # 检查证书
-if (Test-Path "certs\ca.crt") {
-    Write-Host "[OK] CA证书存在" -ForegroundColor Green
+if (Test-Path "certs\root_ca.crt") {
+    Write-Host "[OK] Root CA证书存在" -ForegroundColor Green
 } else {
-    Write-Host "⚠️  CA证书不存在（首次运行时自动生成）" -ForegroundColor Yellow
+    Write-Host "[WARN] Root CA证书不存在（首次运行时自动生成）" -ForegroundColor Yellow
+}
+
+if (Test-Path "certs\ca.crt") {
+    Write-Host "[OK] Kernel CA证书存在" -ForegroundColor Green
+} else {
+    Write-Host "[WARN] Kernel CA证书不存在（首次运行时自动生成）" -ForegroundColor Yellow
 }
 
 if (Test-Path "certs\kernel.crt") {
     Write-Host "[OK] 服务器证书存在" -ForegroundColor Green
 } else {
-    Write-Host "⚠️  服务器证书不存在（首次运行时自动生成）" -ForegroundColor Yellow
+    Write-Host "[WARN] 服务器证书不存在（首次运行时自动生成）" -ForegroundColor Yellow
 }
 
 # 检查配置文件
@@ -167,25 +173,21 @@ Write-Host "=== 状态检查完成 ===" -ForegroundColor Cyan
 
     # 创建证书生成脚本
     $CertScript = @"
-# 证书生成脚本 (PowerShell) - 为内核预生成证书
+# 证书生成脚本 (PowerShell) - 为内核预生成证书（两级 CA 结构）
 
-Write-Host "🔐 开始生成内核证书..." -ForegroundColor Cyan
+Write-Host "Generating kernel certificates..." -ForegroundColor Cyan
 
-# 检查openssl是否可用
 if (!(Get-Command openssl -ErrorAction SilentlyContinue)) {
-    Write-Host "[FAILED] 错误：需要安装openssl" -ForegroundColor Red
-    Write-Host "   请从 https://slproweb.com/products/Win32OpenSSL.html 下载并安装" -ForegroundColor Yellow
+    Write-Host "[FAILED] openssl not found" -ForegroundColor Red
+    Write-Host "   Please install OpenSSL first" -ForegroundColor Yellow
     exit 1
 }
 
-# 检查配置文件
 if (!(Test-Path "config\kernel.yaml")) {
-    Write-Host "错误：找不到配置文件 config\kernel.yaml" -ForegroundColor Red
-    Write-Host "请先创建配置文件" -ForegroundColor Yellow
+    Write-Host "Error: config\kernel.yaml not found" -ForegroundColor Red
     exit 1
 }
 
-# 读取配置（简单的文本解析）
 function Get-ConfigValue {
     param([string]`$key, [string]`$file)
     `$line = Get-Content `$file | Where-Object { `$_ -match "^`${key}:" }
@@ -197,51 +199,73 @@ function Get-ConfigValue {
 }
 
 `$kernelId = Get-ConfigValue "id" "config\kernel.yaml"
-if ([string]::IsNullOrEmpty(`$kernelId)) {
-    `$kernelId = "kernel-1"
-}
+if ([string]::IsNullOrEmpty(`$kernelId)) { `$kernelId = "kernel-1" }
 
 `$address = Get-ConfigValue "address" "config\kernel.yaml"
-if ([string]::IsNullOrEmpty(`$address)) {
-    `$address = "0.0.0.0"
-}
+if ([string]::IsNullOrEmpty(`$address)) { `$address = "0.0.0.0" }
 
-Write-Host "   内核ID: `$kernelId" -ForegroundColor White
-Write-Host "   服务器地址: `$address" -ForegroundColor White
+Write-Host "   Kernel ID: `$kernelId" -ForegroundColor White
+Write-Host "   Server address: `$address" -ForegroundColor White
 
-# 创建证书目录
 New-Item -ItemType Directory -Path "certs" -Force | Out-Null
 
-# 生成CA证书（如果不存在）
-if (!(Test-Path "certs\ca.crt")) {
-    Write-Host "   生成CA根证书..." -ForegroundColor Yellow
+# 1. 生成外部根 CA（自签名）
+if (!(Test-Path "certs\root_ca.crt")) {
+    Write-Host "   Step 1: Generating external root CA..." -ForegroundColor Yellow
+    & openssl genrsa -out certs\root_ca.key 4096 2>`$null
+    & openssl req -new -x509 -days 7300 -key certs\root_ca.key -sha256 -out certs\root_ca.crt `
+        -subj "/C=CN/ST=Beijing/L=Beijing/O=Trusted Data Space/CN=Trusted Data Space Root CA" 2>`$null
+    Write-Host "   [OK] Root CA created: certs\root_ca.crt" -ForegroundColor Green
+} else {
+    Write-Host "   [OK] Root CA already exists" -ForegroundColor Green
+}
 
-    # 生成CA私钥
+# 2. 生成内核中间 CA（由根 CA 签发）
+if (!(Test-Path "certs\ca.crt")) {
+    Write-Host "   Step 2: Generating kernel intermediate CA..." -ForegroundColor Yellow
+
     & openssl genrsa -out certs\ca.key 4096 2>`$null
 
-    # 生成CA证书
-    & openssl req -new -x509 -days 3650 -key certs\ca.key -sha256 -out certs\ca.crt `
-        -subj "/C=CN/ST=State/L=City/O=Trusted Data Space/CN=Trusted Data Space CA" 2>`$null
+    & openssl req -new -key certs\ca.key -out certs\ca.csr `
+        -subj "/C=CN/ST=Beijing/L=Beijing/O=Trusted Data Space/CN=Trusted Data Space Kernel CA" 2>`$null
 
-    Write-Host "   [OK] CA证书生成完成" -ForegroundColor Green
+    `$extContent = @"
+basicConstraints = CA:TRUE, pathlen:1
+keyUsage = cRLSign, keyCertSign, digitalSignature
+extendedKeyUsage = serverAuth, clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+"@
+    `$extContent | Out-File -FilePath "certs\ca.ext" -Encoding ASCII
+
+    & openssl x509 -req -days 3650 `
+        -in certs\ca.csr `
+        -CA certs\root_ca.crt `
+        -CAkey certs\root_ca.key `
+        -CAcreateserial `
+        -out certs\ca.crt `
+        -extfile certs\ca.ext 2>`$null
+
+    Remove-Item "certs\ca.csr", "certs\ca.ext" -ErrorAction SilentlyContinue
+    Remove-Item "certs\root_ca.srl" -ErrorAction SilentlyContinue
+
+    Write-Host "   [OK] Kernel intermediate CA created: certs\ca.crt" -ForegroundColor Green
 } else {
-    Write-Host "   [OK] CA证书已存在" -ForegroundColor Green
+    Write-Host "   [OK] Kernel intermediate CA already exists" -ForegroundColor Green
 }
 
-# 生成服务器私钥（如果不存在）
+# 3. 生成服务器证书（由内核中间 CA 签发）
 if (!(Test-Path "certs\kernel.key")) {
-    Write-Host "   生成服务器私钥..." -ForegroundColor Yellow
+    Write-Host "   Step 3: Generating server key..." -ForegroundColor Yellow
     & openssl genrsa -out certs\kernel.key 2048 2>`$null
-    Write-Host "   [OK] 服务器私钥生成完成" -ForegroundColor Green
+    Write-Host "   [OK] Server key generated" -ForegroundColor Green
 } else {
-    Write-Host "   [OK] 服务器私钥已存在" -ForegroundColor Green
+    Write-Host "   [OK] Server key already exists" -ForegroundColor Green
 }
 
-# 生成服务器证书（如果不存在）
 if (!(Test-Path "certs\kernel.crt")) {
-    Write-Host "   生成服务器证书..." -ForegroundColor Yellow
+    Write-Host "   Step 4: Generating server certificate..." -ForegroundColor Yellow
 
-    # 创建OpenSSL配置文件
     `$configContent = @"
 [req]
 distinguished_name = req_distinguished_name
@@ -250,14 +274,14 @@ prompt = no
 
 [req_distinguished_name]
 C = CN
-ST = State
-L = City
+ST = Beijing
+L = Beijing
 O = Trusted Data Space
 CN = `$kernelId
 
 [v3_req]
 keyUsage = keyEncipherment, dataEncipherment
-extendedKeyUsage = serverAuth
+extendedKeyUsage = serverAuth, clientAuth
 subjectAltName = @alt_names
 
 [alt_names]
@@ -266,35 +290,30 @@ DNS.2 = localhost
 IP.1 = 127.0.0.1
 IP.2 = `$address
 "@
-
     `$configContent | Out-File -FilePath "certs\kernel.cnf" -Encoding ASCII
 
-    # 生成证书请求
     & openssl req -new -key certs\kernel.key -out certs\kernel.csr -config certs\kernel.cnf 2>`$null
 
-    # 使用CA签发证书
     & openssl x509 -req -in certs\kernel.csr -CA certs\ca.crt -CAkey certs\ca.key `
         -CAcreateserial -out certs\kernel.crt -days 365 -sha256 `
         -extensions v3_req -extfile certs\kernel.cnf 2>`$null
 
-    # 清理临时文件
     Remove-Item "certs\kernel.cnf", "certs\kernel.csr" -ErrorAction SilentlyContinue
-    if (Test-Path "certs\ca.srl") { Remove-Item "certs\ca.srl" }
+    Remove-Item "certs\ca.srl" -ErrorAction SilentlyContinue
 
-    Write-Host "   [OK] 服务器证书生成完成" -ForegroundColor Green
+    Write-Host "   [OK] Server certificate created" -ForegroundColor Green
 } else {
-    Write-Host "   [OK] 服务器证书已存在" -ForegroundColor Green
+    Write-Host "   [OK] Server certificate already exists" -ForegroundColor Green
 }
 
 Write-Host ""
-Write-Host "🎉 证书生成完成！" -ForegroundColor Green
-Write-Host "   CA证书: certs\ca.crt" -ForegroundColor White
-Write-Host "   CA私钥: certs\ca.key" -ForegroundColor White
-Write-Host "   服务器证书: certs\kernel.crt" -ForegroundColor White
-Write-Host "   服务器私钥: certs\kernel.key" -ForegroundColor White
+Write-Host "[OK] All certificates generated!" -ForegroundColor Green
+Write-Host "   Root CA (external):        certs\root_ca.crt, certs\root_ca.key"
+Write-Host "   Kernel CA (intermediate):  certs\ca.crt, certs\ca.key"
+Write-Host "   Server certificate:       certs\kernel.crt, certs\kernel.key"
 Write-Host ""
-Write-Host "现在可以启动内核了：" -ForegroundColor Cyan
-Write-Host "   .\start.ps1" -ForegroundColor White
+Write-Host "Verify:"
+Write-Host "   openssl verify -CAfile root_ca.crt -untrusted ca.crt kernel.crt"
 "@
 
     $CertScript | Out-File -FilePath "$KernelDir\generate_certs.ps1" -Encoding UTF8
@@ -355,7 +374,7 @@ address: "192.168.1.100"       # 修改为服务器地址
 port: 50051                      # 服务器端口
 
 # 安全配置
-ca_cert_path: "certs\ca.crt"
+ca_cert_path: "certs\root_ca.crt"
 client_cert_path: "certs\${ComponentName,,}-X.crt"
 client_key_path: "certs\${ComponentName,,}-X.key"
 server_name: "trusted-data-space-kernel"
@@ -444,8 +463,9 @@ Copy-Item config\kernel-template.yaml config\kernel.yaml
 ```
 
 证书生成脚本会：
-- 生成CA根证书和私钥
-- 生成服务器证书和私钥
+- 生成外部根CA证书和私钥（self-signed）
+- 生成内核中间CA证书和私钥（由根CA签发）
+- 生成服务器证书和私钥（由中间CA签发）
 - 基于配置文件中的内核ID和地址配置证书
 "@
 }

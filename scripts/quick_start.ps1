@@ -68,7 +68,7 @@ function Generate-Proto {
 
 # 生成证书
 function Generate-Certificates {
-    if (Test-Path "certs/ca.crt") {
+    if (Test-Path "certs/root_ca.crt") {
         Write-Host "Certificates already exist, skipping..." -ForegroundColor Yellow
     } else {
         Write-Host "Generating test certificates..." -ForegroundColor Cyan

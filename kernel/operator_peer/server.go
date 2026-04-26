@@ -349,7 +349,6 @@ func (s *P2PServer) handleSyncConnectors(peer *PeerConnection, packet *Packet) {
 		return
 	}
 
-	log.Printf("[P2P] Sync connectors from %s: %d connectors", payload.SourceKernelID, len(payload.Connectors))
 
 	var ackPayload *SyncConnectorsAckPayload
 	if s.onSyncConnectors != nil {

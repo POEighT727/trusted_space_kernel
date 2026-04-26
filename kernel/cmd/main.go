@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -58,8 +59,9 @@ type Config struct {
 	} `yaml:"multi_kernel"`
 
 	Security struct {
-		CACertPath     string `yaml:"ca_cert_path"`
-		CAKeyPath      string `yaml:"ca_key_path"`      // CA私钥路径
+		RootCACertPath  string `yaml:"root_ca_cert_path"` // 根CA证书路径
+		CACertPath      string `yaml:"ca_cert_path"`     // 中间CA证书路径
+		CAKeyPath       string `yaml:"ca_key_path"`     // CA私钥路径
 		ServerCertPath string `yaml:"server_cert_path"`
 		ServerKeyPath  string `yaml:"server_key_path"`
 		// 内核间通信证书
@@ -318,6 +320,8 @@ func main() {
 		Port:              config.Server.Port,
 		KernelPort:        config.MultiKernel.KernelPort,
 		CACertPath:        config.Security.CACertPath,
+		RootCACertPath:     config.Security.RootCACertPath,
+		IntermediateCAPath: config.Security.CACertPath,
 		KernelCertPath:    config.Security.KernelCertPath,
 		KernelKeyPath:     config.Security.KernelKeyPath,
 		HeartbeatInterval: config.MultiKernel.HeartbeatInterval,
@@ -534,18 +538,64 @@ func main() {
 		// (config.P2P.Peers 配置保留，仅作参考/记录用途)
 	}
 
-	// 10. mTLS 配置
-	mtlsConfig := &security.MTLSConfig{
-		CACertPath:     config.Security.CACertPath,
-		ServerCertPath: config.Security.ServerCertPath,
-		ServerKeyPath:  config.Security.ServerKeyPath,
+	// Build the peer-cert getter for dynamic TLS. It reads from in-memory
+	// map (freshest certs) and falls back to disk (peer-*.crt files saved by RegisterKernelCA).
+	peerCertGetter := func(kernelID string) []byte {
+		multiKernelManager.PendingPeerCACertsMu().RLock()
+		defer multiKernelManager.PendingPeerCACertsMu().RUnlock()
+		if kernelID == "" {
+			for _, pem := range multiKernelManager.PendingPeerCACerts() {
+				if len(pem) > 0 {
+					return pem
+				}
+			}
+			if entries, err := os.ReadDir("certs"); err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() {
+						continue
+					}
+					if !strings.HasPrefix(entry.Name(), "peer-") || !strings.HasSuffix(entry.Name(), ".crt") {
+						continue
+					}
+					path := filepath.Join("certs", entry.Name())
+					if pem, err := os.ReadFile(path); err == nil && len(pem) > 0 {
+						return pem
+					}
+				}
+			}
+			return nil
+		}
+		if pem, ok := multiKernelManager.PendingPeerCACerts()[kernelID]; ok && len(pem) > 0 {
+			return pem
+		}
+		path := fmt.Sprintf("certs/peer-%s-ca.crt", kernelID)
+		if pem, err := os.ReadFile(path); err == nil && len(pem) > 0 {
+			return pem
+		}
+		return nil
 	}
 
-	creds, err := security.NewServerTransportCredentials(mtlsConfig)
+	// Use DynamicTLSCredentials so the main gRPC server dynamically loads
+	// peer intermediate CA certs (received via RegisterKernelCA) before each
+	// TLS handshake. Without this, inter-kernel connections to port 50051 would
+	// fail because the server only trusts its own CA at startup.
+	creds, err := security.NewDynamicServerTransportCredentials(
+		config.Security.ServerCertPath, config.Security.ServerKeyPath,
+		config.Security.RootCACertPath, config.Security.CACertPath, "certs",
+		peerCertGetter,
+	)
 	if err != nil {
-		log.Fatalf("Failed to setup mTLS: %v", err)
+		log.Fatalf("Failed to setup dynamic mTLS: %v", err)
 	}
-	log.Println("[OK] mTLS configured")
+	log.Println("[OK] Dynamic mTLS configured")
+
+	// Bootstrap server still uses static mtlsConfig for simplicity.
+	mtlsConfig := &security.MTLSConfig{
+		RootCACertPath:    config.Security.RootCACertPath,
+		IntermediateCAPath: config.Security.CACertPath,
+		ServerCertPath:    config.Security.ServerCertPath,
+		ServerKeyPath:     config.Security.ServerKeyPath,
+	}
 
 	// 创建 gRPC 服务器
 	grpcServer := grpc.NewServer(

@@ -12,19 +12,29 @@ import (
 	"time"
 )
 
-// CA 表示内部证书颁发机构
+// CA represents the kernel's intermediate CA used to issue connector certificates.
+// It is signed by an external root CA for proper PKI hierarchy.
 type CA struct {
-	CertPath string
-	KeyPath  string
-	Cert     *x509.Certificate
-	Key      *rsa.PrivateKey
+	CertPath   string
+	KeyPath    string
+	RootCertPath string // path to the external root CA certificate
+	Cert      *x509.Certificate
+	Key       *rsa.PrivateKey
+	RootCert  *x509.Certificate
 }
 
-// NewCA 创建或加载一个 CA
-func NewCA(certPath, keyPath string) (*CA, error) {
+// NewCA creates or loads the kernel's intermediate CA.
+// If rootCertPath is provided, the intermediate CA certificate is verified
+// against the root CA during loading.
+func NewCA(certPath, keyPath string, rootCertPath ...string) (*CA, error) {
 	ca := &CA{
-		CertPath: certPath,
-		KeyPath:  keyPath,
+		CertPath:     certPath,
+		KeyPath:      keyPath,
+		RootCertPath: "",
+	}
+
+	if len(rootCertPath) > 0 {
+		ca.RootCertPath = rootCertPath[0]
 	}
 
 	// 尝试加载现有证书
@@ -93,9 +103,9 @@ func (ca *CA) generate() error {
 	return nil
 }
 
-// load 从文件加载 CA 证书和私钥
+// load 从文件加载 CA 证书和私钥，并验证其由根CA签发
 func (ca *CA) load() error {
-	// 读取证书
+	// 读取中间CA证书
 	certPEM, err := os.ReadFile(ca.CertPath)
 	if err != nil {
 		return fmt.Errorf("failed to read cert file: %w", err)
@@ -109,6 +119,43 @@ func (ca *CA) load() error {
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	// 如果配置了根CA证书路径，加载并验证中间CA的签名链
+	if ca.RootCertPath != "" {
+		rootCertPEM, err := os.ReadFile(ca.RootCertPath)
+		if err != nil {
+			return fmt.Errorf("failed to read root CA cert file: %w", err)
+		}
+
+		rootBlock, _ := pem.Decode(rootCertPEM)
+		if rootBlock == nil {
+			return fmt.Errorf("failed to decode root CA PEM block")
+		}
+
+		rootCert, err := x509.ParseCertificate(rootBlock.Bytes)
+		if err != nil {
+			return fmt.Errorf("failed to parse root CA certificate: %w", err)
+		}
+
+		// 验证中间CA证书由根CA签发
+		roots := x509.NewCertPool()
+		roots.AddCert(rootCert)
+
+		intermediates := x509.NewCertPool()
+		intermediates.AddCert(cert)
+
+		verifyOpts := x509.VerifyOptions{
+			Roots:         roots,
+			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		}
+
+		if _, err := cert.Verify(verifyOpts); err != nil {
+			return fmt.Errorf("intermediate CA certificate is not signed by root CA: %w", err)
+		}
+
+		ca.RootCert = rootCert
 	}
 
 	// 读取私钥

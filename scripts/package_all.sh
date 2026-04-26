@@ -163,16 +163,22 @@ check_port 50052 "引导服务"
 check_port 50053 "内核间通信"
 
 # 检查证书
-if [ -f "certs/ca.crt" ]; then
-    echo "[OK] CA证书存在"
+if [ -f "certs/root_ca.crt" ]; then
+    echo "[OK] Root CA证书存在"
 else
-    echo "⚠️  CA证书不存在（首次运行时自动生成）"
+    echo "[WARN] Root CA证书不存在（首次运行时自动生成）"
+fi
+
+if [ -f "certs/ca.crt" ]; then
+    echo "[OK] Kernel CA证书存在"
+else
+    echo "[WARN] Kernel CA证书不存在（首次运行时自动生成）"
 fi
 
 if [ -f "certs/kernel.crt" ]; then
     echo "[OK] 服务器证书存在"
 else
-    echo "⚠️  服务器证书不存在（首次运行时自动生成）"
+    echo "[WARN] 服务器证书不存在（首次运行时自动生成）"
 fi
 
 # 检查配置文件
@@ -190,76 +196,91 @@ EOF
     # 创建证书生成脚本
     cat > "${KERNEL_DIR}/generate_certs.sh" << 'CERT_EOF'
 #!/bin/bash
-# 证书生成脚本 - 为内核预生成证书
+# 证书生成脚本 - 为内核预生成证书（两级 CA 结构）
 
 set -e
 
-echo "🔐 开始生成内核证书..."
+echo "Generating kernel certificates..."
 
-# 检查openssl是否可用
 if ! command -v openssl &> /dev/null; then
-    echo "[FAILED] 错误：需要安装openssl"
+    echo "[FAILED] openssl not found"
     echo "   Ubuntu/Debian: sudo apt-get install openssl"
-    echo "   CentOS/RHEL: sudo yum install openssl"
     echo "   macOS: brew install openssl"
     exit 1
 fi
 
-# 检查配置文件
 if [ ! -f "config/kernel.yaml" ]; then
-    echo "错误：找不到配置文件 config/kernel.yaml"
-    echo "请先创建配置文件"
+    echo "Error: config/kernel.yaml not found"
     exit 1
 fi
 
-# 读取配置（简单的YAML解析）
 get_config_value() {
-    local key=$1
-    local file=$2
-    grep "^${key}:" "$file" | sed 's/.*: *//' | tr -d '"' || echo ""
+    grep "^${1}:" "$2" | sed 's/.*: *//' | tr -d '"' || echo ""
 }
 
 KERNEL_ID=$(get_config_value "id" config/kernel.yaml)
-if [ -z "$KERNEL_ID" ]; then
-    KERNEL_ID="kernel-1"
-fi
+if [ -z "$KERNEL_ID" ]; then KERNEL_ID="kernel-1"; fi
 
 ADDRESS=$(get_config_value "address" config/kernel.yaml)
-if [ -z "$ADDRESS" ]; then
-    ADDRESS="0.0.0.0"
-fi
+if [ -z "$ADDRESS" ]; then ADDRESS="0.0.0.0"; fi
 
-echo "   内核ID: $KERNEL_ID"
-echo "   服务器地址: $ADDRESS"
+echo "   Kernel ID: $KERNEL_ID"
+echo "   Server address: $ADDRESS"
 
-# 创建证书目录
 mkdir -p certs
 
-# 生成CA证书（如果不存在）
+# 1. 生成外部根 CA（自签名）
+if [ ! -f "certs/root_ca.crt" ]; then
+    echo "   Step 1: Generating external root CA..."
+    openssl genrsa -out certs/root_ca.key 4096 2>/dev/null
+    openssl req -new -x509 -days 7300 -key certs/root_ca.key -sha256 -out certs/root_ca.crt \
+        -subj "/C=CN/ST=Beijing/L=Beijing/O=Trusted Data Space/CN=Trusted Data Space Root CA" 2>/dev/null
+    echo "   [OK] Root CA created: certs/root_ca.crt"
+else
+    echo "   [OK] Root CA already exists"
+fi
+
+# 2. 生成内核中间 CA（由根 CA 签发）
 if [ ! -f "certs/ca.crt" ]; then
-    echo "   生成CA根证书..."
+    echo "   Step 2: Generating kernel intermediate CA..."
     openssl genrsa -out certs/ca.key 4096 2>/dev/null
-    openssl req -new -x509 -days 3650 -key certs/ca.key -sha256 -out certs/ca.crt \
-        -subj "/C=CN/ST=State/L=City/O=Trusted Data Space/CN=Trusted Data Space CA" 2>/dev/null
-    echo "   [OK] CA证书生成完成"
+    openssl req -new -key certs/ca.key -out certs/ca.csr \
+        -subj "/C=CN/ST=Beijing/L=Beijing/O=Trusted Data Space/CN=Trusted Data Space Kernel CA" 2>/dev/null
+
+    cat > certs/ca.ext << CA_EOF
+basicConstraints = CA:TRUE, pathlen:1
+keyUsage = cRLSign, keyCertSign, digitalSignature
+extendedKeyUsage = serverAuth, clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+CA_EOF
+
+    openssl x509 -req -days 3650 \
+        -in certs/ca.csr \
+        -CA certs/root_ca.crt \
+        -CAkey certs/root_ca.key \
+        -CAcreateserial \
+        -out certs/ca.crt \
+        -extfile certs/ca.ext 2>/dev/null
+
+    rm -f certs/ca.csr certs/ca.ext certs/root_ca.srl
+    echo "   [OK] Kernel intermediate CA created: certs/ca.crt"
 else
-    echo "   [OK] CA证书已存在"
+    echo "   [OK] Kernel intermediate CA already exists"
 fi
 
-# 生成服务器私钥（如果不存在）
+# 3. 生成服务器证书（由内核中间 CA 签发）
 if [ ! -f "certs/kernel.key" ]; then
-    echo "   生成服务器私钥..."
+    echo "   Step 3: Generating server key..."
     openssl genrsa -out certs/kernel.key 2048 2>/dev/null
-    echo "   [OK] 服务器私钥生成完成"
+    echo "   [OK] Server key generated"
 else
-    echo "   [OK] 服务器私钥已存在"
+    echo "   [OK] Server key already exists"
 fi
 
-# 生成服务器证书请求
 if [ ! -f "certs/kernel.crt" ]; then
-    echo "   生成服务器证书..."
+    echo "   Step 4: Generating server certificate..."
 
-    # 生成OpenSSL配置文件
     cat > certs/kernel.cnf << KERNEL_EOF
 [req]
 distinguished_name = req_distinguished_name
@@ -268,14 +289,14 @@ prompt = no
 
 [req_distinguished_name]
 C = CN
-ST = State
-L = City
+ST = Beijing
+L = Beijing
 O = Trusted Data Space
 CN = $KERNEL_ID
 
 [v3_req]
 keyUsage = keyEncipherment, dataEncipherment
-extendedKeyUsage = serverAuth
+extendedKeyUsage = serverAuth, clientAuth
 subjectAltName = @alt_names
 
 [alt_names]
@@ -285,35 +306,28 @@ IP.1 = 127.0.0.1
 IP.2 = $ADDRESS
 KERNEL_EOF
 
-    # 生成证书请求
     openssl req -new -key certs/kernel.key -out certs/kernel.csr -config certs/kernel.cnf 2>/dev/null
-
-    # 使用CA签发证书
     openssl x509 -req -in certs/kernel.csr -CA certs/ca.crt -CAkey certs/ca.key \
         -CAcreateserial -out certs/kernel.crt -days 365 -sha256 \
         -extensions v3_req -extfile certs/kernel.cnf 2>/dev/null
 
-    # 清理临时文件
     rm -f certs/kernel.cnf certs/kernel.csr certs/ca.srl
-
-    echo "   [OK] 服务器证书生成完成"
+    echo "   [OK] Server certificate created"
 else
-    echo "   [OK] 服务器证书已存在"
+    echo "   [OK] Server certificate already exists"
 fi
 
-# 设置证书权限
-chmod 644 certs/ca.crt certs/kernel.crt 2>/dev/null || true
-chmod 600 certs/ca.key certs/kernel.key 2>/dev/null || true
+chmod 644 certs/root_ca.crt certs/ca.crt certs/kernel.crt 2>/dev/null || true
+chmod 600 certs/root_ca.key certs/ca.key certs/kernel.key 2>/dev/null || true
 
 echo ""
-echo "🎉 证书生成完成！"
-echo "   CA证书: certs/ca.crt"
-echo "   CA私钥: certs/ca.key"
-echo "   服务器证书: certs/kernel.crt"
-echo "   服务器私钥: certs/kernel.key"
+echo "[OK] All certificates generated!"
+echo "   Root CA (external):        certs/root_ca.crt, certs/root_ca.key"
+echo "   Kernel CA (intermediate):  certs/ca.crt, certs/ca.key"
+echo "   Server certificate:       certs/kernel.crt, certs/kernel.key"
 echo ""
-echo "现在可以启动内核了："
-echo "   ./start.sh"
+echo "Verify:"
+echo "   openssl verify -CAfile root_ca.crt -untrusted ca.crt kernel.crt"
 CERT_EOF
 
     chmod +x "${KERNEL_DIR}/generate_certs.sh"
@@ -383,7 +397,7 @@ address: "192.168.1.100"       # 修改为服务器地址
 port: 50051                      # 服务器端口
 
 # 安全配置
-ca_cert_path: "certs/ca.crt"
+ca_cert_path: "certs/root_ca.crt"
 client_cert_path: "certs/${component_name,,}-X.crt"
 client_key_path: "certs/${component_name,,}-X.key"
 server_name: "trusted-data-space-kernel"
@@ -475,8 +489,9 @@ cp config/kernel-template.yaml config/kernel.yaml
 ```
 
 证书生成脚本会：
-- 生成CA根证书和私钥
-- 生成服务器证书和私钥
+- 生成外部根CA证书和私钥（self-signed）
+- 生成内核中间CA证书和私钥（由根CA签发）
+- 生成服务器证书和私钥（由中间CA签发）
 - 基于配置文件中的内核ID和地址配置证书
 EOF
 fi

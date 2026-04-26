@@ -30,6 +30,7 @@ func LoadTLSConfig(caCertPath, clientCertPath, clientKeyPath, serverName string)
 		Certificates: []tls.Certificate{clientCert},
 		ServerName:   serverName,
 		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"h2"},
 	}
 
 	return tlsConfig, nil

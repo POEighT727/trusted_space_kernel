@@ -11,7 +11,7 @@ connector:
   data_catalog_file: "connector/data_catalog_sample.json"
   # Bootstrap 一次性注册码（用于首次无证书注册）
   # 如果已有证书，此项留空即可；若无证书，需填写内核管理员分发的 token
-  bootstrap_token: "TSK-BOOT-6fb9c65a-912906e8"
+  bootstrap_token: "TSK-BOOT-85733838-c39d2ef3"
 
 kernel:
   # 内核ID（用于跨内核通信标识）
@@ -23,7 +23,7 @@ kernel:
   port: 50051
 
 security:
-  ca_cert_path: "certs/ca.crt"
+  ca_cert_path: "certs/ca.crt"  # 中间CA证书
   client_cert_path: "certs/connector-A.crt"
   client_key_path: "certs/connector-A.key"
   # 服务器名称，用于TLS证书验证，必须与服务器证书的CN或SAN匹配

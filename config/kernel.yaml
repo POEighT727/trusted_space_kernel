@@ -32,8 +32,9 @@ multi_kernel:
   max_retries: 3
 
 security:
-  ca_cert_path: "certs/ca.crt"
-  ca_key_path: "certs/ca.key"
+  root_ca_cert_path: "certs/root_ca.crt"  # 外部根CA证书（用于验证证书链）
+  ca_cert_path: "certs/ca.crt"            # 内核中间CA证书
+  ca_key_path: "certs/ca.key"            # 内核中间CA私钥
   server_cert_path: "certs/kernel.crt"
   server_key_path: "certs/kernel.key"
   # 内核间通信证书

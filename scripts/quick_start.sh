@@ -67,7 +67,7 @@ generate_proto() {
 
 # 生成证书
 generate_certs() {
-    if [ -f "certs/ca.crt" ]; then
+    if [ -f "certs/root_ca.crt" ]; then
         echo "Certificates already exist, skipping..."
     else
         echo "Generating test certificates..."

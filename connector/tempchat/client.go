@@ -75,6 +75,7 @@ func (c *TempChatClient) Connect() error {
 		// 使用普通 TLS
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: true, // 跳过验证，用于首次连接
+			NextProtos:        []string{"h2"},
 		}
 		creds = credentials.NewTLS(tlsConfig)
 	}
