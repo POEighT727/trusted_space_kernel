@@ -781,6 +781,13 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 	if ackDataHash != "" {
 		packetDataHashFromProto = ackDataHash
 	}
+	// SenderKernelID：如果 proto 中有则用 proto 中的（原始发送方内核），否则从 SourceKernelId 推断
+	senderKernelID := req.DataPacket.GetSenderKernelId()
+	if senderKernelID == "" && req.SourceKernelId != "" {
+		// 如果 proto 中没有原始发送方内核（业务数据包），则 SourceKernelId 就是发送方内核
+		senderKernelID = req.SourceKernelId
+	}
+
 	dataPacket := &circulation.DataPacket{
 		ChannelID:           req.DataPacket.ChannelId,
 		SequenceNumber:     req.DataPacket.SequenceNumber,
@@ -788,6 +795,7 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 		Signature:           req.DataPacket.Signature,
 		Timestamp:           req.DataPacket.Timestamp,
 		SenderID:            req.DataPacket.SenderId,
+		SenderKernelID:      senderKernelID,
 		TargetIDs:           req.DataPacket.TargetIds,
 		FlowID:              req.DataPacket.GetFlowId(), // 原始 FlowID（connector 可能未设置）
 		IsFinal:             req.GetIsFinal(),

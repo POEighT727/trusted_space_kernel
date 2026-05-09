@@ -85,11 +85,48 @@ Note: Circulation Module includes:
 
 ### 1. Security Module
 
-Implements **mTLS (Mutual TLS)** for zero-trust security architecture:
+Implements **mTLS (Mutual TLS)** for zero-trust security architecture with **two-tier CA structure**:
 
-- **Root CA**: Self-signed root certificate as trust anchor
-- **Server Certificate**: Certificate held by kernel server
-- **Client Certificate**: Each connector holds a certificate with CN matching connector ID
+**Certificate Trust Chain**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Certificate Trust Chain                  │
+│                                                             │
+│  ┌──────────────┐                                          │
+│  │   Root CA    │  root_ca.crt/key                         │
+│  │ (Self-signed)│  Trust anchor, longest validity         │
+│  └──────┬───────┘                                          │
+│         │ Signs                                             │
+│         ▼                                                  │
+│  ┌──────────────┐                                          │
+│  │ Intermediate │  ca.crt/key                              │
+│  │    CA        │  Intermediate CA, actual signing        │
+│  └──────┬───────┘                                          │
+│         │ Signs                                             │
+│  ┌──────┴───────┐  ┌──────────────┐                        │
+│  │    Kernel     │  │  Connector   │                        │
+│  │  (Server)     │  │  (Client)    │                        │
+│  └──────────────┘  └──────────────┘                        │
+│                                                             │
+│  ┌──────────────┐                                          │
+│  │  Peer Kernel │  peer-kernel-*-ca.crt                   │
+│  │     CA       │  Other kernels' CA certs                 │
+│  └──────────────┘  For multi-kernel mTLS verification     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Certificate Usage**:
+
+| Certificate | Usage | Verified By |
+|-------------|-------|-------------|
+| `root_ca.crt` | Root CA, optionally verifies `ca.crt` | Admin |
+| `ca.crt` | Intermediate CA, issues server/client certs | TLS handshake verification |
+| `kernel.crt` | Kernel server certificate | Connector verifies |
+| `connector-*.crt` | Connector client certificates | Kernel verifies |
+| `peer-kernel-*-ca.crt` | Other kernels' CA certificates | Cross-kernel mTLS verification |
+
+**Other Features**:
 - **Dynamic Registration**: Connectors can apply for certificates on first connection (Bootstrap service, port 50052)
 - **RSA-PSS Digital Signature**: RSA-PSS algorithm for signing evidence records
 - **SHA-256 Hashing**: SHA-256 algorithm for data hashing
@@ -384,9 +421,14 @@ trusted_space_kernel/
 │   ├── kernel.exe                    # Kernel executable
 │   └── connector.exe                 # Connector executable
 ├── certs/                            # Certificate directory
-│   ├── ca.crt / ca.key              # CA root certificate
-│   ├── kernel.crt / kernel.key      # Kernel certificate
-│   └── connector-{A,B,C,X}*.crt/.key # Connector certificates
+│   ├── root_ca.crt / root_ca.key   # Root CA certificate (trust anchor, self-signed)
+│   ├── ca.crt / ca.key             # Intermediate CA certificate (signed by Root CA)
+│   ├── kernel.crt / kernel.key     # Kernel server certificate (signed by Intermediate CA)
+│   ├── connector-A.crt/key         # Connector A certificate (signed by Intermediate CA)
+│   ├── connector-B.crt/key        # Connector B certificate
+│   ├── connector-C.crt/key        # Connector C certificate
+│   ├── connector-X.crt/key        # Connector X certificate
+│   └── peer-kernel-*-ca.crt       # Other kernels' CA certificates (for multi-kernel mTLS)
 ├── config/                           # Configuration files
 │   ├── kernel.yaml                   # Kernel main config
 │   ├── connector.yaml               # Connector A config
@@ -476,6 +518,8 @@ trusted_space_kernel/
 
 ### 1. Generate Certificates
 
+Certificates use a **two-tier CA structure**: Root CA → Intermediate CA → Server/Client certificates
+
 ```bash
 # Linux/Mac
 ./scripts/gen_certs.sh
@@ -483,6 +527,21 @@ trusted_space_kernel/
 # Windows
 .\scripts\gen_certs.ps1
 ```
+
+**Generated certificate structure**:
+
+```
+certs/
+├── root_ca.crt/key          # Root CA (Trust Anchor)
+├── ca.crt/key               # Intermediate CA (signed by Root CA)
+├── kernel.crt/key           # Kernel certificate (signed by Intermediate CA)
+├── connector-A.crt/key      # Connector A certificate
+├── connector-B.crt/key      # Connector B certificate
+├── connector-C.crt/key      # Connector C certificate
+└── connector-X.crt/key      # Connector X certificate
+```
+
+> **Note**: For cross-kernel interconnection, place the other kernel's CA certificate (e.g., `peer-kernel-*-ca.crt`) in the `certs/` directory for mTLS verification.
 
 ### 2. Database Setup (Optional)
 

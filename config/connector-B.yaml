@@ -11,6 +11,7 @@ connector:
   data_catalog:
     - "传感器数据"
     - "日志数据"
+  bootstrap_token: "TSK-BOOT-9eb7c837-e15f2555"
 
 
 kernel:

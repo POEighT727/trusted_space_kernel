@@ -764,24 +764,9 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 
 			// 处理通知
 			for notification := range notifyChan {
-				// 去重检查：防止重复处理同一个频道的通知
-				c.processedNotificationsMu.Lock()
-				if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED {
-					if c.processedNotifications[notification.ChannelId] {
-						c.processedNotificationsMu.Unlock()
-						// 只在第一次跳过时显示消息，避免重复日志
-						c.skippedNotifications[notification.ChannelId]++
-						continue
-					}
-					// 标记为已处理
-					c.processedNotifications[notification.ChannelId] = true
-				}
-				c.processedNotificationsMu.Unlock()
-
-				// 记录本地频道信息
-				c.RecordChannelFromNotification(notification)
-
 				// 检查当前连接器是否是接收方或发送方（支持多对多模式）
+				// 注意：必须在去重检查之前评估，因为 add_receiver 后收到的第二个 ACCEPTED 通知
+				// 可能因为去重而被跳过，但这个通知对于新加入的接收方至关重要。
 				isReceiver := false
 				isSender := false
 
@@ -814,6 +799,28 @@ func (c *Connector) StartAutoNotificationListener(onNotification func(*pb.Channe
 						}
 					}
 				}
+
+				// 去重检查：防止重复处理同一个频道的通知
+				// 重要：对于新加入的接收方，即使 channelId 已处理过，也要放行以触发自动订阅
+				c.processedNotificationsMu.Lock()
+				alreadyProcessed := c.processedNotifications[notification.ChannelId]
+				skipBecauseDup := alreadyProcessed && !isReceiver
+				if notification.NegotiationStatus == pb.ChannelNegotiationStatus_NEGOTIATION_STATUS_ACCEPTED {
+					if skipBecauseDup {
+						c.processedNotificationsMu.Unlock()
+						c.skippedNotifications[notification.ChannelId]++
+						continue
+					}
+					// 仅当尚未处理或该连接器已是接收方时标记为已处理
+					// 如果是已处理但当前为新接收方的情况，保留标记（防止无限重复）
+					if !alreadyProcessed {
+						c.processedNotifications[notification.ChannelId] = true
+					}
+				}
+				c.processedNotificationsMu.Unlock()
+
+				// 记录本地频道信息
+				c.RecordChannelFromNotification(notification)
 
 				// 如果是发送方，根据协商状态显示不同信息
 				if isSender && !isReceiver {

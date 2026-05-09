@@ -3,10 +3,8 @@
 # 生成 protobuf 代码
 proto:
 	@echo "Generating protobuf code..."
-	@mkdir -p api/v1
-	protoc --go_out=. --go_opt=paths=source_relative \
-		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
-		proto/kernel/v1/*.proto
+	@if not exist api\v1 mkdir api\v1
+	protoc --proto_path=proto --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative proto/kernel/v1/*.proto
 
 # 生成测试证书
 certs:
@@ -16,22 +14,12 @@ certs:
 # 编译内核服务
 kernel:
 	@echo "Building kernel service..."
-	@go build -o bin/kernel ./kernel/cmd
+	@go build -o bin/kernel.exe ./kernel/cmd
 
 # 编译连接器
 connector:
 	@echo "Building connector..."
-	@go build -o bin/connector ./connector/cmd
-
-# 运行内核（交互模式，多内核默认启用）
-run-kernel: kernel
-	@echo "Starting kernel with interactive management console..."
-	@./bin/kernel -config config/kernel.yaml
-
-# 运行连接器
-run-connector: connector
-	@echo "Starting connector..."
-	@./bin/connector -config config/connector.yaml
+	@go build -o bin/connector.exe ./connector/cmd
 
 # 清理
 clean:

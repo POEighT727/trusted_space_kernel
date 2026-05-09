@@ -2,8 +2,8 @@ syntax = "proto3";
 
 package trusted_space.kernel.v1;
 
-import "identity.proto";
-import "channel.proto";
+import "kernel/v1/identity.proto";
+import "kernel/v1/channel.proto";
 
 option go_package = "github.com/trusted-space/kernel/api/v1;kernelv1";
 

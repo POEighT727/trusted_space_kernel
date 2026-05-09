@@ -1,12 +1,20 @@
-# 连接器 C 配置
+# 连接器配置
 
 connector:
   id: "connector-C"
-  entity_type: "algorithm_node"
-  public_key: "mock_public_key_xyz789"
+  entity_type: "data_source"
+  public_key: "mock_public_key_abc123"
+  # 是否向其他内核公开自己的信息
+  # false - 不公开（默认）：其他内核不知道该连接器的存在，创建跨内核频道时需要线下协商
+  # true - 公开：互联后其他内核可以通过发现机制获取该连接器信息
+  expose_to_others: true
+  data_catalog_file: "connector/data_catalog_sample.json"
+  # Bootstrap 一次性注册码（用于首次无证书注册）
+  # 如果已有证书，此项留空即可；若无证书，需填写内核管理员分发的 token
+  bootstrap_token: "TSK-BOOT-70aa271d-fcba5646"
 
 kernel:
-  # 内核ID，用于跨内核通信标识
+  # 内核ID（用于跨内核通信标识）
   id: "kernel-1"
   # 内核服务器地址
   # 本地部署: "localhost" 或 "127.0.0.1"
@@ -15,10 +23,33 @@ kernel:
   port: 50051
 
 security:
-  ca_cert_path: "certs/ca.crt"
+  ca_cert_path: "certs/ca.crt"  # 中间CA证书
   client_cert_path: "certs/connector-C.crt"
   client_key_path: "certs/connector-C.key"
   # 服务器名称，用于TLS证书验证，必须与服务器证书的CN或SAN匹配
   # 跨主机部署时，通常使用服务器的域名或IP地址
   server_name: "trusted-data-space-kernel"
 
+channel:
+  # 频道配置文件目录
+  # 如果为空，将自动创建 ./channels/{connector_id} 目录
+  config_dir: "./channels/connector-C"
+
+database:
+  enabled: true       # 是否启用数据库
+  host: "localhost"
+  port: 3306
+  user: "root"
+  password: "123456"
+  database: "connector_c"  # 连接器自己的数据库名
+
+# 临时通信配置（运维方模式）
+tempchat:
+  # 是否启用临时通信功能
+  enabled: true
+  # 临时通信服务地址（运维方监听地址）
+  server_addr: "192.168.31.155:50055"
+  # 是否向其他内核暴露本连接器
+  # false - 不暴露：其他内核的连接器看不到该连接器，无法向其发送临时消息
+  # true - 暴露（默认）：互联后其他内核可以通过 tempchat-list 发现该连接器
+  expose_to_others: true

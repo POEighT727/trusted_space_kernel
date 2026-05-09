@@ -144,6 +144,7 @@ type DataPacket struct {
 	Signature      string
 	Timestamp      int64
 	SenderID       string     // 发送方ID
+	SenderKernelID string     // 发送方内核ID（跨内核时使用）
 	TargetIDs      []string   // 目标接收者ID列表（为空则广播给所有订阅者）
 	MessageType    MessageType // 消息类型（数据/控制/存证/ack）
 	FlowID         string    // 业务流程ID，用于跟踪完整的数据传输过程
@@ -291,7 +292,7 @@ func (cm *ChannelManager) CreateChannelWithID(channelID, creatorID, approverID s
 			SenderApprovals:   make(map[string]bool),
 			ReceiverApprovals: make(map[string]bool),
 		},
-		remoteReceivers:    make(map[string]string), // 初始化远端接收者映射
+		remoteReceivers: make(map[string]string), // 初始化远端接收者映射
 	}
 
 	copy(channel.SenderIDs, senderIDs)
@@ -1601,6 +1602,8 @@ func (c *Channel) PushData(packet *DataPacket) error {
 
 	// 决定是否需要频道级别的缓冲
 	shouldBuffer := false
+	// 收集所有未订阅的本地接收者（包括新加入的）
+	unsubscribedLocalReceivers := make([]string, 0)
 	if len(packet.TargetIDs) > 0 {
 		// 检查指定的目标接收者是否有未订阅但在线的
 		// ACK 消息的目标是发送方（CanReceive 返回 false），也参与缓冲判断
@@ -1610,8 +1613,33 @@ func (c *Channel) PushData(packet *DataPacket) error {
 					// 只有在线但未订阅的才需要频道级别缓冲
 					if c.manager == nil || c.manager.IsConnectorOnline(targetID) {
 						shouldBuffer = true
-						break
+						unsubscribedLocalReceivers = append(unsubscribedLocalReceivers, targetID)
 					}
+				}
+			}
+		}
+	} else {
+		// 广播模式 (TargetIDs 为空)：检查 ReceiverIDs 中是否存在尚未订阅的本地接收者
+		// 这些接收者可能是因为 request-permission / approve-permission 流程刚刚加入的，
+		// 此时数据已经到达（由发送方在它们加入之前发出），需要缓冲等待它们订阅
+		currentKernelID := ""
+		if c.manager != nil {
+			currentKernelID = c.manager.kernelID
+		}
+		for _, receiverID := range c.ReceiverIDs {
+			localID := receiverID
+			if strings.Contains(receiverID, ":") {
+				parts := strings.SplitN(receiverID, ":", 2)
+				if parts[0] == currentKernelID {
+					localID = parts[1]
+				} else {
+					continue // 远端内核的接收者不缓冲
+				}
+			}
+			if _, subscribed := c.subscribers[localID]; !subscribed {
+				if c.manager == nil || c.manager.IsConnectorOnline(localID) {
+					shouldBuffer = true
+					unsubscribedLocalReceivers = append(unsubscribedLocalReceivers, localID)
 				}
 			}
 		}
@@ -1646,18 +1674,19 @@ func (c *Channel) PushData(packet *DataPacket) error {
 		}
 		// 复制数据包以避免并发问题
 		bufferedPacket := &DataPacket{
-			ChannelID:        packet.ChannelID,
-			SequenceNumber:  packet.SequenceNumber,
-			Payload:          make([]byte, len(packet.Payload)),
-			Signature:        packet.Signature,
-			Timestamp:        packet.Timestamp,
-			SenderID:         packet.SenderID,
-			TargetIDs:        make([]string, len(packet.TargetIDs)),
-			FlowID:           packet.FlowID,
-			IsFinal:          packet.IsFinal,
-			DataHash:            packet.DataHash,
+			ChannelID:          packet.ChannelID,
+			SequenceNumber:    packet.SequenceNumber,
+			Payload:           make([]byte, len(packet.Payload)),
+			Signature:         packet.Signature,
+			Timestamp:         packet.Timestamp,
+			SenderID:          packet.SenderID,
+			SenderKernelID:    packet.SenderKernelID,
+			TargetIDs:         make([]string, len(packet.TargetIDs)),
+			FlowID:            packet.FlowID,
+			IsFinal:           packet.IsFinal,
+			DataHash:          packet.DataHash,
 			AckEvidenceRecorded: packet.AckEvidenceRecorded,
-			AfterSent:        packet.AfterSent,
+			AfterSent:         packet.AfterSent,
 		}
 		copy(bufferedPacket.Payload, packet.Payload)
 		copy(bufferedPacket.TargetIDs, packet.TargetIDs)
@@ -1701,6 +1730,9 @@ func (c *Channel) PushData(packet *DataPacket) error {
 				}
 			}
 
+		// 判断原始数据包是否为广播（TargetIDs 为空表示广播）
+		isBroadcastPacket := len(packet.TargetIDs) == 0
+
 		outPacket := &DataPacket{
 			ChannelID:           packet.ChannelID,
 			SequenceNumber:     packet.SequenceNumber,
@@ -1708,7 +1740,7 @@ func (c *Channel) PushData(packet *DataPacket) error {
 			Signature:           "", // 稍后由 KernelSign 生成
 			Timestamp:           packet.Timestamp,
 			SenderID:            packet.SenderID,
-			TargetIDs:           make([]string, len(connectorIDs)),
+			SenderKernelID:      packet.SenderKernelID,
 			MessageType:         packet.MessageType,
 			FlowID:              packet.FlowID,
 			IsFinal:             packet.IsFinal,
@@ -1718,12 +1750,21 @@ func (c *Channel) PushData(packet *DataPacket) error {
 			AfterSent:           packet.AfterSent,
 		}
 		copy(outPacket.Payload, packet.Payload)
-		copy(outPacket.TargetIDs, connectorIDs)
+
+		// 广播数据包：清空 TargetIDs，让下一跳内核根据自身 ReceiverIDs 重新计算目标
+		// 这样新加入的接收者（如刚通过 approve-permission 加入的 connector-C）也能收到数据
+		// 定向数据包：保持原有目标列表不变
+		if isBroadcastPacket {
+			outPacket.TargetIDs = []string{}
+		} else {
+			outPacket.TargetIDs = make([]string, len(connectorIDs))
+			copy(outPacket.TargetIDs, connectorIDs)
+		}
 
 		// 传递原始目标内核ID，用于存证记录
 		// 使用 TargetIDs 的第一个元素来传递原始目标
 		// 若 connectorID 已经包含 kernel 前缀（ACK 反向路由场景），直接使用，不再重复 prepend
-		if len(connectorIDs) > 0 {
+		if len(connectorIDs) > 0 && !isBroadcastPacket {
 			rawConnectorID := connectorIDs[0]
 			if strings.Contains(rawConnectorID, ":") {
 				// 已经是完整格式，直接使用
@@ -1777,9 +1818,10 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 
 	// 先发送暂存的数据（频道级别缓冲）
 	c.bufferMu.Lock()
-	bufferedPackets := make([]*DataPacket, len(c.buffer))
-	copy(bufferedPackets, c.buffer)
-	c.buffer = c.buffer[:0] // 清空缓冲区
+	// 注意：不清理 channel buffer（c.buffer），因为它是所有当前和未来订阅者共享的历史缓冲
+	// 连接器级缓冲（connectorBuffers）才会被消费后清空
+	channelBufferForSub := make([]*DataPacket, len(c.buffer))
+	copy(channelBufferForSub, c.buffer)
 	c.bufferMu.Unlock()
 
 	// 获取连接器级别的离线缓冲数据
@@ -1789,23 +1831,31 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 		log.Printf("🔍 Connector %s has %d buffered packets", subscriberID, len(connectorBufferedPackets))
 	}
 
-	// 合并所有缓冲数据
-	allBufferedPackets := append(bufferedPackets, connectorBufferedPackets...)
+	// 合并所有缓冲数据：频道级缓冲 + 连接器级缓冲
+	// 注意：频道级缓冲不会被清理，多个订阅者都能收到
+	allBufferedPackets := append(channelBufferForSub, connectorBufferedPackets...)
+	log.Printf("[DEBUG] Subscribe: subscriber=%s, channelBuffer=%d, connectorBuffer=%d, totalBuffered=%d",
+		subscriberID, len(channelBufferForSub), len(connectorBufferedPackets), len(allBufferedPackets))
 
 	// 在goroutine中发送所有暂存的数据，避免阻塞
 	go func() {
-		for _, packet := range allBufferedPackets {
-			// 检查是否应该发送给此订阅者
+		log.Printf("[DEBUG] Subscribe goroutine: subscriber=%s, sending %d buffered packets",
+			subscriberID, len(allBufferedPackets))
+		for i, packet := range allBufferedPackets {
 			if c.shouldSendToSubscriber(packet, subscriberID) {
 				select {
 				case subChan <- packet:
-					// 成功发送暂存数据
-				case <-time.After(1 * time.Second):
-					// 超时，跳过
-					log.Printf("[WARN] Timeout sending buffered packet to %s", subscriberID)
+					log.Printf("[DEBUG] Subscribe: subscriber=%s sent buffered packet %d/%d (seq=%d)",
+						subscriberID, i+1, len(allBufferedPackets), packet.SequenceNumber)
+				case <-time.After(5 * time.Second):
+					log.Printf("[WARN] Subscribe: subscriber=%s TIMEOUT sending buffered packet %d/%d",
+						subscriberID, i+1, len(allBufferedPackets))
+					return
 				}
 			}
 		}
+		log.Printf("[DEBUG] Subscribe: subscriber=%s finished sending %d buffered packets",
+			subscriberID, len(allBufferedPackets))
 	}()
 
 	return subChan, nil
@@ -1813,22 +1863,39 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 
 // shouldSendToSubscriber 判断是否应该将数据包发送给订阅者
 func (c *Channel) shouldSendToSubscriber(packet *DataPacket, subscriberID string) bool {
-	// 不发送给发送方自己
-	if subscriberID == packet.SenderID {
+	log.Printf("[DEBUG shouldSendToSubscriber] channel=%s, packet.sender=%s, packet.senderKernel=%s, packet.targets=%v, subscriber=%s, c.SenderIDs=%v",
+		c.ChannelID, packet.SenderID, packet.SenderKernelID, packet.TargetIDs, subscriberID, c.SenderIDs)
+
+	// 不发送给发送方自己（业务数据不回传给发送方）
+	// 检查订阅者ID是否等于数据包的发送方（跨内核格式：kernelID:connectorID 或本地格式：connectorID）
+	packetSenderID := packet.SenderID
+	packetSenderKernelID := packet.SenderKernelID
+	isSubscriberSender := false
+	if packetSenderID == subscriberID {
+		isSubscriberSender = true
+	}
+	if packetSenderKernelID != "" && packetSenderID != "" {
+		if packetSenderKernelID+":"+packetSenderID == subscriberID {
+			isSubscriberSender = true
+		}
+	}
+	if isSubscriberSender {
+		log.Printf("[DEBUG shouldSendToSubscriber] -> false: subscriber %s is the sender", subscriberID)
 		return false
 	}
 
-	// 不发送给其他发送方（业务数据只应流向接收方）
-	// 只有 ACK 消息和证据消息才需要发送给发送方（用于确认）
+	// 对于业务数据包，还需要检查订阅者是否是频道的发送方（不能将数据发给发送方角色）
+	// 只有 ACK 消息和证据消息才需要发给发送方
 	if !packet.IsAck && packet.MessageType != MessageTypeEvidence {
-		for _, senderID := range c.SenderIDs {
-			// 处理跨内核格式 (kernelID:connectorID -> connectorID)
-			checkID := senderID
-			if strings.Contains(senderID, ":") {
-				parts := strings.SplitN(senderID, ":", 2)
-				checkID = parts[1]
+		for _, channelSenderID := range c.SenderIDs {
+			// 提取裸 connectorID（去掉 kernel: 前缀）
+			rawID := channelSenderID
+			if idx := strings.LastIndex(channelSenderID, ":"); idx != -1 {
+				rawID = channelSenderID[idx+1:]
 			}
-			if checkID == subscriberID {
+			// 如果订阅者是频道的发送方，不发
+			if subscriberID == rawID || subscriberID == channelSenderID {
+				log.Printf("[DEBUG shouldSendToSubscriber] -> false: subscriber %s is channel sender (raw=%s)", subscriberID, rawID)
 				return false
 			}
 		}
@@ -1836,22 +1903,26 @@ func (c *Channel) shouldSendToSubscriber(packet *DataPacket, subscriberID string
 
 	// 如果目标列表为空，广播给所有订阅者
 	if len(packet.TargetIDs) == 0 {
+		log.Printf("[DEBUG shouldSendToSubscriber] -> true: broadcast (empty target list)")
 		return true
 	}
 	// 检查订阅者是否在目标列表中
 	for _, targetID := range packet.TargetIDs {
 		// 直接匹配
 		if targetID == subscriberID {
+			log.Printf("[DEBUG shouldSendToSubscriber] -> true: direct match")
 			return true
 		}
 		// 处理跨内核格式 (kernel-ID:connectorID -> connectorID)
 		if strings.Contains(targetID, ":") {
 			parts := strings.SplitN(targetID, ":", 2)
 			if len(parts) == 2 && parts[1] == subscriberID {
+				log.Printf("[DEBUG shouldSendToSubscriber] -> true: cross-kernel match")
 				return true
 			}
 		}
 	}
+	log.Printf("[DEBUG shouldSendToSubscriber] -> false: no match found (targets=%v, subscriber=%s)", packet.TargetIDs, subscriberID)
 	return false
 }
 
@@ -1876,19 +1947,36 @@ func (c *Channel) startDataDistribution() {
 		}
 		c.mu.RUnlock()
 
+		// 调试日志：记录当前数据包和订阅者列表
+		payloadPreview := string(packet.Payload)
+		if len(payloadPreview) > 50 {
+			payloadPreview = payloadPreview[:50] + "..."
+		}
+		log.Printf("[DEBUG startDataDistribution] channel=%s, sender=%s, payload=%s, seq=%d, subscribers=%v",
+			c.ChannelID, packet.SenderID, payloadPreview, packet.SequenceNumber, mapKeys(subscribers))
+
 		// 分发到订阅者（根据目标列表）
 		for subscriberID, subChan := range subscribers {
-			// 检查是否应该发送给此订阅者
-			if c.shouldSendToSubscriber(packet, subscriberID) {
+			shouldSend := c.shouldSendToSubscriber(packet, subscriberID)
+			log.Printf("[DEBUG startDataDistribution]   -> checking subscriber=%s, shouldSend=%v", subscriberID, shouldSend)
+			if shouldSend {
 				select {
 				case subChan <- packet:
-					// 成功发送
+					log.Printf("[DEBUG startDataDistribution]   -> SUCCESS sent to %s", subscriberID)
 				case <-time.After(1 * time.Second):
-					// 超时，跳过此订阅者
+					log.Printf("[DEBUG startDataDistribution]   -> TIMEOUT sending to %s", subscriberID)
 				}
 			}
 		}
 	}
+}
+
+func mapKeys(m map[string]chan *DataPacket) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // StartDataDistribution exported wrapper to start the internal data distribution goroutine.
@@ -1921,25 +2009,16 @@ func (c *Channel) SubscribeWithRecovery(subscriberID string, isRestartRecovery b
 		return nil, fmt.Errorf("channel is not active")
 	}
 
-	// 发送方（原始数据发送者）需要订阅才能接收 ACK 确认
-	// 因此不能拒绝非参与者——ACK 消息需要发送给原始发送方
-	// 这里不再用 IsParticipant 检查，因为 AddParticipant 是空操作
-	// 直接允许订阅者加入（由调用方 SubscribeData 负责权限控制）
-
-	// 检查是否已订阅
-	if _, exists := c.subscribers[subscriberID]; exists {
-		return nil, fmt.Errorf("already subscribed")
-	}
-
 	// 创建订阅通道
 	subChan := make(chan *DataPacket, 100)
 	c.subscribers[subscriberID] = subChan
 
 	// 先发送暂存的数据（频道级别缓冲）
+	// 注意：不清理 channel buffer（c.buffer），因为它是所有当前和未来订阅者共享的历史缓冲
+	// 这样晚加入的订阅者（如刚通过 approve-permission 加入的 connector-C）也能收到缓冲数据
 	c.bufferMu.Lock()
-	bufferedPackets := make([]*DataPacket, len(c.buffer))
-	copy(bufferedPackets, c.buffer)
-	c.buffer = c.buffer[:0] // 清空缓冲区
+	channelBufferForSub := make([]*DataPacket, len(c.buffer))
+	copy(channelBufferForSub, c.buffer)
 	c.bufferMu.Unlock()
 
 	// 如果是重启恢复，获取连接器级别的离线缓冲数据
@@ -1949,18 +2028,29 @@ func (c *Channel) SubscribeWithRecovery(subscriberID string, isRestartRecovery b
 		log.Printf("🔍 Connector %s has %d buffered packets (restart recovery)", subscriberID, len(connectorBufferedPackets))
 	}
 
-	// 合并所有缓冲数据
-	allBufferedPackets := append(bufferedPackets, connectorBufferedPackets...)
+	// 合并所有缓冲数据：频道级缓冲 + 连接器级缓冲
+	// 注意：频道级缓冲不会被清理，多个订阅者都能收到历史数据
+	allBufferedPackets := append(channelBufferForSub, connectorBufferedPackets...)
+	log.Printf("[DEBUG] SubscribeWithRecovery: subscriber=%s, channelBuffer=%d, connectorBuffer=%d, totalBuffered=%d",
+		subscriberID, len(channelBufferForSub), len(connectorBufferedPackets), len(allBufferedPackets))
 
 	// 在goroutine中发送所有暂存的数据，避免阻塞
 	go func() {
-		for _, packet := range allBufferedPackets {
+		log.Printf("[DEBUG] SubscribeWithRecovery goroutine: subscriber=%s, sending %d buffered packets",
+			subscriberID, len(allBufferedPackets))
+		for i, packet := range allBufferedPackets {
 			select {
 			case subChan <- packet:
+				log.Printf("[DEBUG] SubscribeWithRecovery: subscriber=%s sent buffered packet %d/%d (seq=%d)",
+					subscriberID, i+1, len(allBufferedPackets), packet.SequenceNumber)
 			case <-time.After(5 * time.Second):
+				log.Printf("[WARN] SubscribeWithRecovery: subscriber=%s TIMEOUT sending buffered packet %d/%d",
+					subscriberID, i+1, len(allBufferedPackets))
 				return
 			}
 		}
+		log.Printf("[DEBUG] SubscribeWithRecovery: subscriber=%s finished sending %d buffered packets",
+			subscriberID, len(allBufferedPackets))
 	}()
 
 	return subChan, nil
@@ -2055,6 +2145,7 @@ func (cm *ChannelManager) BufferDataForOfflineConnector(connectorID string, pack
 		Signature:        packet.Signature,
 		Timestamp:        packet.Timestamp,
 		SenderID:         packet.SenderID,
+		SenderKernelID:   packet.SenderKernelID,
 		TargetIDs:        make([]string, len(packet.TargetIDs)),
 		FlowID:           packet.FlowID,
 		IsFinal:          packet.IsFinal,

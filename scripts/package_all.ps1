@@ -39,10 +39,11 @@ function Package-Kernel {
     $env:GOARCH = "amd64"
     go build -o "$KernelDir\kernel.exe" ./kernel/cmd
 
-    # 创建配置模板目录
-    Write-Host "   创建配置模板..." -ForegroundColor Yellow
+    # 创建配置目录（包含 bootstrap_tokens.yaml）
     New-Item -ItemType Directory -Path "$KernelDir\config" -Force | Out-Null
     Copy-Item "config\kernel.yaml" "$KernelDir\config\kernel-template.yaml"
+    Copy-Item "config\bootstrap_tokens.yaml" "$KernelDir\config\bootstrap_tokens-template.yaml" -ErrorAction SilentlyContinue
+    "# Bootstrap Token 配置文件`n# 用于管理连接器的一次性注册码" | Out-File -FilePath "$KernelDir\config\bootstrap_tokens.yaml" -Encoding UTF8
 
     # 创建证书目录结构
     New-Item -ItemType Directory -Path "$KernelDir\certs" -Force | Out-Null
@@ -51,10 +52,6 @@ function Package-Kernel {
     # 创建日志目录
     New-Item -ItemType Directory -Path "$KernelDir\logs" -Force | Out-Null
     "# 日志目录`n# 内核运行时会自动创建审计日志文件" | Out-File -FilePath "$KernelDir\logs\.gitkeep" -Encoding UTF8
-
-    # 创建频道配置文件目录
-    New-Item -ItemType Directory -Path "$KernelDir\channel_configs" -Force | Out-Null
-    "# 频道配置文件目录`n# 存放频道特定的配置文件（JSON格式）" | Out-File -FilePath "$KernelDir\channel_configs\.gitkeep" -Encoding UTF8
 
     # 创建数据库目录
     New-Item -ItemType Directory -Path "$KernelDir\data" -Force | Out-Null
@@ -308,11 +305,15 @@ IP.2 = `$address
 
 Write-Host ""
 Write-Host "[OK] All certificates generated!" -ForegroundColor Green
-Write-Host "   Root CA (external):        certs\root_ca.crt, certs\root_ca.key"
-Write-Host "   Kernel CA (intermediate):  certs\ca.crt, certs\ca.key"
+    Write-Host "   Root CA (trust anchor):    certs\root_ca.crt, certs\root_ca.key"
+    Write-Host "   Intermediate CA:           certs\ca.crt, certs\ca.key"
 Write-Host "   Server certificate:       certs\kernel.crt, certs\kernel.key"
 Write-Host ""
-Write-Host "Verify:"
+Write-Host "For cross-kernel interconnection:"
+Write-Host "   1. Copy certs\ca.crt from other kernels to certs\peer-kernel-*-ca.crt"
+Write-Host "   2. Configure kernel_cert_path in config\kernel.yaml"
+Write-Host ""
+Write-Host "Verify certificate chain:"
 Write-Host "   openssl verify -CAfile root_ca.crt -untrusted ca.crt kernel.crt"
 "@
 
@@ -373,8 +374,9 @@ id: "your-${ComponentName,,}-id"        # 修改为你的${ComponentName}ID
 address: "192.168.1.100"       # 修改为服务器地址
 port: 50051                      # 服务器端口
 
-# 安全配置
-ca_cert_path: "certs\root_ca.crt"
+# 安全配置（两级 CA 架构）
+root_ca_cert_path: "certs/root_ca.crt"   # Root CA 证书
+ca_cert_path: "certs/ca.crt"             # Intermediate CA 证书
 client_cert_path: "certs\${ComponentName,,}-X.crt"
 client_key_path: "certs\${ComponentName,,}-X.key"
 server_name: "trusted-data-space-kernel"
@@ -417,7 +419,6 @@ if ($ComponentName -eq "内核") {
     $ReadmeContent += @"
 ├── certs\              # 证书目录（可预生成或首次运行自动生成）
 ├── logs\               # 日志目录
-├── channel_configs\    # 频道配置文件目录
 ├── data\               # 数据库目录（SQLite时使用）
 ├── generate_certs.ps1  # 证书生成脚本（可选）
 ├── start.ps1           # 启动脚本
@@ -463,10 +464,10 @@ Copy-Item config\kernel-template.yaml config\kernel.yaml
 ```
 
 证书生成脚本会：
-- 生成外部根CA证书和私钥（self-signed）
-- 生成内核中间CA证书和私钥（由根CA签发）
-- 生成服务器证书和私钥（由中间CA签发）
-- 基于配置文件中的内核ID和地址配置证书
+- 生成 Root CA 证书和私钥（自签名，作为信任锚点）
+- 生成 Intermediate CA 证书和私钥（由 Root CA 签发）
+- 生成服务器证书和私钥（由 Intermediate CA 签发）
+- 基于配置文件中的内核 ID 和地址配置证书
 "@
 }
 

@@ -109,11 +109,48 @@
 
 ### 1. 安全认证模块 (Security)
 
-采用**基于证书的双向认证（mTLS）机制**，构建零信任安全架构：
+采用**基于证书的双向认证（mTLS）机制**，构建零信任安全架构，并使用**两级 CA 架构**。
 
-- **根证书 (CA)**：自签名的根证书，作为整个信任体系的锚点
-- **服务端证书**：内核服务端持有的证书
-- **客户端证书**：每个连接器持有的证书，CN 必须与连接器 ID 一致
+#### 证书信任链
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      证书信任链                               │
+│                                                             │
+│  ┌──────────────┐                                          │
+│  │   Root CA    │  root_ca.crt/key                         │
+│  │ (自签名)      │  信任锚点，最长有效期                      │
+│  └──────┬───────┘                                          │
+│         │ 签发                                              │
+│         ▼                                                  │
+│  ┌──────────────┐                                          │
+│  │ Intermediate │  ca.crt/key                              │
+│  │    CA        │  中间证书，实际签发用                       │
+│  └──────┬───────┘                                          │
+│         │ 签发                                              │
+│  ┌──────┴───────┐  ┌──────────────┐                        │
+│  │    Kernel     │  │  Connector   │                        │
+│  │  (服务端)      │  │  (客户端)    │                        │
+│  └──────────────┘  └──────────────┘                        │
+│                                                             │
+│  ┌──────────────┐                                          │
+│  │  Peer Kernel │  peer-kernel-*-ca.crt                    │
+│  │     CA       │  其他内核的 CA 证书                        │
+│  └──────────────┘  用于多内核互联 mTLS 验证                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**证书用途**：
+
+| 证书 | 用途 | 验证方 |
+|------|------|--------|
+| `root_ca.crt` | Root CA，可选用于验证 `ca.crt` | 管理员 |
+| `ca.crt` | 中间 CA，签发服务端/客户端证书 | TLS 握手时验证 |
+| `kernel.crt` | Kernel 服务端证书 | Connector 验证 |
+| `connector-*.crt` | Connector 客户端证书 | Kernel 验证 |
+| `peer-kernel-*-ca.crt` | 其他内核的 CA 证书 | 跨内核 mTLS 验证 |
+
+**其他安全特性**：
 - **动态证书注册**：支持连接器首次连接时动态申请证书（Bootstrap 服务，50052 端口）
 - **RSA-PSS 数字签名**：使用 RSA-PSS 算法对存证记录进行数字签名，确保不可否认性
 - **SHA-256 哈希**：关键数据使用 SHA-256 算法生成哈希值
@@ -328,9 +365,21 @@ trusted_space_kernel/
 │   ├── kernel.exe                    # 内核可执行文件
 │   └── connector.exe                  # 连接器可执行文件
 ├── certs/                            # 证书目录
-│   ├── ca.crt / ca.key               # CA 根证书
-│   ├── kernel.crt / kernel.key       # 内核证书
-│   └── connector-{A,B,C,X}*.crt/.key # 各连接器证书
+│   ├── root_ca.crt / root_ca.key   # Root CA 根证书（信任锚点，自签名）
+│   ├── ca.crt / ca.key             # Intermediate CA 中间证书（由 Root CA 签发）
+│   ├── kernel.crt / kernel.key     # Kernel 服务端证书（由 Intermediate CA 签发）
+│   ├── connector-A.crt/key         # Connector A 证书（由 Intermediate CA 签发）
+│   ├── connector-B.crt/key         # Connector B 证书
+│   ├── connector-C.crt/key         # Connector C 证书
+│   ├── connector-X.crt/key         # Connector X 证书
+│   └── peer-kernel-*-ca.crt        # 其他内核的 CA 证书（用于多内核互联 mTLS）
+├── config/                           # 配置文件
+│   ├── kernel.yaml                   # 内核主配置
+│   ├── connector.yaml                # Connector A 配置
+│   ├── connector-B.yaml             # Connector B 配置
+│   ├── connector-C.yaml             # Connector C 配置
+│   ├── connector-X.yaml             # Connector X 配置
+│   └── bootstrap_tokens.yaml         # Bootstrap Token 配置
 ├── config/                           # 配置文件
 │   ├── kernel.yaml                   # 内核主配置
 │   ├── connector.yaml                # 连接器 A 配置
@@ -534,6 +583,8 @@ service TempChatService {
 
 ### 1. 生成证书
 
+证书采用两级 CA 架构：Root CA → Intermediate CA → 服务端/客户端证书
+
 ```bash
 # Linux/Mac
 ./scripts/gen_certs.sh
@@ -541,6 +592,21 @@ service TempChatService {
 # Windows
 .\scripts\gen_certs.ps1
 ```
+
+**生成后证书结构**：
+
+```
+certs/
+├── root_ca.crt/key          # Root CA（信任锚点）
+├── ca.crt/key               # Intermediate CA（由 Root CA 签发）
+├── kernel.crt/key           # Kernel 证书（由 Intermediate CA 签发）
+├── connector-A.crt/key      # Connector A 证书
+├── connector-B.crt/key      # Connector B 证书
+├── connector-C.crt/key      # Connector C 证书
+└── connector-X.crt/key      # Connector X 证书
+```
+
+> **注意**：跨内核互联时，需要将对方的 CA 证书（如 `peer-kernel-*-ca.crt`）放入 `certs/` 目录，以便进行 mTLS 验证。
 
 ### 2. 配置数据库（可选）
 
@@ -602,10 +668,12 @@ connector:
 ./bin/connector.exe --config config/connector.yaml
 ```
 
-首次启动时，连接器会携带 Token 向内核注册，验证通过后获得证书文件：
+首次启动时，连接器会携带 Token 向内核注册，验证通过后获得证书文件（由 Intermediate CA 签发）：
+
 - `certs/connector-A.crt` (证书)
 - `certs/connector-A.key` (私钥)
-- `certs/ca.crt` (CA 证书)
+- `certs/ca.crt` (Intermediate CA 证书，用于验证服务端)
+- `certs/root_ca.crt` (Root CA 证书，可选)
 
 后续启动将使用证书进行 mTLS 认证，不再需要 Token。
 

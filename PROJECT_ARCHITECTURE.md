@@ -109,6 +109,47 @@ require (
 | SHA-256 | 哈希计算 |
 | 哈希链 | 存证记录防篡改 |
 
+### 2.4 证书体系
+
+采用 **两级 CA 架构**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      证书信任链                               │
+│                                                             │
+│  ┌──────────────┐                                          │
+│  │   Root CA    │  root_ca.crt/key                         │
+│  │ (自签名)      │  信任锚点，最长有效期                      │
+│  └──────┬───────┘                                          │
+│         │ 签发                                              │
+│         ▼                                                  │
+│  ┌──────────────┐                                          │
+│  │ Intermediate │  ca.crt/key                              │
+│  │    CA        │  中间证书，实际签发用                       │
+│  └──────┬───────┘                                          │
+│         │ 签发                                              │
+│  ┌──────┴───────┐  ┌──────────────┐                        │
+│  │    Kernel     │  │  Connector   │                        │
+│  │  (服务端)      │  │  (客户端)    │                        │
+│  └──────────────┘  └──────────────┘                        │
+│                                                             │
+│  ┌──────────────┐                                          │
+│  │  Peer Kernel │  peer-kernel-*-ca.crt                    │
+│  │     CA       │  其他内核的 CA 证书                        │
+│  └──────────────┘  用于多内核互联 mTLS 验证                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**证书用途**：
+
+| 证书 | 用途 | 验证方 |
+|------|------|--------|
+| `root_ca.crt` | Root CA，可选用于验证 `ca.crt` | 管理员 |
+| `ca.crt` | 中间 CA，签发服务端/客户端证书 | TLS 握手时验证 |
+| `kernel.crt` | Kernel 服务端证书 | Connector 验证 |
+| `connector-*.crt` | Connector 客户端证书 | Kernel 验证 |
+| `peer-kernel-*-ca.crt` | 其他内核的 CA 证书 | 跨内核 mTLS 验证 |
+
 ---
 
 ## 3. 目录结构
@@ -120,16 +161,22 @@ trusted_space_kernel/
 │   └── connector.exe               # 连接器可执行文件
 │
 ├── certs/                            # 证书目录
-│   ├── ca.crt / ca.key             # CA 根证书
-│   ├── kernel.crt / kernel.key     # 内核证书
-│   └── connector-*.crt/key         # 连接器证书
+│   ├── root_ca.crt / root_ca.key     # Root CA 根证书（信任锚点，自签名）
+│   ├── ca.crt / ca.key               # Intermediate CA 中间证书（由 Root CA 签发）
+│   ├── kernel.crt / kernel.key        # Kernel 服务端证书（由 Intermediate CA 签发）
+│   ├── connector-A.crt/key            # Connector A 证书（由 Intermediate CA 签发）
+│   ├── connector-B.crt/key           # Connector B 证书
+│   ├── connector-C.crt/key           # Connector C 证书
+│   ├── connector-X.crt/key          # Connector X 证书
+│   └── peer-kernel-*-ca.crt          # 其他内核的 CA 证书（用于多内核互联 mTLS）
 │
 ├── config/                            # 配置文件目录
-│   ├── kernel.yaml                 # 内核配置
-│   ├── connector.yaml              # 连接器 A 配置
-│   ├── connector-B.yaml            # 连接器 B 配置
-│   ├── connector-C.yaml            # 连接器 C 配置
-│   └── connector-X.yaml            # 连接器 X 配置
+│   ├── kernel.yaml                   # 内核配置
+│   ├── connector.yaml                # Connector A 配置
+│   ├── connector-B.yaml              # Connector B 配置
+│   ├── connector-C.yaml              # Connector C 配置
+│   ├── connector-X.yaml              # Connector X 配置
+│   └── bootstrap_tokens.yaml         # Bootstrap Token 配置文件
 │
 ├── channels/                         # 频道数据目录
 │   └── {connector-id}/             # 每个连接器一个子目录

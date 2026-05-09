@@ -41,10 +41,12 @@ package_kernel() {
         GOOS=linux GOARCH=amd64 go build -o "${KERNEL_DIR}/kernel" ./kernel/cmd
     fi
 
-    # 创建配置模板目录
-    echo "   创建配置模板..."
+    # 创建配置目录（包含 bootstrap_tokens.yaml）
     mkdir -p "${KERNEL_DIR}/config"
     cp config/kernel.yaml "${KERNEL_DIR}/config/kernel-template.yaml"
+    cp config/bootstrap_tokens.yaml "${KERNEL_DIR}/config/bootstrap_tokens-template.yaml" 2>/dev/null || true
+    echo "# Bootstrap Token 配置文件" > "${KERNEL_DIR}/config/bootstrap_tokens.yaml"
+    echo "# 用于管理连接器的一次性注册码" >> "${KERNEL_DIR}/config/bootstrap_tokens.yaml"
 
     # 创建证书目录结构
     mkdir -p "${KERNEL_DIR}/certs"
@@ -56,11 +58,6 @@ package_kernel() {
     mkdir -p "${KERNEL_DIR}/logs"
     echo "# 日志目录" > "${KERNEL_DIR}/logs/.gitkeep"
     echo "# 内核运行时会自动创建审计日志文件" >> "${KERNEL_DIR}/logs/.gitkeep"
-
-    # 创建频道配置文件目录
-    mkdir -p "${KERNEL_DIR}/channel_configs"
-    echo "# 频道配置文件目录" > "${KERNEL_DIR}/channel_configs/.gitkeep"
-    echo "# 存放频道特定的配置文件（JSON格式）" >> "${KERNEL_DIR}/channel_configs/.gitkeep"
 
     # 创建数据库目录
     mkdir -p "${KERNEL_DIR}/data"
@@ -322,11 +319,15 @@ chmod 600 certs/root_ca.key certs/ca.key certs/kernel.key 2>/dev/null || true
 
 echo ""
 echo "[OK] All certificates generated!"
-echo "   Root CA (external):        certs/root_ca.crt, certs/root_ca.key"
-echo "   Kernel CA (intermediate):  certs/ca.crt, certs/ca.key"
-echo "   Server certificate:       certs/kernel.crt, certs/kernel.key"
+echo "   Root CA (trust anchor):     certs/root_ca.crt, certs/root_ca.key"
+echo "   Intermediate CA:            certs/ca.crt, certs/ca.key"
+echo "   Server certificate:         certs/kernel.crt, certs/kernel.key"
 echo ""
-echo "Verify:"
+echo "For cross-kernel interconnection:"
+echo "   1. Copy certs/ca.crt from other kernels to certs/peer-kernel-*-ca.crt"
+echo "   2. Configure kernel_cert_path in config/kernel.yaml"
+echo ""
+echo "Verify certificate chain:"
 echo "   openssl verify -CAfile root_ca.crt -untrusted ca.crt kernel.crt"
 CERT_EOF
 
@@ -396,8 +397,9 @@ id: "your-${component_name,,}-id"        # 修改为你的${component_name}ID
 address: "192.168.1.100"       # 修改为服务器地址
 port: 50051                      # 服务器端口
 
-# 安全配置
-ca_cert_path: "certs/root_ca.crt"
+# 安全配置（两级 CA 架构）
+root_ca_cert_path: "certs/root_ca.crt"   # Root CA 证书
+ca_cert_path: "certs/ca.crt"             # Intermediate CA 证书
 client_cert_path: "certs/${component_name,,}-X.crt"
 client_key_path: "certs/${component_name,,}-X.key"
 server_name: "trusted-data-space-kernel"
@@ -444,7 +446,6 @@ EOF
 if [ "$component_name" = "内核" ]; then
     cat >> "${target_dir}/README.md" << EOF
 ├── logs/               # 日志目录
-├── channel_configs/    # 频道配置文件目录
 ├── data/               # 数据库目录（SQLite时使用）
 ├── generate_certs.sh   # 证书生成脚本（可选）
 ├── start.sh            # 启动脚本
@@ -489,10 +490,10 @@ cp config/kernel-template.yaml config/kernel.yaml
 ```
 
 证书生成脚本会：
-- 生成外部根CA证书和私钥（self-signed）
-- 生成内核中间CA证书和私钥（由根CA签发）
-- 生成服务器证书和私钥（由中间CA签发）
-- 基于配置文件中的内核ID和地址配置证书
+- 生成 Root CA 证书和私钥（自签名，作为信任锚点）
+- 生成 Intermediate CA 证书和私钥（由 Root CA 签发）
+- 生成服务器证书和私钥（由 Intermediate CA 签发）
+- 基于配置文件中的内核 ID 和地址配置证书
 EOF
 fi
 
