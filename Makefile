@@ -1,10 +1,12 @@
 .PHONY: proto certs kernel connector clean
 
-# 生成 protobuf 代码
+# 生成 protobuf 代码（输出到 proto/kernel/v1/，与 .proto 文件同目录）
 proto:
 	@echo "Generating protobuf code..."
-	@if not exist api\v1 mkdir api\v1
-	protoc --proto_path=proto --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative proto/kernel/v1/*.proto
+	@cd proto/kernel/v1 && protoc \
+		--go_out=. --go_opt=paths=source_relative \
+		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
+		*.proto
 
 # 生成测试证书
 certs:
@@ -24,7 +26,7 @@ connector:
 # 清理
 clean:
 	@echo "Cleaning..."
-	@rm -rf bin/ certs/ api/
+	@rm -rf bin/ certs/ 
 	@go clean
 
 # 安装依赖
