@@ -607,7 +607,9 @@ func main() {
 	// 注册服务
 	channelService := server.NewChannelServiceServer(channelManager, registry, auditLog, multiKernelManager, dbManager)
 	
-	// 设置权限变更回调：当权限被批准时，通知被添加的连接器（含跨内核转发）
+	// 设置权限变更回调：当权限被批准/移除时，通知连接器（含跨内核转发）
+	// add_sender/add_receiver: 发送通知
+	// remove_sender/remove_receiver: 取消订阅
 	channelManager.SetPermissionChangeCallback(func(channelID, connectorID, changeType string) {
 		// 获取频道信息
 		channel, err := channelManager.GetChannel(channelID)
@@ -616,7 +618,22 @@ func main() {
 			return
 		}
 
-		// 构建通知消息，携带 ACCEPTED 状态便于对端内核直接激活频道
+		// remove_sender/remove_receiver: 取消订阅（本地连接器）
+		if changeType == "remove_receiver" || changeType == "remove_sender" {
+			// 提取裸 connector ID
+			bareID := connectorID
+			if idx := strings.LastIndex(connectorID, ":"); idx != -1 {
+				bareID = connectorID[idx+1:]
+			}
+			// 取消订阅
+			if ch, err := channelManager.GetChannel(channelID); err == nil {
+				ch.Unsubscribe(bareID)
+				log.Printf("[OK] Permission change: %s %s unsubscribed from channel %s", changeType, bareID, channelID)
+			}
+			return
+		}
+
+		// add_sender/add_receiver: 发送通知
 		notification := &pb.ChannelNotification{
 			ChannelId:         channelID,
 			CreatorId:         channel.CreatorID,

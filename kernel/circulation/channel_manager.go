@@ -1899,6 +1899,24 @@ func (c *Channel) shouldSendToSubscriber(packet *DataPacket, subscriberID string
 				return false
 			}
 		}
+
+		// 业务数据包：订阅者必须是当前授权的接收方（ReceiverIDs 中存在）
+		// 如果已被移除出接收方列表，不再接收业务数据（ACK 和证据消息除外）
+		isReceiver := false
+		for _, receiverID := range c.ReceiverIDs {
+			rawID := receiverID
+			if idx := strings.LastIndex(receiverID, ":"); idx != -1 {
+				rawID = receiverID[idx+1:]
+			}
+			if subscriberID == rawID || subscriberID == receiverID {
+				isReceiver = true
+				break
+			}
+		}
+		if !isReceiver {
+			log.Printf("[DEBUG shouldSendToSubscriber] -> false: subscriber %s is not an authorized receiver", subscriberID)
+			return false
+		}
 	}
 
 	// 如果目标列表为空，广播给所有订阅者
@@ -2642,9 +2660,9 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 	
 	// 通知远程内核频道已更新（发送方/接收方列表已变更）
 	
-	// 通知被添加的连接器：使用解析后的完整 kernel-qualified ID（而非原始 TargetID），
+	// 通知被添加/移除的连接器：使用解析后的完整 kernel-qualified ID（而非原始 TargetID），
 	// 确保回调可以正确进行跨内核转发。
-	if c.manager != nil && c.manager.permissionChangeCallback != nil && (request.ChangeType == "add_sender" || request.ChangeType == "add_receiver") {
+	if c.manager != nil && c.manager.permissionChangeCallback != nil {
 		// Resolve the full qualified connector ID from the updated participant lists
 		resolvedTargetID := request.TargetID
 		switch request.ChangeType {
@@ -2679,6 +2697,39 @@ func (c *Channel) ApprovePermissionChange(approverID, requestID string) error {
 					if bare == targetBare {
 						resolvedTargetID = sid
 					}
+				}
+			}
+		case "remove_receiver":
+			// 移除的接收者已被从 ReceiverIDs 中删除，直接使用 TargetID
+			// 但需要构造完整的 kernel-qualified 格式
+			targetBare := request.TargetID
+			if idx := strings.LastIndex(request.TargetID, ":"); idx != -1 {
+				targetBare = request.TargetID[idx+1:]
+			}
+			// 查找移除前的完整 ID
+			for _, rid := range c.ReceiverIDs {
+				bare := rid
+				if idx := strings.LastIndex(rid, ":"); idx != -1 {
+					bare = rid[idx+1:]
+				}
+				if bare == targetBare {
+					resolvedTargetID = rid
+					break
+				}
+			}
+		case "remove_sender":
+			targetBare := request.TargetID
+			if idx := strings.LastIndex(request.TargetID, ":"); idx != -1 {
+				targetBare = request.TargetID[idx+1:]
+			}
+			for _, sid := range c.SenderIDs {
+				bare := sid
+				if idx := strings.LastIndex(sid, ":"); idx != -1 {
+					bare = sid[idx+1:]
+				}
+				if bare == targetBare {
+					resolvedTargetID = sid
+					break
 				}
 			}
 		}
