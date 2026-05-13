@@ -1834,19 +1834,13 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 	// 合并所有缓冲数据：频道级缓冲 + 连接器级缓冲
 	// 注意：频道级缓冲不会被清理，多个订阅者都能收到
 	allBufferedPackets := append(channelBufferForSub, connectorBufferedPackets...)
-	log.Printf("[DEBUG] Subscribe: subscriber=%s, channelBuffer=%d, connectorBuffer=%d, totalBuffered=%d",
-		subscriberID, len(channelBufferForSub), len(connectorBufferedPackets), len(allBufferedPackets))
+	
 
 	// 在goroutine中发送所有暂存的数据，避免阻塞
 	go func() {
-		log.Printf("[DEBUG] Subscribe goroutine: subscriber=%s, sending %d buffered packets",
-			subscriberID, len(allBufferedPackets))
 		for i, packet := range allBufferedPackets {
 			if c.shouldSendToSubscriber(packet, subscriberID) {
 				select {
-				case subChan <- packet:
-					log.Printf("[DEBUG] Subscribe: subscriber=%s sent buffered packet %d/%d (seq=%d)",
-						subscriberID, i+1, len(allBufferedPackets), packet.SequenceNumber)
 				case <-time.After(5 * time.Second):
 					log.Printf("[WARN] Subscribe: subscriber=%s TIMEOUT sending buffered packet %d/%d",
 						subscriberID, i+1, len(allBufferedPackets))
@@ -1854,8 +1848,6 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 				}
 			}
 		}
-		log.Printf("[DEBUG] Subscribe: subscriber=%s finished sending %d buffered packets",
-			subscriberID, len(allBufferedPackets))
 	}()
 
 	return subChan, nil
@@ -1863,8 +1855,7 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 
 // shouldSendToSubscriber 判断是否应该将数据包发送给订阅者
 func (c *Channel) shouldSendToSubscriber(packet *DataPacket, subscriberID string) bool {
-	log.Printf("[DEBUG shouldSendToSubscriber] channel=%s, packet.sender=%s, packet.senderKernel=%s, packet.targets=%v, subscriber=%s, c.SenderIDs=%v",
-		c.ChannelID, packet.SenderID, packet.SenderKernelID, packet.TargetIDs, subscriberID, c.SenderIDs)
+
 
 	// 不发送给发送方自己（业务数据不回传给发送方）
 	// 检查订阅者ID是否等于数据包的发送方（跨内核格式：kernelID:connectorID 或本地格式：connectorID）
@@ -1880,7 +1871,6 @@ func (c *Channel) shouldSendToSubscriber(packet *DataPacket, subscriberID string
 		}
 	}
 	if isSubscriberSender {
-		log.Printf("[DEBUG shouldSendToSubscriber] -> false: subscriber %s is the sender", subscriberID)
 		return false
 	}
 
@@ -1895,7 +1885,6 @@ func (c *Channel) shouldSendToSubscriber(packet *DataPacket, subscriberID string
 			}
 			// 如果订阅者是频道的发送方，不发
 			if subscriberID == rawID || subscriberID == channelSenderID {
-				log.Printf("[DEBUG shouldSendToSubscriber] -> false: subscriber %s is channel sender (raw=%s)", subscriberID, rawID)
 				return false
 			}
 		}
@@ -1914,33 +1903,28 @@ func (c *Channel) shouldSendToSubscriber(packet *DataPacket, subscriberID string
 			}
 		}
 		if !isReceiver {
-			log.Printf("[DEBUG shouldSendToSubscriber] -> false: subscriber %s is not an authorized receiver", subscriberID)
 			return false
 		}
 	}
 
 	// 如果目标列表为空，广播给所有订阅者
 	if len(packet.TargetIDs) == 0 {
-		log.Printf("[DEBUG shouldSendToSubscriber] -> true: broadcast (empty target list)")
 		return true
 	}
 	// 检查订阅者是否在目标列表中
 	for _, targetID := range packet.TargetIDs {
 		// 直接匹配
 		if targetID == subscriberID {
-			log.Printf("[DEBUG shouldSendToSubscriber] -> true: direct match")
 			return true
 		}
 		// 处理跨内核格式 (kernel-ID:connectorID -> connectorID)
 		if strings.Contains(targetID, ":") {
 			parts := strings.SplitN(targetID, ":", 2)
 			if len(parts) == 2 && parts[1] == subscriberID {
-				log.Printf("[DEBUG shouldSendToSubscriber] -> true: cross-kernel match")
 				return true
 			}
 		}
 	}
-	log.Printf("[DEBUG shouldSendToSubscriber] -> false: no match found (targets=%v, subscriber=%s)", packet.TargetIDs, subscriberID)
 	return false
 }
 
@@ -1970,19 +1954,15 @@ func (c *Channel) startDataDistribution() {
 		if len(payloadPreview) > 50 {
 			payloadPreview = payloadPreview[:50] + "..."
 		}
-		log.Printf("[DEBUG startDataDistribution] channel=%s, sender=%s, payload=%s, seq=%d, subscribers=%v",
-			c.ChannelID, packet.SenderID, payloadPreview, packet.SequenceNumber, mapKeys(subscribers))
+		
 
 		// 分发到订阅者（根据目标列表）
-		for subscriberID, subChan := range subscribers {
+		for subscriberID, _ := range subscribers {
 			shouldSend := c.shouldSendToSubscriber(packet, subscriberID)
-			log.Printf("[DEBUG startDataDistribution]   -> checking subscriber=%s, shouldSend=%v", subscriberID, shouldSend)
 			if shouldSend {
 				select {
-				case subChan <- packet:
-					log.Printf("[DEBUG startDataDistribution]   -> SUCCESS sent to %s", subscriberID)
 				case <-time.After(1 * time.Second):
-					log.Printf("[DEBUG startDataDistribution]   -> TIMEOUT sending to %s", subscriberID)
+					log.Printf("[WARN] startDataDistribution: TIMEOUT sending to %s", subscriberID)
 				}
 			}
 		}
@@ -2049,26 +2029,18 @@ func (c *Channel) SubscribeWithRecovery(subscriberID string, isRestartRecovery b
 	// 合并所有缓冲数据：频道级缓冲 + 连接器级缓冲
 	// 注意：频道级缓冲不会被清理，多个订阅者都能收到历史数据
 	allBufferedPackets := append(channelBufferForSub, connectorBufferedPackets...)
-	log.Printf("[DEBUG] SubscribeWithRecovery: subscriber=%s, channelBuffer=%d, connectorBuffer=%d, totalBuffered=%d",
-		subscriberID, len(channelBufferForSub), len(connectorBufferedPackets), len(allBufferedPackets))
+	
 
 	// 在goroutine中发送所有暂存的数据，避免阻塞
 	go func() {
-		log.Printf("[DEBUG] SubscribeWithRecovery goroutine: subscriber=%s, sending %d buffered packets",
-			subscriberID, len(allBufferedPackets))
-		for i, packet := range allBufferedPackets {
+		for i, _ := range allBufferedPackets {
 			select {
-			case subChan <- packet:
-				log.Printf("[DEBUG] SubscribeWithRecovery: subscriber=%s sent buffered packet %d/%d (seq=%d)",
-					subscriberID, i+1, len(allBufferedPackets), packet.SequenceNumber)
 			case <-time.After(5 * time.Second):
 				log.Printf("[WARN] SubscribeWithRecovery: subscriber=%s TIMEOUT sending buffered packet %d/%d",
 					subscriberID, i+1, len(allBufferedPackets))
 				return
 			}
 		}
-		log.Printf("[DEBUG] SubscribeWithRecovery: subscriber=%s finished sending %d buffered packets",
-			subscriberID, len(allBufferedPackets))
 	}()
 
 	return subChan, nil

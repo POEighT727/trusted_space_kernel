@@ -1093,15 +1093,9 @@ func (s *KernelServiceServer) ForwardData(ctx context.Context, req *pb.ForwardDa
 					req.ChannelId, computedDataHash, prevSignature)
 			}
 			// dataPacket.Signature 和 dataPacket.DataHash 已在 PushData 之前更新
-		} else {
-			log.Printf("[DEBUG ForwardData] Skipping data hash record: currentKernelID=%s == req.SourceKernelId=%s",
-				currentKernelID, req.SourceKernelId)
-		}
+		} 
 		// kernel-1 侧的业务数据包不写入 business_data_chain（由 connector-A 写入）
-	} else {
-		log.Printf("[DEBUG ForwardData] Skipping business chain record: flowID='%s', isEndPacket=%v, businessChainManager=%v",
-			flowID, isEndPacket, s.businessChainManager != nil)
-	}
+	} 
 
 	// ----------------------------------------
 	// 4. 流结束：生成 flow signature
