@@ -1841,6 +1841,8 @@ func (c *Channel) Subscribe(subscriberID string) (chan *DataPacket, error) {
 		for i, packet := range allBufferedPackets {
 			if c.shouldSendToSubscriber(packet, subscriberID) {
 				select {
+				case subChan <- packet:
+					// 缓冲数据发送成功
 				case <-time.After(5 * time.Second):
 					log.Printf("[WARN] Subscribe: subscriber=%s TIMEOUT sending buffered packet %d/%d",
 						subscriberID, i+1, len(allBufferedPackets))
@@ -1957,10 +1959,12 @@ func (c *Channel) startDataDistribution() {
 		
 
 		// 分发到订阅者（根据目标列表）
-		for subscriberID, _ := range subscribers {
+		for subscriberID, subChan := range subscribers {
 			shouldSend := c.shouldSendToSubscriber(packet, subscriberID)
 			if shouldSend {
 				select {
+				case subChan <- packet:
+					// 数据发送成功
 				case <-time.After(1 * time.Second):
 					log.Printf("[WARN] startDataDistribution: TIMEOUT sending to %s", subscriberID)
 				}
@@ -2033,12 +2037,16 @@ func (c *Channel) SubscribeWithRecovery(subscriberID string, isRestartRecovery b
 
 	// 在goroutine中发送所有暂存的数据，避免阻塞
 	go func() {
-		for i, _ := range allBufferedPackets {
-			select {
-			case <-time.After(5 * time.Second):
-				log.Printf("[WARN] SubscribeWithRecovery: subscriber=%s TIMEOUT sending buffered packet %d/%d",
-					subscriberID, i+1, len(allBufferedPackets))
-				return
+		for i, packet := range allBufferedPackets {
+			if c.shouldSendToSubscriber(packet, subscriberID) {
+				select {
+				case subChan <- packet:
+					// 缓冲数据发送成功
+				case <-time.After(5 * time.Second):
+					log.Printf("[WARN] SubscribeWithRecovery: subscriber=%s TIMEOUT sending buffered packet %d/%d",
+						subscriberID, i+1, len(allBufferedPackets))
+					return
+				}
 			}
 		}
 	}()
